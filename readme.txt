@@ -1,6 +1,13 @@
 Data acquisition -- Livermore stormdrain study
 ==============================================
 
+Published build -- nothing to install, nothing to run:
+
+    https://johnkpan.github.io/Livermore_stormdrain_map/
+
+That is the Stormdrain_map/ folder of step 5, served from this repo's gh-pages
+branch. Everything below is how to rebuild it from scratch.
+
 Everything runs from the project root. The whole pipeline, in order:
 
     .venv/Scripts/python.exe fetch_livermore_street_centerlines.py
