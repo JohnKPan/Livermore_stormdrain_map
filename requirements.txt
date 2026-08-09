@@ -1,13 +1,24 @@
 # Livermore stormdrain pipeline dependencies.
 #
-# Nothing here is needed by fetch_dem.py or the core of
-# extract_centerline_latlon.py -- both are pure stdlib (json/csv/math/urllib).
-# Everything else builds on the stack below.
+# The three fetch scripts need none of this -- fetch_livermore_street_centerlines.py,
+# fetch_inlets.py and fetch_dem.py are pure stdlib (json/csv/math/urllib), as is
+# the core of extract_centerline_latlon.py (pandas only for --parquet). So the
+# data can be pulled on a bare interpreter; the stack below is for everything
+# that reads it.
 
 # --- data ---------------------------------------------------------------
-# segments_points_1m.parquet, all tabular joins
+# pandas:  every tabular join in the pipeline.
+# pyarrow: the engine behind read_parquet/to_parquet for
+#          segments_points_1m.parquet. Never imported by name, so an
+#          import scan will call it unused -- it is not. Removing it breaks
+#          extract_centerline_latlon.py --parquet and everything after it.
 pandas>=2.2
 pyarrow>=17
+
+# numpy: imported directly by 8 of the scripts, not merely pulled in by pandas
+# and matplotlib. Declared so a fresh install cannot lose it to a transitive
+# dependency change.
+numpy>=2.0
 
 # --- geospatial ---------------------------------------------------------
 # rasterio: read/sample the 3DEP GeoTIFF tiles (add_elevation, preview_dem,
@@ -23,9 +34,13 @@ matplotlib>=3.10
 contextily>=1.6
 
 # --- interactive --------------------------------------------------------
-# bokeh:  linked profile+map HTML (plot_street_bokeh.py). Pulls in xyzservices
-#         for tile providers, plus jinja2/tornado/pyyaml.
+# bokeh:       the linked profile+map pages (plot_street_bokeh.py) and the
+#              city-wide picker over them (plot_city_overview.py). Also brings
+#              jinja2/tornado/pyyaml.
+# xyzservices: CartoDB tile providers. Bokeh happens to depend on it, but both
+#              scripts import it directly, so it is named here in its own right.
 bokeh>=3.9
+xyzservices>=2024.9
 
 # plotly: only plot_points_map.py, the city-wide point overview. Optional --
 #         drop this line if you do not need that script.
