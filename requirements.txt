@@ -1,0 +1,32 @@
+# Livermore stormdrain pipeline dependencies.
+#
+# Nothing here is needed by fetch_dem.py or the core of
+# extract_centerline_latlon.py -- both are pure stdlib (json/csv/math/urllib).
+# Everything else builds on the stack below.
+
+# --- data ---------------------------------------------------------------
+# segments_points_1m.parquet, all tabular joins
+pandas>=2.2
+pyarrow>=17
+
+# --- geospatial ---------------------------------------------------------
+# rasterio: read/sample the 3DEP GeoTIFF tiles (add_elevation, preview_dem,
+#           map_street_cells)
+# pyproj:   WGS84 <-> UTM 10N <-> Web Mercator throughout
+rasterio>=1.4
+pyproj>=3.7
+
+# --- static figures -----------------------------------------------------
+# matplotlib:  every PNG (profiles, cell maps, drain charts, DEM previews)
+# contextily:  CartoDB basemap tiles under the matplotlib plan views
+matplotlib>=3.10
+contextily>=1.6
+
+# --- interactive --------------------------------------------------------
+# bokeh:  linked profile+map HTML (plot_street_bokeh.py). Pulls in xyzservices
+#         for tile providers, plus jinja2/tornado/pyyaml.
+bokeh>=3.9
+
+# plotly: only plot_points_map.py, the city-wide point overview. Optional --
+#         drop this line if you do not need that script.
+plotly>=6.0

@@ -1,0 +1,31 @@
+# Nothing here is committed but source. Every artifact below is reproducible
+# from the scripts -- see readme.txt for the seven commands that rebuild it.
+#
+# NOTE: gitignore only treats "#" as a comment at the START of a line. A
+# trailing comment becomes part of the pattern and silently matches nothing.
+
+# Fetched inputs: 1.35 GB of USGS 3DEP tiles, and the centerline GeoJSON
+# from the Livermore open data portal.
+dem/
+streets/
+
+# Derived data and the built deliverable
+derived/
+Stormdrain_map/
+
+# Local environment
+.venv/
+__pycache__/
+*.pyc
+.tilecache/
+
+# Working copies
+backup/
+backup */
+*.bak
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
