@@ -24,6 +24,12 @@ backup/
 backup */
 *.bak
 
+# Scratch survey of other Bay Area cities' stormdrain GIS layers. Unlike
+# everything above these are NOT reproducible -- no script here writes them --
+# so ignoring them means they exist only on this machine. Move them under
+# version control if they ever become an input.
+bay_area_*.csv
+
 # Editor / OS
 .vscode/
 .idea/
