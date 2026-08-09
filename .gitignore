@@ -24,11 +24,13 @@ backup/
 backup */
 *.bak
 
-# Scratch survey of other Bay Area cities' stormdrain GIS layers. Unlike
-# everything above these are NOT reproducible -- no script here writes them --
-# so ignoring them means they exist only on this machine. Move them under
-# version control if they ever become an input.
+# Bay Area survey -- which other cities publish inlet data, and what their
+# layers carry. Kept out of the repo by choice, script included: the CSVs are
+# reproducible, but only from a generator that is itself ignored, so a fresh
+# clone cannot rebuild them. All three live on one machine. Track them together
+# if the survey ever feeds the pipeline.
 bay_area_*.csv
+survey_bay_area_sources.py
 
 # Editor / OS
 .vscode/
