@@ -205,6 +205,28 @@ hardcoded, so either can move -- put both in one directory and it disappears.
 Change --outdir on plot_street_bokeh.py and --pages here together, or the
 overview will point at pages that are not there.
 
+The overview carries two colourings, switched by the radio button beside its
+search box:
+
+  road class       the default. Colour is FunctionalClass, width follows it too.
+  sags per street  the street's n_sags from _index.csv, binned 0 / 1 / 2 / 3-4 /
+                   5-9 / 10+ on a grey-to-dark-red ramp. Both colourings are
+                   always built; --color-by sags only picks which one the page
+                   opens on.
+
+Legend entries hide their streets in either colouring -- hiding "no sag" leaves
+just the 337 streets that have one, which is the view worth bookmarking. The
+switch resets whatever the other legend had hidden, since the two filter on
+different keys. Tap, hover, search and the #street bookmark work the same in
+both; the tapped-street highlight turns blue under the sag colouring, where red
+would vanish into the top of the ramp.
+
+Note what the sag colouring is and is not: it is a count per street, painted
+along the whole street, so ISABEL AV reads dark red over all 15 km for 11 sags
+that sit at 11 points. Long streets collect more sags -- take the colour as
+"how much of this street's drainage is worth reading", not as a density. The
+legend counts streets; the road-class legend counts centerline segments.
+
 Pages load BokehJS from a CDN, so viewing needs a network connection, but they
 work opened straight from disk -- no local server needed.
 

@@ -1,10 +1,11 @@
 """City-wide index map over the per-street pages from plot_street_bokeh.py.
 
 Draws every Livermore centerline on one CartoDB map, coloured by functional
-class. Tapping a street -- or picking one from the search box -- loads that
-street's existing profile+map page into an iframe directly below, so the whole
-corpus written by `plot_street_bokeh.py --all` becomes browsable from one entry
-point.
+class or by the street's sag count -- a radio button on the page switches
+between the two, and --color-by picks which one it opens on. Tapping a street
+-- or picking one from the search box -- loads that street's existing
+profile+map page into an iframe directly below, so the whole corpus written by
+`plot_street_bokeh.py --all` becomes browsable from one entry point.
 
 Nothing here regenerates a street page: the pages are consumed as-is, keyed by
 the `file` column of the index that `--all` writes. By default the overview
@@ -14,6 +15,7 @@ and the iframe srcs are relative paths worked out from those two locations.
 Usage:
     python plot_street_bokeh.py --all        # once, to build the pages
     python plot_city_overview.py             # then this
+    python plot_city_overview.py --color-by sags    # open on the sag colouring
 """
 
 import argparse
@@ -24,9 +26,11 @@ import pandas as pd
 import xyzservices.providers as xyz
 from bokeh.document import Document
 from bokeh.events import DocumentReady
-from bokeh.layouts import column
-from bokeh.models import (AutocompleteInput, ColumnDataSource, CustomJS, Div,
-                          HoverTool, Range1d, TapTool, WheelZoomTool)
+from bokeh.layouts import column, row
+from bokeh.models import (AutocompleteInput, CDSView, ColumnDataSource,
+                          CustomJS, Div, HoverTool, IndexFilter, Legend,
+                          LegendItem, RadioButtonGroup, Range1d, TapTool,
+                          WheelZoomTool)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
@@ -41,6 +45,11 @@ MAP_W, MAP_H = 1240, 700
 FRAME_W, FRAME_H = 1240, 1020
 HIT_W = 12                # invisible fat line under each class, for hit testing
 
+TITLE = ("Livermore street centerline — tap a street to load its profile and "
+         "drainage map below")
+TITLE_SAG = ("Livermore streets by sag count — tap a street to load its "
+             "profile and drainage map below")
+
 # Arterials and freeways read as the skeleton of the city; the Local mesh is
 # the background it sits on. Ramps stay thin so interchanges do not blob.
 CLASS_WIDTH = {
@@ -54,6 +63,32 @@ CLASS_WIDTH = {
     "Ramp": 1.5,
     UNCLASSIFIED: 1.0,
 }
+
+# The alternate colouring: sags per street, binned rather than ramped. 1,391 of
+# the 1,728 streets have no sag at all and the tail runs to 29, so a linear
+# scale would spend its whole range on a handful of streets. Zero gets a grey
+# that reads as background; the ramp starts at one.
+#
+# (lower bound, label, colour, minimum line width) -- the upper bound of each
+# bin is the next entry's lower bound. Width is a floor, not a value: a street
+# keeps its class width if that is already fatter, so the arterial skeleton
+# survives while a Local street with sags stops being a 1 px line.
+SAG_BINS = [
+    (0,  "no sag", "#aeb8c2", 0.0),
+    (1,  "1",      "#fcc44e", 1.8),
+    (2,  "2",      "#f99331", 2.2),
+    (3,  "3–4",    "#ef6420", 2.6),
+    (5,  "5–9",    "#cf2d16", 3.0),
+    (10, "10+",    "#8c0308", 3.4),
+]
+
+
+def sag_bin(n):
+    """Index of the SAG_BINS entry a sag count falls in."""
+    for i in range(len(SAG_BINS) - 1, -1, -1):
+        if n >= SAG_BINS[i][0]:
+            return i
+    return 0
 
 
 def load(here, args):
@@ -89,7 +124,12 @@ def main():
                     help="directory holding the per-street pages and _index.csv")
     ap.add_argument("--out", default=OUT,
                     help="path for the overview page itself")
+    ap.add_argument("--color-by", "--colour-by", dest="color_by",
+                    choices=("class", "sags"), default="class",
+                    help="colouring the page opens on; both are always built "
+                         "and switchable on the page itself")
     args = ap.parse_args()
+    sag_first = args.color_by == "sags"
 
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, args.out)
@@ -131,8 +171,7 @@ def main():
                 x_range=Range1d(xs_all.min()-padx, xs_all.max()+padx),
                 y_range=Range1d(ys_all.min()-pady, ys_all.max()+pady),
                 x_axis_type="mercator", y_axis_type="mercator",
-                title="Livermore street centerline — tap a street to load its "
-                      "profile and drainage map below")
+                title=TITLE_SAG if sag_first else TITLE)
     mp.add_tile(xyz.CartoDB.Positron)
     # City scale means a lot of zooming; make the wheel do it without a toolbar
     # trip. The per-street pages leave this off, where panning matters more.
@@ -141,7 +180,12 @@ def main():
     tips = [("street", "@name"), ("class", "@cls"),
             ("inlets", "@n_inlets"), ("sags", "@n_sags (@n_unserved unserved)"),
             ("street length", "@length_m{0,0} m")]
-    srcs, hits = [], []
+    srcs, hits, cls_lines, cls_items, cls_w = [], [], [], [], []
+    # Which segments of which class source land in which sag bin. Indices, not
+    # geometry: the sag colouring draws the very same sources through a filter,
+    # so the coordinates are serialised into the page once rather than twice.
+    by_bin = [{} for _ in SAG_BINS]
+    bin_names = [set() for _ in SAG_BINS]       # for the legend counts
     for cls in DRAW_ORDER:                      # Local first, Interstate last
         r = rows.get(cls)
         if not r or not r["xs"]:
@@ -153,26 +197,70 @@ def main():
             n_sags=stats.n_sags.to_numpy(),
             n_unserved=stats.n_unserved.to_numpy(),
             length_m=stats.length_m.to_numpy()))
-        label = f"{cls} ({len(r['xs']):,})"
         # Two renderers on ONE source: the visible line, and a fat transparent
         # one to catch the cursor -- a 1 px Local street is otherwise unclickable.
-        # Both carry the same legend_label so a legend click hides the hit
-        # target too, otherwise a hidden class would still be tappable.
-        mp.multi_line("xs", "ys", source=src, line_color=CLASS_COLORS[cls],
-                      line_width=CLASS_WIDTH.get(cls, 1.2), legend_label=label)
+        # Both go in the same legend item so a legend click hides the hit target
+        # too, otherwise a hidden class would still be tappable.
+        w0 = CLASS_WIDTH.get(cls, 1.2)
+        line = mp.multi_line("xs", "ys", source=src, line_color=CLASS_COLORS[cls],
+                             line_width=w0, visible=not sag_first)
         hit = mp.multi_line("xs", "ys", source=src, line_width=HIT_W,
-                            line_alpha=0.0, legend_label=label)
+                            line_alpha=0.0)
+        cls_items.append(LegendItem(label=f"{cls} ({len(r['xs']):,})",
+                                    renderers=[line, hit]))
         srcs.append(src)
         hits.append(hit)
+        cls_lines.append(line)
+        cls_w.append(w0)
+
+        si = len(srcs) - 1
+        for k, n in enumerate(stats.n_sags.to_numpy()):
+            b = sag_bin(int(n))
+            by_bin[b].setdefault(si, []).append(k)
+            bin_names[b].add(r["name"][k])
     mp.add_tools(HoverTool(renderers=hits, tooltips=tips, line_policy="nearest"))
 
-    # Added last so it draws over every class. Zooming to a street is not much
-    # use if you cannot tell which of the lines in view it is. No legend_label:
-    # this is not a class, and it must not be hideable.
-    hi = ColumnDataSource(dict(xs=[], ys=[]))
-    mp.multi_line("xs", "ys", source=hi, line_color="#e00000", line_width=5,
-                  line_alpha=0.8, line_cap="round")
+    # Sag colouring: one renderer per (class source, bin), bins outermost so the
+    # worst streets draw over the quiet ones. Splitting by class as well as bin
+    # is what lets a line keep its class width -- and it costs nothing, since
+    # each renderer is just a filtered view of a source that already exists.
+    # Hover, tap and the search box hang off the class renderers, so they behave
+    # identically in either colouring.
+    sag_lines, sag_items = [], []
+    for (_, label, colour, wmin), members, nms in zip(SAG_BINS, by_bin, bin_names):
+        rs = [mp.multi_line("xs", "ys", source=srcs[si], visible=sag_first,
+                            view=CDSView(filter=IndexFilter(ks)),
+                            line_color=colour, line_width=max(cls_w[si], wmin))
+              for si, ks in sorted(members.items())]
+        if not rs:
+            continue
+        # Streets, not segments as the class legend counts: the colour is a
+        # per-street number, and one street is many segments.
+        sag_items.append(LegendItem(label=f"{label} ({len(nms):,} streets)",
+                                    renderers=rs))
+        sag_lines.extend(rs)
 
+    # Added last so it draws over both colourings. Zooming to a street is not
+    # much use if you cannot tell which of the lines in view it is. In neither
+    # legend: this is not a class or a bin, and it must not be hideable.
+    hi = ColumnDataSource(dict(xs=[], ys=[]))
+    # Two renderers over one source: red disappears into the top of the sag
+    # ramp, which is itself red, so that colouring gets a blue highlight. Same
+    # visibility flip as everything else rather than a colour swap in JS.
+    hi_cls = mp.multi_line("xs", "ys", source=hi, line_color="#e00000",
+                           line_width=5, line_alpha=0.8, line_cap="round",
+                           visible=not sag_first)
+    hi_sag = mp.multi_line("xs", "ys", source=hi, line_color="#0a84ff",
+                           line_width=5, line_alpha=0.9, line_cap="round",
+                           visible=sag_first)
+
+    # One legend per colouring, both parked at the same spot inside the plot;
+    # only ever one is visible, so they never collide. Explicit rather than
+    # legend_label= because that folds everything into a single legend.
+    leg_cls = Legend(items=cls_items, visible=not sag_first)
+    leg_sag = Legend(items=sag_items, visible=sag_first, title="sags on street")
+    for leg in (leg_cls, leg_sag):
+        mp.add_layout(leg)
     mp.legend.click_policy = "hide"
     mp.legend.label_text_font_size = "8pt"
     mp.legend.background_fill_alpha = 0.85
@@ -182,6 +270,28 @@ def main():
     search = AutocompleteInput(
         completions=names, search_strategy="includes", case_sensitive=False,
         min_characters=2, width=380, placeholder=f"search {len(names):,} streets")
+    colour = RadioButtonGroup(labels=["road class", "sags per street"],
+                              active=int(sag_first), width=260)
+    colour.js_on_change("active", CustomJS(
+        args=dict(CLS=cls_lines, SAG=sag_lines, HIT=hits, hiC=hi_cls,
+                  hiS=hi_sag, legC=leg_cls, legS=leg_sag, title=mp.title,
+                  T=TITLE, TS=TITLE_SAG),
+        code="""
+        const sag = cb_obj.active === 1;
+        // Both legends hide by flipping renderer.visible, so switching also
+        // clears whatever the other mode had hidden -- deliberate: the two
+        // legends filter on different keys and cannot be kept in step. The hit
+        // targets come back either way, or a class hidden here would stay
+        // untappable over there.
+        for (const r of CLS) { r.visible = !sag; }
+        for (const r of SAG) { r.visible = sag; }
+        for (const r of HIT) { r.visible = true; }
+        hiC.visible = !sag;
+        hiS.visible = sag;
+        legC.visible = !sag;
+        legS.visible = sag;
+        title.text = sag ? TS : T;
+    """))
     pick = Div(text="<i>tap a street on the map, or search above</i>",
                width=MAP_W,
                styles={"font-family": "monospace", "font-size": "13px",
@@ -273,7 +383,7 @@ def main():
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
     doc = Document()
-    doc.add_root(column(search, pick, mp, frame))
+    doc.add_root(column(row(search, colour), pick, mp, frame))
     doc.js_on_event(DocumentReady, ready)
     output_file(out, title="Livermore stormdrain — street index", mode="cdn")
     save(doc)
