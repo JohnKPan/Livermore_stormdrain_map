@@ -1,0 +1,5 @@
+# core.autocrlf is true on the machine this repo was built on, which would hand
+# every clone a run_pipeline.sh whose lines end in \r. bash reports that as
+# "$'\r': command not found" -- an error that points nowhere near the cause.
+# Shell scripts therefore keep LF endings everywhere, on every platform.
+*.sh text eol=lf

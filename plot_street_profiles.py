@@ -8,7 +8,9 @@ is appears on the x-axis label and in _index.csv, since it varies by street.
 
 Because 1 m samples are noise-dominated point-to-point (SNR ~0.23 against a
 ~2 cm noise floor), each plot shows the raw profile faintly with a 25 m rolling
-mean on top -- the 25 m baseline is where gradient becomes trustworthy.
+mean on top -- the 25 m baseline is where gradient becomes trustworthy. --smooth
+changes that window; it is the one knob every profile in this project shares,
+since plot_street_drains.py and plot_street_bokeh.py both build theirs here.
 
 Outputs:
     derived/profiles/<STREET>.png
@@ -18,6 +20,7 @@ Usage:
     python plot_street_profiles.py
     python plot_street_profiles.py --min-length 250     # only longer streets
     python plot_street_profiles.py --street "HOLMES ST" # just one
+    python plot_street_profiles.py --smooth 10          # tighter rolling mean
 """
 
 import argparse
@@ -33,7 +36,7 @@ import pandas as pd
 POINTS = "derived/segments_points_1m.parquet"
 OUTDIR = "derived/profiles"
 GAP_BREAK_M = 40.0        # larger jumps between segments are drawn as a break
-SMOOTH_M = 25.0
+SMOOTH_M = 25.0           # default rolling-mean window; --smooth overrides
 NODE_TOL_M = 2.0          # segment endpoints this close share one junction node
 OPPOSITE = {"W": "E", "N": "S"}
 
@@ -153,11 +156,16 @@ def chain_segments(segs):
             np.concatenate(D), np.concatenate(RUN), gaps, origin)
 
 
-def build_profile(e, n, z, run):
-    """Cumulative along-path distance, with distance still accruing over gaps."""
+def build_profile(e, n, z, run, smooth_m=SMOOTH_M):
+    """Cumulative along-path distance, with distance still accruing over gaps.
+
+    smooth_m is the rolling-mean window in metres. Points are 1 m apart, so it
+    doubles as the window in samples; the mean is taken per run, so it never
+    averages across a gap between segments.
+    """
     d = np.r_[0.0, np.cumsum(np.hypot(np.diff(e), np.diff(n)))]
     s = pd.Series(z)
-    w = max(3, int(round(SMOOTH_M)))
+    w = max(3, int(round(smooth_m)))
     smooth = (s.groupby(run)
                .transform(lambda g: g.rolling(w, center=True,
                                               min_periods=max(3, w // 3)).mean())
@@ -172,6 +180,9 @@ def main():
     ap.add_argument("--street", default=None, help="render a single street name")
     ap.add_argument("--outdir", default=OUTDIR)
     ap.add_argument("--dpi", type=int, default=110)
+    ap.add_argument("--smooth", type=float, default=SMOOTH_M,
+                    help="rolling-mean window (m) over the 1 m samples "
+                         f"(default {SMOOTH_M:g})")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -199,7 +210,7 @@ def main():
                          sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
         e, n, z, disc, run, gaps, origin = chain_segments(segs)
         far = OPPOSITE[origin]
-        d, smooth = build_profile(e, n, z, run)
+        d, smooth = build_profile(e, n, z, run, args.smooth)
 
         if d[-1] < args.min_length:
             skipped += 1
@@ -216,7 +227,7 @@ def main():
             ax.plot(d[m], z[m], color="#9fb3c8", lw=0.7,
                     label="raw 1 m" if r == 0 else None)
             ax.plot(d[m], smooth[m], color="#2e86c1", lw=1.9,
-                    label=f"{SMOOTH_M:g} m rolling mean" if r == 0 else None)
+                    label=f"{args.smooth:g} m rolling mean" if r == 0 else None)
         ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5,
                 label=f"{origin} start")
         ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5,

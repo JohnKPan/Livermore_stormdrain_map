@@ -12,10 +12,17 @@ the `file` column of the index that `--all` writes. By default the overview
 lands at Stormdrain_map/index.html and the pages in Stormdrain_map/streets/,
 and the iframe srcs are relative paths worked out from those two locations.
 
+--pages-alt adds a SECOND corpus, built at a different --smooth window, and a
+checkbox that switches the whole page between the two: which page the iframe
+loads, the sag counts in the tooltips, and the sag colouring itself. Sags come
+from the smoothed profile, so a shorter window finds more of them -- the two
+sets genuinely disagree, and the checkbox is how they are compared.
+
 Usage:
     python plot_street_bokeh.py --all        # once, to build the pages
     python plot_city_overview.py             # then this
     python plot_city_overview.py --color-by sags    # open on the sag colouring
+    python plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
 """
 
 import argparse
@@ -27,10 +34,10 @@ import xyzservices.providers as xyz
 from bokeh.document import Document
 from bokeh.events import DocumentReady
 from bokeh.layouts import column, row
-from bokeh.models import (AutocompleteInput, CDSView, ColumnDataSource,
-                          CustomJS, Div, HoverTool, IndexFilter, Legend,
-                          LegendItem, RadioButtonGroup, Range1d, TapTool,
-                          WheelZoomTool)
+from bokeh.models import (AutocompleteInput, CDSView, CheckboxGroup,
+                          ColumnDataSource, CustomJS, Div, HoverTool,
+                          IndexFilter, InlineStyleSheet, Legend, LegendItem,
+                          RadioButtonGroup, Range1d, TapTool, WheelZoomTool)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
@@ -38,11 +45,16 @@ from plot_points_map import CLASS_COLORS, DRAW_ORDER
 
 VERTS = "derived/segments_vertices.csv"
 PAGES = "Stormdrain_map/streets"
+PAGES_ALT = "Stormdrain_map/streets_10m"
 OUT = "Stormdrain_map/index.html"
 INDEX = "_index.csv"
 UNCLASSIFIED = "(unclassified)"
 MAP_W, MAP_H = 1240, 700
-FRAME_W, FRAME_H = 1240, 1020
+# FRAME_H is the embedded street page's own height, measured: read + pick Divs,
+# then plot_street_bokeh.py's PROF_H and MAP_H panels with their titles and
+# axes. Short of it and the iframe grows an inner scrollbar, which is what a
+# 1,020 px frame was doing around a 1,305 px page. Raise this with PROF_H.
+FRAME_W, FRAME_H = 1240, 1320
 HIT_W = 12                # invisible fat line under each class, for hit testing
 
 TITLE = ("Livermore street centerline — tap a street to load its profile and "
@@ -83,6 +95,29 @@ SAG_BINS = [
 ]
 
 
+# The smoothing checkbox sits under the map, between the two things it changes,
+# and is sized to be seen: Bokeh's default is a 13 px browser checkbox with 12 px
+# text, which reads as a footnote beside a 1,240 px map. Injected into the
+# widget's own shadow root, so these bare selectors cannot leak anywhere else.
+CHECKBOX_CSS = """
+:host { padding: 12px 0 4px 2px; }
+label {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 17px;
+    font-weight: 600;
+    cursor: pointer;
+}
+input[type="checkbox"] {
+    width: 21px;
+    height: 21px;
+    accent-color: #0a84ff;
+    cursor: pointer;
+}
+"""
+
+
 def sag_bin(n):
     """Index of the SAG_BINS entry a sag count falls in."""
     for i in range(len(SAG_BINS) - 1, -1, -1):
@@ -91,8 +126,14 @@ def sag_bin(n):
     return 0
 
 
-def load(here, args):
-    """Per-OBJECTID polylines in Web Mercator, joined to the page index."""
+def load(here, args, variants):
+    """Per-OBJECTID polylines in Web Mercator, joined to every page index.
+
+    Fills each variant's "idx" in place and returns the vertices, narrowed to
+    the streets that have a page in EVERY corpus -- the checkbox switches a
+    loaded street between them, so one that exists in only one set would break
+    on the toggle rather than at load.
+    """
     v = pd.read_csv(os.path.join(here, args.verts),
                     usecols=["OBJECTID", "FullStreetName", "FunctionalClass",
                              "vertex_index", "lat", "lon"])
@@ -107,14 +148,16 @@ def load(here, args):
     to3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     v["mx"], v["my"] = to3857.transform(v.lon.to_numpy(), v.lat.to_numpy())
 
-    idx = pd.read_csv(os.path.join(here, args.pages, INDEX))
-    have = set(idx.FullStreetName)
+    for var in variants:
+        idx = pd.read_csv(os.path.join(here, var["pages"], INDEX))
+        var["idx"] = idx.set_index("FullStreetName")
+    have = set.intersection(*[set(var["idx"].index) for var in variants])
     missing = sorted(set(v.FullStreetName) - have)
     if missing:
         print(f"  {len(missing)} street(s) have no page, dropped: "
               f"{', '.join(missing[:5])}{' ...' if len(missing) > 5 else ''}")
         v = v[v.FullStreetName.isin(have)]
-    return v, idx.set_index("FullStreetName")
+    return v
 
 
 def main():
@@ -122,6 +165,14 @@ def main():
     ap.add_argument("--verts", default=VERTS)
     ap.add_argument("--pages", default=PAGES,
                     help="directory holding the per-street pages and _index.csv")
+    ap.add_argument("--pages-alt", default=None,
+                    help="second corpus, built at a different --smooth window; "
+                         "adds the checkbox that switches between the two "
+                         f"(e.g. {PAGES_ALT})")
+    ap.add_argument("--label", default="25 m",
+                    help="how --pages is named on the page")
+    ap.add_argument("--alt-label", default="10 m",
+                    help="how --pages-alt is named on the page")
     ap.add_argument("--out", default=OUT,
                     help="path for the overview page itself")
     ap.add_argument("--color-by", "--colour-by", dest="color_by",
@@ -131,16 +182,23 @@ def main():
     args = ap.parse_args()
     sag_first = args.color_by == "sags"
 
+    # Primary first: it is the one the page opens on, and the one whose inlet
+    # counts and lengths are used -- neither depends on the smoothing window.
+    variants = [dict(pages=args.pages, label=args.label)]
+    if args.pages_alt:
+        variants.append(dict(pages=args.pages_alt, label=args.alt_label))
+
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, args.out)
     # The overview no longer sits beside the pages it opens, so every iframe src
     # needs a relative hop from wherever this page lands to wherever they do.
     # Derived rather than hardcoded, so --out and --pages stay free to move.
     # Forward slashes: this ends up in a URL, not a filesystem path.
-    rel = os.path.relpath(os.path.join(here, args.pages),
-                          os.path.dirname(out)).replace(os.sep, "/")
-    pfx = "" if rel in ("", ".") else rel + "/"
-    v, idx = load(here, args)
+    for var in variants:
+        rel = os.path.relpath(os.path.join(here, var["pages"]),
+                              os.path.dirname(out)).replace(os.sep, "/")
+        var["pfx"] = "" if rel in ("", ".") else rel + "/"
+    v = load(here, args, variants)
 
     # ---------------- geometry, one entry per OBJECTID ----------------
     # Not per street: a name spans several disjoint segments, and folding them
@@ -181,22 +239,31 @@ def main():
             ("inlets", "@n_inlets"), ("sags", "@n_sags (@n_unserved unserved)"),
             ("street length", "@length_m{0,0} m")]
     srcs, hits, cls_lines, cls_items, cls_w = [], [], [], [], []
-    # Which segments of which class source land in which sag bin. Indices, not
-    # geometry: the sag colouring draws the very same sources through a filter,
-    # so the coordinates are serialised into the page once rather than twice.
-    by_bin = [{} for _ in SAG_BINS]
-    bin_names = [set() for _ in SAG_BINS]       # for the legend counts
+    # Which segments of which class source land in which sag bin, per variant.
+    # Indices, not geometry: every sag colouring draws the very same sources
+    # through a filter, so the coordinates are serialised into the page once
+    # however many corpora are being compared.
+    by_bin = [[{} for _ in SAG_BINS] for _ in variants]
+    bin_names = [[set() for _ in SAG_BINS] for _ in variants]   # legend counts
     for cls in DRAW_ORDER:                      # Local first, Interstate last
         r = rows.get(cls)
         if not r or not r["xs"]:
             continue
-        stats = idx.reindex(r["name"])
-        src = ColumnDataSource(dict(
-            xs=r["xs"], ys=r["ys"], name=r["name"], cls=r["cls"],
-            n_inlets=stats.n_inlets.to_numpy(),
-            n_sags=stats.n_sags.to_numpy(),
-            n_unserved=stats.n_unserved.to_numpy(),
-            length_m=stats.length_m.to_numpy()))
+        stats = [var["idx"].reindex(r["name"]) for var in variants]
+        # Inlets and length are upstream of the smoothing -- an inlet snaps to
+        # the centerline and a street is as long as it is -- so they come from
+        # the primary and stay put. Only the sag columns move with the checkbox.
+        data = dict(xs=r["xs"], ys=r["ys"], name=r["name"], cls=r["cls"],
+                    n_inlets=stats[0].n_inlets.to_numpy(),
+                    length_m=stats[0].length_m.to_numpy(),
+                    n_sags=stats[0].n_sags.to_numpy(),
+                    n_unserved=stats[0].n_unserved.to_numpy())
+        # Tooltips name fixed columns, so the toggle copies the variant it wants
+        # into n_sags/n_unserved. Both sets have to be on the source to do that.
+        for vi, s in enumerate(stats):
+            data[f"n_sags_v{vi}"] = s.n_sags.to_numpy()
+            data[f"n_unserved_v{vi}"] = s.n_unserved.to_numpy()
+        src = ColumnDataSource(data)
         # Two renderers on ONE source: the visible line, and a fat transparent
         # one to catch the cursor -- a 1 px Local street is otherwise unclickable.
         # Both go in the same legend item so a legend click hides the hit target
@@ -214,10 +281,11 @@ def main():
         cls_w.append(w0)
 
         si = len(srcs) - 1
-        for k, n in enumerate(stats.n_sags.to_numpy()):
-            b = sag_bin(int(n))
-            by_bin[b].setdefault(si, []).append(k)
-            bin_names[b].add(r["name"][k])
+        for vi, s in enumerate(stats):
+            for k, n in enumerate(s.n_sags.to_numpy()):
+                b = sag_bin(int(n))
+                by_bin[vi][b].setdefault(si, []).append(k)
+                bin_names[vi][b].add(r["name"][k])
     mp.add_tools(HoverTool(renderers=hits, tooltips=tips, line_policy="nearest"))
 
     # Sag colouring: one renderer per (class source, bin), bins outermost so the
@@ -226,41 +294,52 @@ def main():
     # each renderer is just a filtered view of a source that already exists.
     # Hover, tap and the search box hang off the class renderers, so they behave
     # identically in either colouring.
-    sag_lines, sag_items = [], []
-    for (_, label, colour, wmin), members, nms in zip(SAG_BINS, by_bin, bin_names):
-        rs = [mp.multi_line("xs", "ys", source=srcs[si], visible=sag_first,
-                            view=CDSView(filter=IndexFilter(ks)),
-                            line_color=colour, line_width=max(cls_w[si], wmin))
-              for si, ks in sorted(members.items())]
-        if not rs:
-            continue
-        # Streets, not segments as the class legend counts: the colour is a
-        # per-street number, and one street is many segments.
-        sag_items.append(LegendItem(label=f"{label} ({len(nms):,} streets)",
-                                    renderers=rs))
-        sag_lines.extend(rs)
+    # One such set per variant, since the counts differ between them; SAG_VAR
+    # keeps a flat parallel list of which variant each renderer belongs to, so
+    # the JS can flip visibility without nesting.
+    sag_lines, sag_var, sag_legs = [], [], []
+    for vi, var in enumerate(variants):
+        shown = sag_first and vi == 0
+        sag_items = []
+        for (_, label, colour, wmin), members, nms in zip(SAG_BINS, by_bin[vi],
+                                                          bin_names[vi]):
+            rs = [mp.multi_line("xs", "ys", source=srcs[si], visible=shown,
+                                view=CDSView(filter=IndexFilter(ks)),
+                                line_color=colour,
+                                line_width=max(cls_w[si], wmin))
+                  for si, ks in sorted(members.items())]
+            if not rs:
+                continue
+            # Streets, not segments as the class legend counts: the colour is a
+            # per-street number, and one street is many segments.
+            sag_items.append(LegendItem(label=f"{label} ({len(nms):,} streets)",
+                                        renderers=rs))
+            sag_lines.extend(rs)
+            sag_var.extend([vi]*len(rs))
+        leg = Legend(items=sag_items, visible=shown,
+                     title="sags on street" if len(variants) == 1
+                     else f"sags on street — {var['label']}")
+        mp.add_layout(leg)
+        sag_legs.append(leg)
 
     # Added last so it draws over both colourings. Zooming to a street is not
     # much use if you cannot tell which of the lines in view it is. In neither
     # legend: this is not a class or a bin, and it must not be hideable.
     hi = ColumnDataSource(dict(xs=[], ys=[]))
-    # Two renderers over one source: red disappears into the top of the sag
-    # ramp, which is itself red, so that colouring gets a blue highlight. Same
-    # visibility flip as everything else rather than a colour swap in JS.
-    hi_cls = mp.multi_line("xs", "ys", source=hi, line_color="#e00000",
-                           line_width=5, line_alpha=0.8, line_cap="round",
-                           visible=not sag_first)
-    hi_sag = mp.multi_line("xs", "ys", source=hi, line_color="#0a84ff",
-                           line_width=5, line_alpha=0.9, line_cap="round",
-                           visible=sag_first)
+    # Blue in both colourings, so one renderer does it: the highlight means the
+    # same thing either way, and a colour that changes with the mode reads as
+    # though it were encoding something. Blue is the choice because red -- the
+    # obvious highlight -- vanishes into the top of the sag ramp, which is
+    # itself red. Nothing here flips with the mode any more.
+    mp.multi_line("xs", "ys", source=hi, line_color="#0a84ff",
+                  line_width=5, line_alpha=0.9, line_cap="round")
 
-    # One legend per colouring, both parked at the same spot inside the plot;
-    # only ever one is visible, so they never collide. Explicit rather than
-    # legend_label= because that folds everything into a single legend.
+    # One legend per colouring -- per variant, for the sag ones -- all parked at
+    # the same spot inside the plot; only ever one is visible, so they never
+    # collide. Explicit rather than legend_label=, because that folds everything
+    # into a single legend.
     leg_cls = Legend(items=cls_items, visible=not sag_first)
-    leg_sag = Legend(items=sag_items, visible=sag_first, title="sags on street")
-    for leg in (leg_cls, leg_sag):
-        mp.add_layout(leg)
+    mp.add_layout(leg_cls)
     mp.legend.click_policy = "hide"
     mp.legend.label_text_font_size = "8pt"
     mp.legend.background_fill_alpha = 0.85
@@ -272,27 +351,45 @@ def main():
         min_characters=2, width=380, placeholder=f"search {len(names):,} streets")
     colour = RadioButtonGroup(labels=["road class", "sags per street"],
                               active=int(sag_first), width=260)
-    colour.js_on_change("active", CustomJS(
-        args=dict(CLS=cls_lines, SAG=sag_lines, HIT=hits, hiC=hi_cls,
-                  hiS=hi_sag, legC=leg_cls, legS=leg_sag, title=mp.title,
-                  T=TITLE, TS=TITLE_SAG),
-        code="""
-        const sag = cb_obj.active === 1;
-        // Both legends hide by flipping renderer.visible, so switching also
-        // clears whatever the other mode had hidden -- deliberate: the two
-        // legends filter on different keys and cannot be kept in step. The hit
-        // targets come back either way, or a class hidden here would stay
-        // untappable over there.
+    # A checkbox, not a second radio pair: there is one alternative corpus and
+    # the primary is the default. None of this exists without --pages-alt, and
+    # the JS below treats a null widget as "always the primary".
+    smooth = None
+    if len(variants) > 1:
+        smooth = CheckboxGroup(labels=[f"{variants[1]['label']} smoothing"],
+                               active=[], width=320,
+                               stylesheets=[InlineStyleSheet(css=CHECKBOX_CSS)])
+
+    labels = [var["label"] for var in variants]
+    titles_sag = [TITLE_SAG if len(variants) == 1
+                  else f"{TITLE_SAG} ({lab} smoothing)" for lab in labels]
+
+    # Shared by the colouring switch and the smoothing checkbox: both change
+    # which renderers are on, and each has to honour the other's state.
+    VIS_JS = """
+        const sag = colour.active === 1;
+        const v = (SM && SM.active.length) ? 1 : 0;
+        // Legends hide by flipping renderer.visible, so switching also clears
+        // whatever the other mode had hidden -- deliberate: the legends filter
+        // on different keys and cannot be kept in step. The hit targets come
+        // back either way, or a class hidden here would stay untappable over
+        // there.
         for (const r of CLS) { r.visible = !sag; }
-        for (const r of SAG) { r.visible = sag; }
+        for (let i = 0; i < SAG.length; i++) { SAG[i].visible = sag && SAGV[i] === v; }
         for (const r of HIT) { r.visible = true; }
-        hiC.visible = !sag;
-        hiS.visible = sag;
         legC.visible = !sag;
-        legS.visible = sag;
-        title.text = sag ? TS : T;
-    """))
-    pick = Div(text="<i>tap a street on the map, or search above</i>",
+        for (let k = 0; k < LEGS.length; k++) { LEGS[k].visible = sag && k === v; }
+        title.text = sag ? TS[v] : T;
+    """
+    vis_args = dict(CLS=cls_lines, SAG=sag_lines, SAGV=sag_var, HIT=hits,
+                    legC=leg_cls, LEGS=sag_legs, title=mp.title, T=TITLE,
+                    TS=titles_sag, colour=colour, SM=smooth)
+    colour.js_on_change("active", CustomJS(args=vis_args, code=VIS_JS))
+
+    opens = ("" if len(variants) == 1 else
+             f" &middot; pages open at {labels[0]} smoothing, "
+             f"tick the box for {labels[1]}")
+    pick = Div(text="<i>tap a street on the map, or search above</i>" + opens,
                width=MAP_W,
                styles={"font-family": "monospace", "font-size": "13px",
                        "padding": "4px 0", "min-height": "20px"})
@@ -302,11 +399,24 @@ def main():
                      "border:1px solid #d5dade'>no street selected</div>",
                 width=FRAME_W, height=FRAME_H, disable_math=True)
 
-    # name -> [href, x0, y0, x1, y1, inlets, sags, unserved, length]
-    meta = {nm: [pfx + str(idx.at[nm, "file"]), *[float(q) for q in bbox[nm]],
-                 int(idx.at[nm, "n_inlets"]), int(idx.at[nm, "n_sags"]),
-                 int(idx.at[nm, "n_unserved"]), float(idx.at[nm, "length_m"])]
+    # name -> everything the page needs about a street. href/sags/unserved are
+    # one entry per variant, indexed by the checkbox; inlets and length do not
+    # move with the smoothing window, so they stay scalars.
+    prim = variants[0]["idx"]
+    meta = {nm: dict(href=[var["pfx"] + str(var["idx"].at[nm, "file"])
+                           for var in variants],
+                     bbox=[float(q) for q in bbox[nm]],
+                     sags=[int(var["idx"].at[nm, "n_sags"]) for var in variants],
+                     unserved=[int(var["idx"].at[nm, "n_unserved"])
+                               for var in variants],
+                     inlets=int(prim.at[nm, "n_inlets"]),
+                     length=float(prim.at[nm, "length_m"]))
             for nm in names}
+
+    # Which street is loaded, so the smoothing checkbox can reload the same one
+    # into the other corpus. A CDS rather than a JS global: every callback is a
+    # separate function body, and this is the only state they share.
+    state = ColumnDataSource(dict(nm=[""]))
 
     # Shared tail: every entry point resolves a street NAME, then this loads it.
     # Rewriting .text rebuilds the iframe, which is what navigates it -- Bokeh
@@ -315,6 +425,9 @@ def main():
     LOAD_JS = """
         const M = META[nm];
         if (M === undefined) { return; }
+        // Named vi, not v: VIS_JS declares its own v and the two get
+        // concatenated into one function body on the checkbox callback.
+        const vi = (SM && SM.active.length) ? 1 : 0;
         // Repaint the highlight from the geometry already in the browser --
         // the class sources hold it, so META does not have to carry a second
         // copy of every coordinate.
@@ -327,11 +440,13 @@ def main():
         }
         hi.data = {xs: hx, ys: hy};
         hi.change.emit();
-        pick.text = "<b>" + nm + "</b> &middot; " + M[5] + " inlets &middot; "
-                  + M[6] + " sags (" + M[7] + " unserved) &middot; "
-                  + M[8].toFixed(0) + " m &middot; <span style='color:#777'>"
-                  + M[0] + "</span>";
-        frame.text = "<iframe src='" + M[0] + "' width='%d' height='%d'"
+        state.data.nm = [nm];
+        pick.text = "<b>" + nm + "</b> &middot; " + M.inlets + " inlets &middot; "
+                  + M.sags[vi] + " sags (" + M.unserved[vi] + " unserved) &middot; "
+                  + M.length.toFixed(0) + " m &middot; " + LAB[vi]
+                  + " smoothing &middot; <span style='color:#777'>"
+                  + M.href[vi] + "</span>";
+        frame.text = "<iframe src='" + M.href[vi] + "' width='%d' height='%d'"
                    + " style='border:1px solid #d5dade' loading='lazy'></iframe>";
         if (decodeURIComponent((window.location.hash || "").slice(1)) !== nm) {
             history.replaceState(null, "", "#" + encodeURIComponent(nm));
@@ -342,7 +457,7 @@ def main():
         // Pad the street's own bbox, then grow the short side to the map's
         // aspect -- match_aspect only corrects a range Bokeh itself set, and a
         // range assigned from JS would otherwise squash the basemap.
-        let [x0, y0, x1, y1] = [M[1], M[2], M[3], M[4]];
+        let [x0, y0, x1, y1] = M.bbox;
         const px = Math.max(0.25*(x1 - x0), 120), py = Math.max(0.25*(y1 - y0), 120);
         x0 -= px; x1 += px; y0 -= py; y1 += py;
         const ar = %f, bw = x1 - x0, bh = y1 - y0;
@@ -352,7 +467,8 @@ def main():
     """ % (MAP_W/MAP_H)
 
     cb_args = dict(META=meta, pick=pick, frame=frame, S=srcs, hi=hi,
-                   xr=mp.x_range, yr=mp.y_range)
+                   xr=mp.x_range, yr=mp.y_range, SM=smooth, LAB=labels,
+                   state=state)
 
     tap = CustomJS(args=cb_args, code="""
         // One TapTool covers every class, so find which source took the hit.
@@ -381,15 +497,43 @@ def main():
         if (!nm) { return; }
     """ + LOAD_JS + ZOOM_JS)
 
+    if smooth is not None:
+        # Everything the window touches, in one callback: which renderers are
+        # drawn, the counts behind the tooltips, and the page in the iframe.
+        # Nothing re-zooms -- the view is where the reader put it, and only the
+        # smoothing changed.
+        smooth.js_on_change("active", CustomJS(
+            args={**vis_args, **cb_args}, code=VIS_JS + """
+            // Tooltips name fixed columns, so move the variant under them.
+            for (const s of S) {
+                s.data.n_sags = s.data["n_sags_v" + v];
+                s.data.n_unserved = s.data["n_unserved_v" + v];
+                s.change.emit();
+            }
+            const nm = state.data.nm[0];
+            if (!nm) { return; }
+        """ + LOAD_JS))
+
     os.makedirs(os.path.dirname(out), exist_ok=True)
     doc = Document()
-    doc.add_root(column(row(search, colour), pick, mp, frame))
+    # The checkbox goes between the map and the iframe, not in the header strip:
+    # it changes which page loads below it, so it belongs next to that page
+    # rather than beside the search box it has nothing to do with.
+    body = [row(search, colour), pick, mp]
+    if smooth is not None:
+        body.append(smooth)
+    body.append(frame)
+    doc.add_root(column(*body))
     doc.js_on_event(DocumentReady, ready)
     output_file(out, title="Livermore stormdrain — street index", mode="cdn")
     save(doc)
     n_seg = sum(len(s.data["xs"]) for s in srcs)
     print(f"{n_seg:,} segments over {len(names):,} streets -> {out}  "
           f"({os.path.getsize(out)/1e6:.1f} MB)")
+    for var in variants:
+        sub = var["idx"].reindex(names)
+        print(f"  {var['label']:>6} smoothing: {int(sub.n_sags.sum()):,} sags, "
+              f"{int(sub.n_unserved.sum()):,} unserved   ({var['pages']})")
     return 0
 
 

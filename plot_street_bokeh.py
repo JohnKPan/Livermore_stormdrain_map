@@ -21,6 +21,7 @@ Usage:
     python plot_street_bokeh.py --street "CONCANNON BL"
     python plot_street_bokeh.py --random 20 --seed 3
     python plot_street_bokeh.py --all --sv-key AIza...
+    python plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
 """
 
 import argparse
@@ -39,12 +40,16 @@ from pyproj import Transformer
 
 from plot_street_drains import (DATUM_SHIFT_M, DEFAULT_STYLE, STYLE,
                                 load_inlets, prepare)
-from plot_street_profiles import safe_name
+from plot_street_profiles import SMOOTH_M, safe_name
 
 POINTS = "derived/segments_points_1m.parquet"
 INLETS = "derived/storm_inlets.csv"
 OUTDIR = "Stormdrain_map/streets"
-PROF_H, MAP_H, PANEL_W = 320, 560, 1180
+# The profile is the panel the page is read for, and at 320 px a Livermore
+# street -- tens of metres of relief over kilometres -- was drawn nearly flat.
+# Height only: PANEL_W is pinned by the overview's iframe, which embeds these
+# pages at FRAME_W and would gain a horizontal scrollbar if this grew.
+PROF_H, MAP_H, PANEL_W = 480, 560, 1180
 PROF_ARROW_FRAC = 0.16    # arrow length as a fraction of the visible y-range
 MAP_ARROW_FRAC = 0.10
 SV_W = 440                # embedded Street View panel, when a key is supplied
@@ -95,8 +100,12 @@ def build(street, st, inlets, args, outdir, used):
                   y_axis_label="elevation (m, NAVD88)",
                   x_range=Range1d(-0.02*float(d[-1]), 1.02*float(d[-1])),
                   y_range=Range1d(ylo - ypad, yhi + ypad),
+                  # The smoothing window is in the title because two sets of
+                  # these pages now exist side by side, and the sag markers
+                  # below differ between them -- see prepare().
                   title=f"{street} — elevation profile "
-                        f"({len(near)} inlets within {args.max_offset:g} m)")
+                        f"({len(near)} inlets within {args.max_offset:g} m, "
+                        f"{args.smooth:g} m smoothing)")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     line_sm = prof.line("d", "sm", source=src, line_color="#33475b",
                         line_width=2)
@@ -283,7 +292,7 @@ def build(street, st, inlets, args, outdir, used):
     cb_map = CustomJS(args=dict(SRC=src, cur=cur, vline=vline, read=read),
                       code=LINK_JS)
     path_tips = [("chainage", "@d{0.0} m"), ("elev", "@z{0.00} m"),
-                 ("smoothed", "@sm{0.00} m"),
+                 (f"smoothed ({args.smooth:g} m)", "@sm{0.00} m"),
                  ("lat, lon", "@lat{0.000000}, @lon{0.000000}")]
     # vline mode on a scatter returns every point under the cursor, which
     # stacks five near-identical rows once zoomed in. Hovering the line with
@@ -301,10 +310,13 @@ def build(street, st, inlets, args, outdir, used):
     # panel below is an ordinary Div in the layout, so its anchor behaves like
     # any other link -- and it must be its OWN Div, because `read` is rewritten
     # on every hover and moving towards a link crosses the plots.
+    # Two points up on the hover readout above it: this line is read carefully
+    # -- asset ID, elevations, and the Street View link -- while the hover line
+    # is glanced at and replaced on every mouse move.
     pick = Div(text="<i>tap an inlet marker for its Street View link</i>",
                width=PANEL_W,
-               styles={"font-family": "monospace", "font-size": "13px",
-                       "padding": "4px 0", "min-height": "20px"})
+               styles={"font-family": "monospace", "font-size": "15px",
+                       "padding": "4px 0", "min-height": "22px"})
 
     # ---------------- embedded Street View ----------------
     # Maps Embed API: a plain iframe, free and unmetered, but it needs a key.
@@ -387,6 +399,10 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--outdir", default=OUTDIR)
     ap.add_argument("--max-offset", type=float, default=30.0)
+    # Moves both the drawn profile and the sags, so a second window means a
+    # second output directory rather than an overwrite of the first.
+    ap.add_argument("--smooth", type=float, default=SMOOTH_M,
+                    help=f"rolling-mean window (m) (default {SMOOTH_M:g})")
     ap.add_argument("--sag-prom", type=float, default=0.20)
     ap.add_argument("--sag-sep", type=float, default=10.0)
     ap.add_argument("--sag-window", type=float, default=60.0)

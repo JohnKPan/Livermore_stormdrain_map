@@ -19,6 +19,7 @@ Usage:
     python plot_street_drains.py --street "A ST"
     python plot_street_drains.py --street "AIRWAY BL" --max-offset 25
     python plot_street_drains.py --all --min-drains 5
+    python plot_street_drains.py --street "A ST" --smooth 10
 """
 
 import argparse
@@ -34,7 +35,8 @@ import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
-from plot_street_profiles import chain_segments, build_profile, safe_name
+from plot_street_profiles import (SMOOTH_M, chain_segments, build_profile,
+                                  safe_name)
 
 POINTS = "derived/segments_points_1m.parquet"
 INLETS = "derived/storm_inlets.csv"
@@ -145,7 +147,7 @@ def prepare(st, inlets, args):
         segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
                      sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
     e, n, z, disc, run, _, origin = chain_segments(segs)
-    d, smooth = build_profile(e, n, z, run)
+    d, smooth = build_profile(e, n, z, run, args.smooth)
     near = snap(inlets, e, n, d, args.max_offset)
     if not near.empty:
         near = near.assign(dem_m=z[near.path_idx.to_numpy()])
@@ -154,7 +156,8 @@ def prepare(st, inlets, args):
         near = near.assign(num=np.arange(1, len(near) + 1))
 
     # Sags come from the smoothed profile: at 1 m the elevation noise (~2 cm)
-    # would manufacture minima everywhere.
+    # would manufacture minima everywhere. --smooth therefore moves the sag
+    # count as well as the drawn line -- a shorter window keeps shallower dips.
     sags = find_sags(d, smooth, run, args.sag_prom, args.sag_sep, args.sag_edge)
     marked, unserved = [], []
     to4326 = Transformer.from_crs("EPSG:26910", "EPSG:4326", always_xy=True)
@@ -285,7 +288,7 @@ def render(street, st, prep, args, outdir, used):
         ax.plot(d[m], z[m], color="#b6c4d2", lw=0.7,
                 label="DEM, raw 1 m" if r == 0 else None)
         ax.plot(d[m], smooth[m], color="#33475b", lw=1.8,
-                label="DEM, 25 m mean" if r == 0 else None)
+                label=f"DEM, {args.smooth:g} m mean" if r == 0 else None)
 
     for t, g in near.groupby("type"):
         sty = STYLE.get(t, DEFAULT_STYLE)
@@ -507,6 +510,9 @@ def main():
                     help="CartoDB tile style: Voyager, Positron, DarkMatter; "
                          "anything else falls back to OpenStreetMap")
     ap.add_argument("--outdir", default=OUTDIR)
+    ap.add_argument("--smooth", type=float, default=SMOOTH_M,
+                    help="rolling-mean window (m) behind both the drawn "
+                         f"profile and sag detection (default {SMOOTH_M:g})")
     ap.add_argument("--sag-prom", type=float, default=0.20,
                     help="min prominence (m) for a profile dip to count as a sag")
     ap.add_argument("--sag-sep", type=float, default=10.0,

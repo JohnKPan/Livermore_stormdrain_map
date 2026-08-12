@@ -1,5 +1,5 @@
-# Nothing here is committed but source. Every artifact below is reproducible
-# from the scripts -- see readme.txt for the seven commands that rebuild it.
+# Nothing here is committed but source. Every artifact below is reproducible:
+# run_pipeline.sh rebuilds the lot, and readme.txt documents each step.
 #
 # NOTE: gitignore only treats "#" as a comment at the START of a line. A
 # trailing comment becomes part of the pattern and silently matches nothing.

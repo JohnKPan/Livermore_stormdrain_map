@@ -9,7 +9,17 @@ Data acquisition -- Livermore stormdrain study
 That is the Stormdrain_map/ folder of step 5, served from this repo's gh-pages
 branch. Everything below is how to rebuild it from scratch.
 
-Everything runs from the project root. The whole pipeline, in order:
+Everything runs from the project root. One command runs the lot:
+
+    ./run_pipeline.sh                 full rebuild -- fetch, derive, render
+    ./run_pipeline.sh --render-only   skip the fetches, rebuild the deliverable
+
+That script is the list below, in order, with the two page builds run at the
+same time -- they are independent, so the render step takes about 6 minutes
+instead of the ~12 it takes back to back. --no-parallel puts them back to back.
+It picks the venv python if there is one, and falls back to whatever is on PATH.
+
+The steps themselves, should you want to run them by hand:
 
     .venv/Scripts/python.exe fetch_livermore_street_centerlines.py
     .venv/Scripts/python.exe fetch_inlets.py
@@ -17,18 +27,24 @@ Everything runs from the project root. The whole pipeline, in order:
     .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet
     .venv/Scripts/python.exe add_elevation.py --no-csv
     .venv/Scripts/python.exe plot_street_bokeh.py --all
-    .venv/Scripts/python.exe plot_city_overview.py
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
+    .venv/Scripts/python.exe plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
 
 The first three pull every external input; the rest derive everything else from
 them. Nothing has to be downloaded by hand. Sections below document each step,
 then the optional static renders.
+
+The two plot_street_bokeh.py runs differ only in the elevation smoothing window
+and where they write. Both corpora are kept, and the overview's checkbox
+switches between them -- see section 5.
 
 (Plain `python fetch_inlets.py` works too if the venv is activated -- the
 explicit interpreter path just avoids depending on that.)
 
 Order matters in exactly two places: add_elevation.py needs the parquet that
 extract_centerline_latlon.py writes, and plot_city_overview.py needs the
-_index.csv that plot_street_bokeh.py --all writes.
+_index.csv that EACH plot_street_bokeh.py --all run writes -- one per smoothing
+window, both before the overview.
 
 All three fetches are safe to re-run. The centerline and inlet fetches
 overwrite their outputs; fetch_dem.py skips tiles already fully downloaded and
@@ -185,12 +201,14 @@ elevations, range 109.12..240.71 m. 23.7 MB parquet.
 The deliverable -- interactive, one page per street plus a city-wide picker:
 
     .venv/Scripts/python.exe plot_street_bokeh.py --all
-    .venv/Scripts/python.exe plot_city_overview.py
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
+    .venv/Scripts/python.exe plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
 
 Writes: Stormdrain_map/index.html            city-wide picker -- OPEN THIS ONE
         Stormdrain_map/streets/<STREET>.html linked profile + plan view, one
-                                             per street
+                                             per street, 25 m smoothing
         Stormdrain_map/streets/_index.csv    per-street inlet and sag counts
+        Stormdrain_map/streets_10m/...       the same, at 10 m smoothing
 
 Stormdrain_map/ is the whole deliverable: self-contained, and the only thing
 outside derived/. Zip that one folder to hand the study to someone.
@@ -202,8 +220,15 @@ collision-breaking counter and cannot be recomputed independently).
 The overview does not sit beside the pages it opens, so its iframe links carry
 a "streets/" prefix. That prefix is computed from --out and --pages rather than
 hardcoded, so either can move -- put both in one directory and it disappears.
-Change --outdir on plot_street_bokeh.py and --pages here together, or the
-overview will point at pages that are not there.
+Change --outdir on plot_street_bokeh.py and --pages (or --pages-alt) here
+together, or the overview will point at pages that are not there.
+
+The iframe is sized to the street page's own height: FRAME_H in
+plot_city_overview.py against PROF_H + MAP_H in plot_street_bokeh.py. Raise the
+elevation profile there and FRAME_H has to follow, or the embedded page gains an
+inner scrollbar. Width is the tighter constraint and runs the other way --
+PANEL_W must stay under FRAME_W, or the iframe scrolls sideways -- which is why
+the profile was made taller rather than wider.
 
 The overview carries two colourings, switched by the radio button beside its
 search box:
@@ -215,17 +240,61 @@ search box:
                    opens on.
 
 Legend entries hide their streets in either colouring -- hiding "no sag" leaves
-just the 337 streets that have one, which is the view worth bookmarking. The
-switch resets whatever the other legend had hidden, since the two filter on
-different keys. Tap, hover, search and the #street bookmark work the same in
-both; the tapped-street highlight turns blue under the sag colouring, where red
-would vanish into the top of the ramp.
+just the streets that have one (356 at 25 m, 464 at 10 m), which is the view
+worth bookmarking. The switch resets whatever the other legend had hidden, since
+the legends filter on different keys and cannot be kept in step; so does the
+smoothing checkbox, for the same reason. Tap, hover, search and the #street
+bookmark work the same in both, and so does the tapped-street highlight: one
+blue line in either colouring. Blue rather than the obvious red because red
+vanishes into the top of the sag ramp, which is itself red. It does sit near
+Major Collector's blue under the road-class colouring, but at 5 px against 2 it
+is the widest and brightest line on the map.
+
+The #street bookmark holds the street name only, not the smoothing -- a
+bookmarked link reopens at 25 m whichever box was ticked when it was made.
 
 Note what the sag colouring is and is not: it is a count per street, painted
 along the whole street, so ISABEL AV reads dark red over all 15 km for 11 sags
 that sit at 11 points. Long streets collect more sags -- take the colour as
 "how much of this street's drainage is worth reading", not as a density. The
 legend counts streets; the road-class legend counts centerline segments.
+
+Smoothing -- 25 m or 10 m, and the checkbox between them
+--------------------------------------------------------
+
+--smooth is the rolling-mean window over the 1 m elevation samples, in metres.
+It lives in plot_street_profiles.py (SMOOTH_M = 25.0, the default) and
+plot_street_drains.py and plot_street_bokeh.py take the same flag, because all
+three build their profile through that module's build_profile(). It is the one
+knob they share; changing SMOOTH_M moves all of them.
+
+It is not cosmetic. Sags are found ON the smoothed profile -- at 1 m the ~2 cm
+DEM noise manufactures minima everywhere -- so the window decides how shallow a
+dip still counts, and the two builds genuinely disagree:
+
+                        25 m          10 m
+    sags                 597           823
+    unserved sags        168           246
+    streets with a sag   356           464
+
+176 streets differ, and never in the other direction: a shorter window only ever
+keeps more dips, because a longer one averages them away. Neither is the right
+answer. 25 m is the baseline the DEM's own accuracy note argues for (see
+derived/segments_points_1m.meta.json -- adjacent 1 m deltas are noise); 10 m
+catches real but shallow ponding that 25 m flattens, at the cost of promoting
+some noise. The checkbox exists so the two can be read against each other rather
+than one being picked blind.
+
+Ticking "10 m smoothing", between the map and the iframe, switches at once: the
+page in the iframe, the sag counts in the hover tooltips and the picked-street
+line, and the sag colouring with its own legend. The road-class colouring does
+not move -- it has nothing to do with elevation. The view does not re-zoom, so a
+street stays where it is while the smoothing changes underneath it.
+
+The checkbox appears only when --pages-alt is given; without it the overview
+behaves exactly as before, over one corpus. Both corpora must cover the same
+streets -- a street missing from either is dropped, with a warning, since the
+toggle would otherwise break on a street that exists in only one of them.
 
 Pages load BokehJS from a CDN, so viewing needs a network connection, but they
 work opened straight from disk -- no local server needed.
@@ -236,9 +305,15 @@ API key (that API is free and unmetered). The key is written into every page,
 so restrict it to the Maps Embed API in the Cloud console -- HTTP referrer
 restrictions cannot cover file:// pages. Changing the key means a full rebuild.
 
-Run of 2026-08-09: 1,728 pages, 91.4 MB, about 10 minutes for --all; the
-overview is seconds on top. 1,404 streets carry inlets; 568 sags found, of
-which 158 have no inlet serving them.
+Run of 2026-08-12, via run_pipeline.sh --render-only: 1,728 pages per corpus,
+88 MB each, 6m 03s for both --all runs in parallel and 4s for the overview on
+top, which lands at 4.2 MB. 1,404 streets carry inlets. 597 sags at 25 m, of
+which 168 have no inlet serving them; 823 and 246 at 10 m.
+
+(The earlier run of 2026-08-09 reported 568 sags and 158 unserved at 25 m. The
+difference is not the smoothing: it is the chaining fix that starts each street
+at a real terminal rather than the bbox corner, which changed some streets'
+paths and therefore their profiles.)
 
 
 Static renders -- optional, none of the above depends on them:
