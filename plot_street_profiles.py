@@ -1,10 +1,10 @@
 """Plot the elev_m profile of every street, one PNG per street name.
 
 A street name usually covers several centerline segments, so the segments are
-chained end-to-end into a single path before plotting. The chain always starts
-at whichever terminal endpoint lies closest to the northwest corner of that
-street's bounding box, so every profile reads NW -> SE and repeated runs are
-directly comparable.
+chained end-to-end into a single path before plotting. The chain starts at a
+terminal of that street -- the westmost for a street running mostly E-W, the
+northmost otherwise -- so repeated runs are directly comparable. Which end that
+is appears on the x-axis label and in _index.csv, since it varies by street.
 
 Because 1 m samples are noise-dominated point-to-point (SNR ~0.23 against a
 ~2 cm noise floor), each plot shows the raw profile faintly with a 25 m rolling
@@ -34,6 +34,8 @@ POINTS = "derived/segments_points_1m.parquet"
 OUTDIR = "derived/profiles"
 GAP_BREAK_M = 40.0        # larger jumps between segments are drawn as a break
 SMOOTH_M = 25.0
+NODE_TOL_M = 2.0          # segment endpoints this close share one junction node
+OPPOSITE = {"W": "E", "N": "S"}
 
 
 def safe_name(name, used):
@@ -47,23 +49,68 @@ def safe_name(name, used):
     return s
 
 
-def chain_segments(segs):
-    """Greedily order segments into one path starting nearest the NW corner.
+def endpoint_nodes(segs):
+    """Cluster segment endpoints into the junction nodes they share.
 
-    segs: list of (oid, e, n, z, disc) arrays, each already ordered along its
-    segment. Returns the concatenated arrays plus the gap preceding each.
+    Returns (pos, degree): node positions as an (N, 2) array, and how many
+    segment ends meet at each. Degree 1 marks a terminal -- a true end of the
+    street, rather than a joint with the next segment along.
+    """
+    eps = np.array([(s[1][i], s[2][i]) for s in segs for i in (0, -1)])
+    node = np.full(len(eps), -1)
+    pos, k = [], 0
+    for i in range(len(eps)):
+        if node[i] >= 0:
+            continue
+        same = (np.hypot(eps[:, 0] - eps[i, 0], eps[:, 1] - eps[i, 1]) < NODE_TOL_M)
+        same &= node < 0
+        node[same] = k
+        pos.append(eps[same].mean(axis=0))
+        k += 1
+    return np.array(pos), np.bincount(node, minlength=k)
+
+
+def path_origin(segs):
+    """Where a street's path should start, and the compass label for that end.
+
+    Candidates are the terminals of the segment graph, so the start always lies
+    on the road. The corner of the bounding box does not: for a street that
+    bends, its westmost easting and northmost northing belong to different
+    places, and the nearest endpoint to that phantom corner can be a junction
+    mid-street. Patterson Pass Rd started 540 m in and then jumped 3.5 km back.
+
+    Which terminal wins follows the street's longer axis -- the westmost for one
+    running mostly E-W, the northmost for the rest. A single rule like NW -> SE
+    cannot work, because a street whose west end is also its south end has no
+    NW end to start from.
     """
     all_e = np.concatenate([s[1] for s in segs])
     all_n = np.concatenate([s[2] for s in segs])
-    nw = np.array([all_e.min(), all_n.max()])          # NW corner of the bbox
+    pos, deg = endpoint_nodes(segs)
+    cand = pos[deg == 1]
+    if not len(cand):
+        cand = pos                       # a closed loop has no terminal at all
+    if np.ptp(all_e) >= np.ptp(all_n):
+        return cand[cand[:, 0].argmin()], "W"
+    return cand[cand[:, 1].argmax()], "N"
+
+
+def chain_segments(segs):
+    """Greedily order segments into one path, starting at one end of the street.
+
+    segs: list of (oid, e, n, z, disc) arrays, each already ordered along its
+    segment. Returns the concatenated arrays, the gap preceding each, and the
+    compass label of the end the path starts from -- see path_origin.
+    """
+    start, origin = path_origin(segs)
 
     remaining = list(range(len(segs)))
-    # Seed with whichever endpoint of any segment is closest to the NW corner.
+    # Seed with whichever endpoint of any segment is closest to that end.
     best, best_d, best_flip = None, np.inf, False
     for i in remaining:
         _, e, n, _, _ = segs[i]
         for flip, (px, py) in ((False, (e[0], n[0])), (True, (e[-1], n[-1]))):
-            d = np.hypot(px - nw[0], py - nw[1])
+            d = np.hypot(px - start[0], py - start[1])
             if d < best_d:
                 best, best_d, best_flip = i, d, flip
 
@@ -103,7 +150,7 @@ def chain_segments(segs):
         D.append(disc)
         RUN.append(np.full(len(e), run))
     return (np.concatenate(E), np.concatenate(N), np.concatenate(Z),
-            np.concatenate(D), np.concatenate(RUN), gaps)
+            np.concatenate(D), np.concatenate(RUN), gaps, origin)
 
 
 def build_profile(e, n, z, run):
@@ -150,7 +197,8 @@ def main():
             sg = sg.sort_values("dist_along_m")
             segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
                          sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
-        e, n, z, disc, run, gaps = chain_segments(segs)
+        e, n, z, disc, run, gaps, origin = chain_segments(segs)
+        far = OPPOSITE[origin]
         d, smooth = build_profile(e, n, z, run)
 
         if d[-1] < args.min_length:
@@ -158,7 +206,7 @@ def main():
             continue
 
         fname = safe_name(name, used) + ".png"
-        # signed end-minus-start: positive means the street climbs going NW -> SE
+        # signed end-minus-start: positive means the street climbs going origin -> far
         change = z[-1] - z[0]
         grade = change / d[-1] * 100 if d[-1] > 0 else 0.0
 
@@ -169,8 +217,10 @@ def main():
                     label="raw 1 m" if r == 0 else None)
             ax.plot(d[m], smooth[m], color="#2e86c1", lw=1.9,
                     label=f"{SMOOTH_M:g} m rolling mean" if r == 0 else None)
-        ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5, label="NW start")
-        ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5, label="end")
+        ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5,
+                label=f"{origin} start")
+        ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5,
+                label=f"{far} end")
 
         bad = disc > 20
         nbad = int(bad.sum())
@@ -179,7 +229,7 @@ def main():
                     ls="none", zorder=6,
                     label=f"discontinuity ({nbad})")
 
-        ax.set_xlabel("distance along street from NW end (m)")
+        ax.set_xlabel(f"distance along street from {origin} end (m)")
         ax.set_ylabel("elevation (m, NAVD88)")
         nseg = len(segs)
         nbreak = int(run.max())
@@ -189,7 +239,7 @@ def main():
         if nbad:
             bits.append(f"{nbad} point{'s' if nbad != 1 else ''} flagged")
         ax.set_title(f"{name}   —   " + " · ".join(bits) + "\n"
-                     f"NW end {z[0]:.1f} m → SE end {z[-1]:.1f} m   "
+                     f"{origin} end {z[0]:.1f} m → {far} end {z[-1]:.1f} m   "
                      f"(net {change:+.2f} m, {grade:+.2f}% mean grade)",
                      fontsize=10)
         ax.grid(alpha=0.3)
@@ -199,6 +249,7 @@ def main():
 
         rows.append({"FullStreetName": name, "file": fname, "n_segments": nseg,
                      "length_m": round(float(d[-1]), 1), "n_gaps": nbreak,
+                     "origin": origin,
                      "elev_start_m": round(float(z[0]), 3),
                      "elev_end_m": round(float(z[-1]), 3),
                      "elev_min_m": round(float(np.nanmin(z)), 3),

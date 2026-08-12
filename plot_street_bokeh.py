@@ -2,7 +2,7 @@
 
 Two panels sharing one ColumnDataSource over the chained path points:
 
-  top    elevation profile (x = chainage from the NW end)
+  top    elevation profile (x = chainage from the street's W or N end)
   bottom plan view on CartoDB tiles, in Web Mercator
 
 Because both panels are built from the SAME ordered array of path points, the
@@ -91,7 +91,7 @@ def build(street, st, inlets, args, outdir, used):
                 ylo, yhi = min(ylo, v.min()), max(yhi, v.max())
     ypad = max(0.06*(yhi - ylo), 0.15)
     prof = figure(width=PANEL_W, height=PROF_H, tools="pan,wheel_zoom,box_zoom,reset",
-                  x_axis_label="distance along street from NW end (m)",
+                  x_axis_label=f"distance along street from {p['origin']} end (m)",
                   y_axis_label="elevation (m, NAVD88)",
                   x_range=Range1d(-0.02*float(d[-1]), 1.02*float(d[-1])),
                   y_range=Range1d(ylo - ypad, yhi + ypad),

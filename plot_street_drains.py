@@ -1,6 +1,7 @@
 """Street elevation profile with storm drain inlets, plus a plan-view map.
 
-Top panel : DEM elevation along the street (NW -> SE), with every storm inlet
+Top panel : DEM elevation along the street (W -> E, or N -> S for a street that
+            runs mostly north-south), with every storm inlet
             within --max-offset of the centerline placed at its chainage.
             Inlets with a surveyed TopOfGrate are drawn at that elevation, with
             a stem down to InvertElevation1 showing pipe depth. Inlets without
@@ -143,13 +144,13 @@ def prepare(st, inlets, args):
         sg = sg.sort_values("dist_along_m")
         segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
                      sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
-    e, n, z, disc, run, _ = chain_segments(segs)
+    e, n, z, disc, run, _, origin = chain_segments(segs)
     d, smooth = build_profile(e, n, z, run)
     near = snap(inlets, e, n, d, args.max_offset)
     if not near.empty:
         near = near.assign(dem_m=z[near.path_idx.to_numpy()])
-        # sorted by chainage in snap(), so numbers run 1..N from the NW end and
-        # read left-to-right on the profile as well as along the map
+        # sorted by chainage in snap(), so numbers run 1..N from the start end
+        # and read left-to-right on the profile as well as along the map
         near = near.assign(num=np.arange(1, len(near) + 1))
 
     # Sags come from the smoothed profile: at 1 m the elevation noise (~2 cm)
@@ -158,7 +159,7 @@ def prepare(st, inlets, args):
     marked, unserved = [], []
     to4326 = Transformer.from_crs("EPSG:26910", "EPSG:4326", always_xy=True)
     # find_sags returns chainage order, so this numbers the surviving sags
-    # 1..N from the NW end -- independent of how many inlets exist
+    # 1..N from the start end -- independent of how many inlets exist
     for k, (chain, elev, prom, pidx) in enumerate(sags, 1):
         row = None
         if not near.empty:
@@ -203,13 +204,14 @@ def prepare(st, inlets, args):
         unserved.append(rec)
 
     return dict(e=e, n=n, z=z, run=run, d=d, smooth=smooth, near=near,
-                sags=sags, marked=marked, unserved=unserved)
+                sags=sags, marked=marked, unserved=unserved, origin=origin)
 
 
 def render(street, st, prep, args, outdir, used):
     e, n, z, run = prep["e"], prep["n"], prep["z"], prep["run"]
     d, smooth, near = prep["d"], prep["smooth"], prep["near"]
     marked, unserved = prep["marked"], prep["unserved"]
+    origin = prep["origin"]
 
     tr = Transformer.from_crs("EPSG:26910", "EPSG:4326", always_xy=True)
     slon, slat = tr.transform(e, n)
@@ -349,7 +351,7 @@ def render(street, st, prep, args, outdir, used):
 
     ax.set_xlim(*xlim)
     ax.set_ylim(*ylim)
-    ax.set_xlabel("distance along street from NW end (m)")
+    ax.set_xlabel(f"distance along street from {origin} end (m)")
     ax.set_ylabel("elevation (m, NAVD88)")
     shift_note = (f"grate/invert shifted {DATUM_SHIFT_M:+.3f} m to NAVD88"
                   if args.datum_shift else "raw inlet elevations, NO datum shift")
