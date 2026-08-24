@@ -13,6 +13,12 @@ streets/
 derived/
 Stormdrain_map/
 
+# Bay Area geojson outputs: city boundaries from TIGERweb, and the road-surface
+# polygons buffered off the Overture centerlines. Both reproducible from their
+# fetch scripts; the street split lives under streets/ above.
+city_geojson/
+street_polygons/
+
 # Local environment
 .venv/
 __pycache__/
