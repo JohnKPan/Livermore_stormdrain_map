@@ -24,6 +24,7 @@ Usage:
     python plot_street_bokeh.py --all        # once, to build the pages
     python plot_city_overview.py             # then this
     python plot_city_overview.py --color-by sags    # open on the sag colouring
+    python plot_city_overview.py --opens-at "10 m"  # open on that window
     python plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
     python plot_city_overview.py \
         --pages     Stormdrain_map/streets_25m --label     "25 m" \
@@ -163,6 +164,10 @@ def main():
                          "per --pages-alt, in the same order")
     ap.add_argument("--out", default=OUT,
                     help="path for the overview page itself")
+    ap.add_argument("--opens-at", default=None, metavar="LABEL",
+                    help="which smoothing window the page opens on, named by "
+                         "its label (e.g. \"10 m\"). Independent of the order "
+                         "the corpora are listed in; defaults to --pages")
     ap.add_argument("--color-by", "--colour-by", dest="color_by",
                     choices=("class", "sags"), default="class",
                     help="colouring the page opens on; both are always built "
@@ -179,6 +184,18 @@ def main():
         labs = args.alt_label or []
         lab = labs[i] if i < len(labs) else os.path.basename(alt.rstrip("/\\"))
         variants.append(dict(pages=alt, label=lab))
+
+    # Which variant the page OPENS on -- deliberately not tied to the order the
+    # corpora are listed in. The selector shows them in the given order, which
+    # for 25 / 10 / 5 reads as a scale; the page can still open on any of them.
+    # Matched by label rather than index so the caller says "10 m", not "1".
+    dvi = 0
+    if args.opens_at is not None:
+        have = [var["label"] for var in variants]
+        if args.opens_at not in have:
+            ap.error(f"--opens-at {args.opens_at!r} matches no corpus; "
+                     f"labels are {have}")
+        dvi = have.index(args.opens_at)
 
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, args.out)
@@ -255,8 +272,8 @@ def main():
         data = dict(xs=r["xs"], ys=r["ys"], name=r["name"], cls=r["cls"],
                     n_inlets=stats[0].n_inlets.to_numpy(),
                     length_m=stats[0].length_m.to_numpy(),
-                    n_sags=stats[0].n_sags.to_numpy(),
-                    n_unserved=stats[0].n_unserved.to_numpy())
+                    n_sags=stats[dvi].n_sags.to_numpy(),
+                    n_unserved=stats[dvi].n_unserved.to_numpy())
         # Tooltips name fixed columns, so the toggle copies the variant it wants
         # into n_sags/n_unserved. Both sets have to be on the source to do that.
         for vi, s in enumerate(stats):
@@ -298,7 +315,7 @@ def main():
     # the JS can flip visibility without nesting.
     sag_lines, sag_var, sag_legs = [], [], []
     for vi, var in enumerate(variants):
-        shown = sag_first and vi == 0
+        shown = sag_first and vi == dvi
         sag_items = []
         for (_, label, colour, wmin), members, nms in zip(SAG_BINS, by_bin[vi],
                                                           bin_names[vi]):
@@ -358,11 +375,15 @@ def main():
     if len(variants) > 1:
         smooth = RadioButtonGroup(
             labels=[f"{var['label']} smoothing" for var in variants],
-            active=0, width=max(320, 150 * len(variants)))
+            active=dvi, width=max(320, 150 * len(variants)))
 
     labels = [var["label"] for var in variants]
     titles_sag = [TITLE_SAG if len(variants) == 1
                   else f"{TITLE_SAG} ({lab} smoothing)" for lab in labels]
+    # The figure was built with the bare TITLE_SAG, which named no window at
+    # all until the reader touched the selector. Name it from the start.
+    if sag_first:
+        mp.title.text = titles_sag[dvi]
 
     # Shared by the colouring switch and the smoothing checkbox: both change
     # which renderers are on, and each has to honour the other's state.
@@ -386,9 +407,10 @@ def main():
                     TS=titles_sag, colour=colour, SM=smooth)
     colour.js_on_change("active", CustomJS(args=vis_args, code=VIS_JS))
 
+    others = [lab for i, lab in enumerate(labels) if i != dvi]
     opens = ("" if len(variants) == 1 else
-             f" &middot; pages open at {labels[0]} smoothing; "
-             f"switch to {', '.join(labels[1:])} above the map")
+             f" &middot; pages open at {labels[dvi]} smoothing; "
+             f"switch to {', '.join(others)} above the map")
     pick = Div(text="<i>tap a street on the map, or search above</i>" + opens,
                width=MAP_W,
                styles={"font-family": "monospace", "font-size": "13px",

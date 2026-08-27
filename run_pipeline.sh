@@ -26,6 +26,11 @@ cd "$(dirname "$0")"
 # 1 m to 1 ft moved it by two. 5 m is the new shortest window -- expect it to
 # keep more shallow dips again, and more noise with them.
 SMOOTHS=(25 10 5)
+# Which window the overview OPENS on. Not the same as listing it first: the
+# selector keeps the order above, which reads as a scale, while the page can
+# open on any of them. 25 m is the smoothest and misses shallow sags; 5 m keeps
+# noise; 10 m is the working default. Must match one of SMOOTHS.
+OPENS_AT=10
 DIRS=("Stormdrain_map/streets_25m"
       "Stormdrain_map/streets_10m"
       "Stormdrain_map/streets_5m")
@@ -141,6 +146,7 @@ for i in "${!SMOOTHS[@]}"; do
     [ "$i" -eq 0 ] && continue
     ovw+=(--pages-alt "${DIRS[$i]}" --alt-label "${SMOOTHS[$i]} m")
 done
+ovw+=(--opens-at "${OPENS_AT} m")
 step "city overview" "${PY[@]}" plot_city_overview.py "${ovw[@]}"
 
 printf '\ndone in %dm %ds -- open Stormdrain_map/index.html\n' \
