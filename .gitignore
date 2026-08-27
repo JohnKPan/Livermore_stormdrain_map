@@ -13,11 +13,41 @@ streets/
 derived/
 Stormdrain_map/
 
+# Parked road-surface / street-width experiment: buffer vs osm2streets vs real
+# published polygons, plus the interactive HTML maps. Kept out of the repo --
+# it only somewhat worked, and its data outputs are large. See the folder itself.
+street_width_experiment/
+
 # Bay Area geojson outputs: city boundaries from TIGERweb, and the road-surface
 # polygons buffered off the Overture centerlines. Both reproducible from their
 # fetch scripts; the street split lives under streets/ above.
 city_geojson/
 street_polygons/
+
+# Best-available road-surface layer, two tiers: real published polygons
+# (fetch_real_street_polygons.py) and osm2streets-modelled ones
+# (build_osm2streets_polygons.py). combine_street_polygons.py picks between them.
+real_street_polygons/
+osm2streets_polygons/
+
+# osm2streets runner deps and build artifacts. The scripts are committed; the
+# WASM package is npm-installed (npm install in o2s/) and not tracked.
+o2s/node_modules/
+o2s/o2s_mod.mjs
+o2s/*.osm
+o2s/*.geojson
+
+# 1 ft OPR DEM: ~6 GB of whole tiles, plus the staged multi-block fragments
+# and the per-run VRT mosaic. All reproducible from fetch_usgs_lidar.py, which
+# skips what it already has. The manifest and log are the record of one run.
+dem_livermore/
+livermore_tiles.csv
+livermore_download.log
+
+# conda-forge environment. Only needed to mosaic collects that sit in DIFFERENT
+# projections -- gdal.Warp, which has no PyPI wheel on Windows. environment.yml
+# is committed and recreates it; the micromamba binary is a download.
+.conda/
 
 # Local environment
 .venv/

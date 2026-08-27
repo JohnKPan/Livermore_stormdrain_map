@@ -3,7 +3,7 @@
 Two panels sharing one ColumnDataSource over the chained path points:
 
   top    elevation profile (x = chainage from the street's W or N end)
-  bottom plan view on CartoDB tiles, in Web Mercator
+  bottom plan view on Esri Gray Canvas tiles, in Web Mercator
 
 Because both panels are built from the SAME ordered array of path points, the
 hovered index is a shared key -- hovering either panel moves a crosshair on the
@@ -40,9 +40,10 @@ from pyproj import Transformer
 
 from plot_street_drains import (DATUM_SHIFT_M, DEFAULT_STYLE, STYLE,
                                 load_inlets, prepare)
-from plot_street_profiles import SMOOTH_M, safe_name
+from extract_centerline_latlon import points_path
+from plot_street_profiles import SMOOTH_M, safe_name, sample_step
 
-POINTS = "derived/segments_points_1m.parquet"
+POINTS = points_path()
 INLETS = "derived/storm_inlets.csv"
 OUTDIR = "Stormdrain_map/streets"
 # The profile is the panel the page is read for, and at 320 px a Livermore
@@ -64,6 +65,24 @@ def bearing(lat1, lon1, lat2, lon2):
     return (np.degrees(np.arctan2(y, x)) + 360.0) % 360.0
 
 
+def draw_stride(d, run, draw_spacing):
+    """Indices to embed for DRAWING, thinned to about `draw_spacing` metres.
+
+    Analysis is untouched -- see the module note. The first and last points are
+    always kept so the line still spans the street, and a spacing of 0 (or a
+    corpus already coarser than the target) keeps everything.
+    """
+    if not draw_spacing or draw_spacing <= 0:
+        return np.arange(len(d))
+    stride = int(round(draw_spacing / sample_step(d, run)))
+    if stride <= 1:
+        return np.arange(len(d))
+    keep = np.arange(0, len(d), stride)
+    if keep[-1] != len(d) - 1:
+        keep = np.r_[keep, len(d) - 1]
+    return keep
+
+
 def build(street, st, inlets, args, outdir, used):
     p = prepare(st, inlets, args)
     d, z, sm = p["d"], p["z"], p["smooth"]
@@ -81,7 +100,12 @@ def build(street, st, inlets, args, outdir, used):
     mx, my = to3857.transform(e, n)
     lon, lat = to4326.transform(e, n)
 
-    src = ColumnDataSource(dict(d=d, z=z, sm=sm, mx=mx, my=my, lon=lon, lat=lat))
+    # Thin ONLY what gets drawn. lat/lon/d/z stay full-resolution locals below,
+    # because the inlet snapping indexes them with near.path_idx.
+    k = draw_stride(d, p["run"], args.draw_spacing)
+    p["drawn"] = k
+    src = ColumnDataSource(dict(d=d[k], z=z[k], sm=sm[k], mx=mx[k], my=my[k],
+                                lon=lon[k], lat=lat[k]))
     cur = ColumnDataSource(dict(d=[d[0]], z=[z[0]], mx=[mx[0]], my=[my[0]]))
 
     # ---------------- profile ----------------
@@ -125,7 +149,14 @@ def build(street, st, inlets, args, outdir, used):
                 y_range=Range1d(my.min()-pad, my.max()+pad),
                 x_axis_type="mercator", y_axis_type="mercator",
                 title=f"{street} — plan view (hover either panel to link)")
-    mp.add_tile(xyz.CartoDB.Positron)
+    # Esri.WorldGrayCanvas, not CartoDB.Positron. CARTO began requiring an API
+    # key for its raster basemaps around 2026-08-25/26 and now serves
+    # unauthenticated requests as a valid PNG watermarked "API KEY REQUIRED" --
+    # HTTP 200, no error, so the page just quietly renders a spoiled map. These
+    # tiles are fetched by the BROWSER on every page open, so every existing
+    # page was affected the moment CARTO flipped it, build date irrelevant.
+    # Gray Canvas is key-free and plays the same muted-backdrop role.
+    mp.add_tile(xyz.Esri.WorldGrayCanvas)
     mp.line("mx", "my", source=src, line_color="#12263a", line_width=2)
     # Fat transparent line as the hover target. A scatter target fails here:
     # at 3 m spacing the markers are sub-pixel on screen, so one hover lands on
@@ -401,6 +432,16 @@ def main():
     ap.add_argument("--max-offset", type=float, default=30.0)
     # Moves both the drawn profile and the sags, so a second window means a
     # second output directory rather than an overwrite of the first.
+    # Default 0 -- every point is embedded. The pages are ~4x heavier for it
+    # (0.31 GB vs 83 MB across the corpus) and the extra detail is below one
+    # screen pixel, but the raw samples stay inspectable in the page, which is
+    # what this project wants. Pass a spacing in metres to thin the DRAWN line;
+    # sags, inlets and the rolling mean are computed on every point regardless.
+    ap.add_argument("--draw-spacing", type=float, default=0.0,
+                    help="thin the embedded polyline to roughly this spacing "
+                         "(m) for DRAWING only; sags, inlets and the rolling "
+                         "mean are still computed on every point. "
+                         "0 = keep all points (default)")
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
                     help=f"rolling-mean window (m) (default {SMOOTH_M:g})")
     ap.add_argument("--sag-prom", type=float, default=0.20)
@@ -470,7 +511,8 @@ def main():
                 print(f"  {i}/{len(names)} processed", flush=True)
         else:
             print(f"wrote {os.path.basename(out):<28} "
-                  f"{len(st):>6,} pts  {len(p['near']):>3} inlets  "
+                  f"{len(st):>7,}->{len(p['drawn']):>6,} pts  "
+                  f"{len(p['near']):>3} inlets  "
                   f"{len(p['marked'])} sag  {len(p['unserved'])} unserved  "
                   f"{os.path.getsize(out)/1e3:>6.0f} KB")
     if args.all:

@@ -1,12 +1,15 @@
 """Plot the resampled centerline points on an interactive Plotly map.
 
-Reads derived/segments_points_1m.csv (or any --points file), joins
-FunctionalClass from derived/segments_endpoints.csv on OBJECTID, and writes a
-self-contained HTML map coloured by road class.
+Reads the resampled point corpus (parquet by default, or any --points file --
+.csv is read as CSV), joins FunctionalClass from derived/segments_endpoints.csv
+on OBJECTID, and writes a self-contained HTML map coloured by road class.
+
+At the 0.1 m default that corpus is ~6.7 M points, which is far more than a
+browser will draw comfortably: use --every to thin it.
 
 Usage:
-    python plot_points_map.py                     # all 667k points
-    python plot_points_map.py --every 10          # every 10th point (~67k)
+    python plot_points_map.py --every 100         # ~67k points, a sane default map
+    python plot_points_map.py                     # every point (slow, huge HTML)
     python plot_points_map.py --hover             # per-point street-name hover
     python plot_points_map.py --offline           # inline plotly.js, no CDN
 """
@@ -19,7 +22,9 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-POINTS = "derived/segments_points_1m.csv"
+from extract_centerline_latlon import SPACING, label, points_path
+
+POINTS = points_path()
 ENDPOINTS = "derived/segments_endpoints.csv"
 
 # Ordered so the busy classes draw on top of the Local mesh.
@@ -58,7 +63,11 @@ def main():
     here = os.path.dirname(os.path.abspath(__file__))
     pts_path = os.path.join(here, args.points)
 
-    df = pd.read_csv(pts_path, usecols=["OBJECTID", "FullStreetName", "lat", "lon"])
+    cols = ["OBJECTID", "FullStreetName", "lat", "lon"]
+    if pts_path.lower().endswith(".csv"):
+        df = pd.read_csv(pts_path, usecols=cols)
+    else:
+        df = pd.read_parquet(pts_path, columns=cols)
     if args.every > 1:
         df = df.iloc[::args.every].copy()
 
@@ -93,7 +102,7 @@ def main():
             kw["hovertemplate"] = "%{lat:.6f}, %{lon:.6f}<extra>" + name + "</extra>"
         fig.add_trace(go.Scattermap(
             # float64 numpy -> plotly 6 serialises as base64 typed arrays, far
-            # smaller than JSON text and lossless at 1 m precision.
+            # smaller than JSON text and lossless at the corpus spacing.
             lat=sub.lat.to_numpy(dtype=np.float64),
             lon=sub.lon.to_numpy(dtype=np.float64),
             mode="markers",
@@ -110,14 +119,16 @@ def main():
         ),
         margin=dict(l=0, r=0, t=44, b=0),
         title=(f"Livermore street centerline — {len(df):,} points "
-               f"({'every ' + str(args.every) + 'th of ' if args.every > 1 else ''}1 m spacing)"),
+               f"({'every ' + str(args.every) + 'th of ' if args.every > 1 else ''}"
+               f"{SPACING:g} m spacing)"),
         legend=dict(itemsizing="constant", bgcolor="rgba(255,255,255,0.85)",
                     bordercolor="#ccc", borderwidth=1, x=0.01, y=0.99),
         height=860,
     )
 
     suffix = "" if args.every == 1 else f"_every{args.every}"
-    out = args.out or os.path.join(here, "derived", f"map_points_1m{suffix}.html")
+    out = args.out or os.path.join(
+        here, "derived", f"map_points_{label(SPACING)}{suffix}.html")
     fig.write_html(out, include_plotlyjs=True if args.offline else "cdn",
                    full_html=True)
     print(f"{len(df):,} points -> {out}  ({os.path.getsize(out) / 1e6:.1f} MB)")

@@ -4,14 +4,26 @@ Input : streets/Street_Centerline_-_Public.geojson (EPSG:4326, LineString), as
         written by fetch_livermore_street_centerlines.py. Override with --src.
 
 Default run writes three files to derived/:
-    segments_endpoints.csv  - 1 row per centerline feature
-    segments_vertices.csv   - 1 row per shape vertex (native resolution)
-    segments_points_1m.csv  - 1 row per point resampled every 1 m
+    segments_endpoints.csv    - 1 row per centerline feature
+    segments_vertices.csv     - 1 row per shape vertex (native resolution)
+    segments_points_0p1m.csv  - 1 row per point resampled every 0.1 m
+
+The resample interval is in the filename, so corpora at different spacings sit
+side by side rather than overwriting each other. points_path() is the one place
+that name is built; every consumer imports it rather than hardcoding a path.
+
+Spacing is 0.1 m to suit the 1 ft (0.3048 m) OPR DEM the elevations come from.
+That is ~3x finer than the DEM grid, so neighbouring samples are correlated --
+it oversamples deliberately, to place points precisely along the centerline
+rather than to extract detail the DEM does not hold.
+
+At 0.1 m this writes ~6.7 M points, which is a ~600 MB CSV. The pipeline runs
+--slim --parquet --no-csv, which streams that CSV, converts it, and removes it.
 
 Usage:
-    python extract_centerline_latlon.py                   # endpoints + vertices + 1 m
-    python extract_centerline_latlon.py --slim --parquet  # what the pipeline consumes
-    python extract_centerline_latlon.py --spacing 10      # coarser resample
+    python extract_centerline_latlon.py                   # endpoints + vertices + 0.1 m
+    python extract_centerline_latlon.py --slim --parquet --no-csv   # the pipeline
+    python extract_centerline_latlon.py --spacing 1       # coarser resample
     python extract_centerline_latlon.py --points-only
 
 --slim --parquet is the combination add_elevation.py expects: it reads the
@@ -30,6 +42,10 @@ from fetch_livermore_street_centerlines import DEFAULT_OUT as SRC
 
 OUTDIR = "derived"
 R = 6371008.8  # mean earth radius, m
+
+# Default resample interval, metres. Matched to the 1 ft OPR DEM -- see the
+# module docstring. Consumers import this so the whole pipeline moves together.
+SPACING = 0.1
 
 ATTRS = ["OBJECTID", "FullStreetName", "StreetName", "StreetType",
          "PrefixDir", "SuffixDir", "FunctionalClass", "RoadType", "GlobalID"]
@@ -67,24 +83,38 @@ def interpolate(coords, cum, target):
 
 
 def label(spacing):
-    """Filename suffix: 10m, 1m, 0p5m."""
+    """Filename suffix: 10m, 1m, 0p5m, 0p1m."""
     s = f"{spacing:g}".replace(".", "p")
     return f"{s}m"
+
+
+def points_path(spacing=SPACING, ext="parquet"):
+    """Where the resampled points for a given spacing live.
+
+    One source of truth for the name, imported by add_elevation.py and every
+    plotter, so changing SPACING moves the whole pipeline in step.
+    """
+    return os.path.join(OUTDIR, f"segments_points_{label(spacing)}.{ext}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC,
                     help=f"input centerline GeoJSON (default {SRC})")
-    ap.add_argument("--spacing", type=float, default=1.0,
-                    help="resample interval in metres (default 1)")
+    ap.add_argument("--spacing", type=float, default=SPACING,
+                    help=f"resample interval in metres (default {SPACING:g})")
     ap.add_argument("--slim", action="store_true",
                     help="keep only OBJECTID + FullStreetName; join the rest on OBJECTID")
     ap.add_argument("--parquet", action="store_true",
                     help="also write the resampled points as .parquet")
     ap.add_argument("--points-only", action="store_true",
                     help="skip the endpoints and vertices files")
+    ap.add_argument("--no-csv", action="store_true",
+                    help="delete the points CSV once --parquet has converted it; "
+                         "at 0.1 m spacing that CSV is ~600 MB and nothing reads it")
     args = ap.parse_args()
+    if args.no_csv and not args.parquet:
+        raise SystemExit("--no-csv only makes sense with --parquet")
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.join(here, args.src)
@@ -166,6 +196,9 @@ def main():
         df.to_parquet(pq_path, index=False, compression="zstd")
         print(f"{pq_path}  ({os.path.getsize(pq_path) / 1e6:.1f} MB "
               f"vs {os.path.getsize(pts_path) / 1e6:.1f} MB csv)")
+        if args.no_csv:
+            os.remove(pts_path)
+            print(f"removed {pts_path}")
 
 
 if __name__ == "__main__":

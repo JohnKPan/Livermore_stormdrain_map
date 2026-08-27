@@ -6,11 +6,17 @@ terminal of that street -- the westmost for a street running mostly E-W, the
 northmost otherwise -- so repeated runs are directly comparable. Which end that
 is appears on the x-axis label and in _index.csv, since it varies by street.
 
-Because 1 m samples are noise-dominated point-to-point (SNR ~0.23 against a
-~2 cm noise floor), each plot shows the raw profile faintly with a 25 m rolling
-mean on top -- the 25 m baseline is where gradient becomes trustworthy. --smooth
-changes that window; it is the one knob every profile in this project shares,
-since plot_street_drains.py and plot_street_bokeh.py both build theirs here.
+Individual samples are noise-dominated point-to-point (SNR ~0.23 against a
+~2 cm noise floor), so each plot shows the raw profile faintly with a 25 m
+rolling mean on top -- the 25 m baseline is where gradient becomes trustworthy.
+--smooth changes that window; it is the one knob every profile in this project
+shares, since plot_street_drains.py and plot_street_bokeh.py both build theirs
+here.
+
+The window is in METRES and is converted to samples using the point spacing
+measured from the data (see sample_step). It used to be converted 1:1, which
+silently assumed 1 m spacing -- at the current 0.1 m that would have made
+--smooth 25 a 2.5 m window, and moved every sag count in the project with it.
 
 Outputs:
     derived/profiles/<STREET>.png
@@ -33,10 +39,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-POINTS = "derived/segments_points_1m.parquet"
+from extract_centerline_latlon import points_path
+
+POINTS = points_path()
 OUTDIR = "derived/profiles"
 GAP_BREAK_M = 40.0        # larger jumps between segments are drawn as a break
 SMOOTH_M = 25.0           # default rolling-mean window; --smooth overrides
+# Where a profile or map marks a discontinuity. 20 cm on the old 1 m DEM; the
+# 1 ft grid interpolates across a curb in a third of the distance, so the same
+# physical step shows a smaller bilinear-vs-cell gap and 20 flagged only 140
+# points corpus-wide -- none at all on AIRWAY BL, this project's worked example.
+# 10 cm flags 823, still far above the 2.07 cm p99 noise floor.
+DISC_CM = 10.0
 NODE_TOL_M = 2.0          # segment endpoints this close share one junction node
 OPPOSITE = {"W": "E", "N": "S"}
 
@@ -156,16 +170,29 @@ def chain_segments(segs):
             np.concatenate(D), np.concatenate(RUN), gaps, origin)
 
 
+def sample_step(d, run):
+    """Median along-path distance between consecutive samples, in metres.
+
+    Taken from the data rather than from a constant, so the corpus spacing and
+    the smoothing window can never drift apart. Steps that cross a run boundary
+    are excluded -- those are the gaps between chained segments, not samples.
+    """
+    step = np.diff(d)
+    same = np.asarray(run)[1:] == np.asarray(run)[:-1]
+    step = step[same & (step > 0)]
+    return float(np.median(step)) if step.size else 1.0
+
+
 def build_profile(e, n, z, run, smooth_m=SMOOTH_M):
     """Cumulative along-path distance, with distance still accruing over gaps.
 
-    smooth_m is the rolling-mean window in metres. Points are 1 m apart, so it
-    doubles as the window in samples; the mean is taken per run, so it never
+    smooth_m is the rolling-mean window in METRES, converted to samples by the
+    spacing measured from the data. The mean is taken per run, so it never
     averages across a gap between segments.
     """
     d = np.r_[0.0, np.cumsum(np.hypot(np.diff(e), np.diff(n)))]
     s = pd.Series(z)
-    w = max(3, int(round(smooth_m)))
+    w = max(3, int(round(smooth_m / sample_step(d, run))))
     smooth = (s.groupby(run)
                .transform(lambda g: g.rolling(w, center=True,
                                               min_periods=max(3, w // 3)).mean())
@@ -181,8 +208,8 @@ def main():
     ap.add_argument("--outdir", default=OUTDIR)
     ap.add_argument("--dpi", type=int, default=110)
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
-                    help="rolling-mean window (m) over the 1 m samples "
-                         f"(default {SMOOTH_M:g})")
+                    help="rolling-mean window in metres, converted to samples "
+                         f"using the corpus spacing (default {SMOOTH_M:g})")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
@@ -211,6 +238,7 @@ def main():
         e, n, z, disc, run, gaps, origin = chain_segments(segs)
         far = OPPOSITE[origin]
         d, smooth = build_profile(e, n, z, run, args.smooth)
+        step = sample_step(d, run)
 
         if d[-1] < args.min_length:
             skipped += 1
@@ -225,7 +253,7 @@ def main():
         for r in np.unique(run):
             m = run == r
             ax.plot(d[m], z[m], color="#9fb3c8", lw=0.7,
-                    label="raw 1 m" if r == 0 else None)
+                    label=f"raw {step:.3g} m" if r == 0 else None)
             ax.plot(d[m], smooth[m], color="#2e86c1", lw=1.9,
                     label=f"{args.smooth:g} m rolling mean" if r == 0 else None)
         ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5,
@@ -233,7 +261,7 @@ def main():
         ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5,
                 label=f"{far} end")
 
-        bad = disc > 20
+        bad = disc > DISC_CM
         nbad = int(bad.sum())
         if nbad:
             ax.plot(d[bad], z[bad], "x", color="#d73027", ms=5, mew=1.2,

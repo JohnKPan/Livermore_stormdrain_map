@@ -35,14 +35,19 @@ import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
+from extract_centerline_latlon import points_path
 from plot_street_profiles import (SMOOTH_M, chain_segments, build_profile,
-                                  safe_name)
+                                  safe_name, sample_step)
 
-POINTS = "derived/segments_points_1m.parquet"
+POINTS = points_path()
 INLETS = "derived/storm_inlets.csv"
 OUTDIR = "derived/drains"
 FT_TO_M = 0.3048
 DATUM_SHIFT_M = 0.794          # measured NGVD29 -> NAVD88 offset, see module docstring
+# OSM's tile usage policy requires a User-Agent identifying the application.
+# contextily's default is "contextily-<random hex>", which is blocked outright.
+TILE_UA = ("PengWeather-Stormdrain-Study/1.0 "
+           "(Livermore CA storm drain research; contextily)")
 GRATE_MIN_FT, GRATE_MAX_FT = 300.0, 900.0   # Livermore spans roughly 390-790 ft
 
 # Standardised chart scales. Vertical is fixed so 0.20 m (the sag threshold)
@@ -86,10 +91,23 @@ def snap(inlets, e, n, dist, max_offset):
     sub = inlets[keep].copy()
     if sub.empty:
         return sub.assign(chainage=[], offset_m=[], dem_m=[])
-    d2 = ((sub.x.to_numpy()[:, None] - e[None, :])**2
-          + (sub.y.to_numpy()[:, None] - n[None, :])**2)
-    idx = d2.argmin(axis=1)
-    sub["offset_m"] = np.sqrt(d2[np.arange(len(sub)), idx])
+    # Running argmin over chunks of the path. The whole inlet x point matrix
+    # would be 9.3 GB for UNNAMED (119 scattered segments, so the bbox filter
+    # above keeps 97% of the city's inlets); this caps it at inlets x CHUNK.
+    sx, sy = sub.x.to_numpy(), sub.y.to_numpy()
+    best = np.full(len(sub), np.inf)
+    idx = np.zeros(len(sub), dtype=np.int64)
+    CHUNK = 8192
+    for a in range(0, len(e), CHUNK):
+        ee, nn = e[a:a + CHUNK], n[a:a + CHUNK]
+        d2 = (sx[:, None] - ee[None, :])**2 + (sy[:, None] - nn[None, :])**2
+        j = d2.argmin(axis=1)
+        dmin = d2[np.arange(len(sub)), j]
+        hit = dmin < best
+        best[hit] = dmin[hit]
+        idx[hit] = a + j[hit]
+
+    sub["offset_m"] = np.sqrt(best)
     sub["chainage"] = dist[idx]
     sub["path_idx"] = idx
     return sub[sub.offset_m <= max_offset].sort_values("chainage")
@@ -283,10 +301,13 @@ def render(street, st, prep, args, outdir, used):
     tall = False
 
     # ---------------- profile ----------------
+    # The corpus spacing is measured, not assumed -- it moved from 1 m to 0.1 m
+    # when the DEM went to 1 ft, and a hardcoded label went stale silently.
+    step = sample_step(d, run)
     for r in np.unique(run):
         m = run == r
         ax.plot(d[m], z[m], color="#b6c4d2", lw=0.7,
-                label="DEM, raw 1 m" if r == 0 else None)
+                label=f"DEM, raw {step:.3g} m" if r == 0 else None)
         ax.plot(d[m], smooth[m], color="#33475b", lw=1.8,
                 label=f"DEM, {args.smooth:g} m mean" if r == 0 else None)
 
@@ -392,7 +413,7 @@ def render(street, st, prep, args, outdir, used):
     # Drawn in Web Mercator so tiles land unwarped and sharp; the ticks are then
     # relabelled back to lat/lon so the axes still read as GPS coordinates.
     axm.plot(mx, my, ".", color="#12263a", ms=1.8, zorder=4,
-             label=f"1 m centerline points ({len(st):,})")
+             label=f"{step:.3g} m centerline points ({len(st):,})")
     for t, g in near.groupby("type"):
         sty = STYLE.get(t, DEFAULT_STYLE)
         gx, gy = to3857.transform(g.lon.to_numpy(), g.lat.to_numpy())
@@ -450,10 +471,9 @@ def render(street, st, prep, args, outdir, used):
     basemap = "none"
     try:
         import contextily as cx
-        provider = getattr(
-            cx.providers.CartoDB, args.basemap,
-            cx.providers.CartoDB.Voyager) if hasattr(cx.providers.CartoDB, args.basemap) \
-            else cx.providers.OpenStreetMap.Mapnik
+        provider = (getattr(cx.providers.CartoDB, args.basemap)
+                    if hasattr(cx.providers.CartoDB, args.basemap)
+                    else cx.providers.OpenStreetMap.Mapnik)
         if args.zoom > 0:
             zoom = args.zoom
         else:
@@ -465,7 +485,8 @@ def render(street, st, prep, args, outdir, used):
             zoom = int(np.clip(round(np.log2(3*40075016.686/max(span, 1.0))),
                                12, 18))
         cx.add_basemap(axm, source=provider, crs="EPSG:3857",
-                       attribution_size=6, zoom=zoom)
+                       attribution_size=6, zoom=zoom,
+                       headers={"User-Agent": TILE_UA})
         basemap = f"{args.basemap} z{zoom}"
     except Exception as exc:                                   # noqa: BLE001
         print(f"  basemap unavailable ({type(exc).__name__}: {exc}); "
@@ -506,9 +527,12 @@ def main():
     ap.add_argument("--max-offset", type=float, default=30.0,
                     help="max centerline distance for an inlet to belong (m)")
     ap.add_argument("--no-datum-shift", dest="datum_shift", action="store_false")
-    ap.add_argument("--basemap", default="Voyager",
-                    help="CartoDB tile style: Voyager, Positron, DarkMatter; "
-                         "anything else falls back to OpenStreetMap")
+    ap.add_argument("--basemap", default="osm",
+                    help="tile source. Default 'osm' (OpenStreetMap). The "
+                         "CartoDB styles -- Voyager, Positron, DarkMatter -- "
+                         "now watermark every tile 'API KEY REQUIRED' unless "
+                         "you have a key configured, and they return HTTP 200 "
+                         "while doing it, so the failure is silent.")
     ap.add_argument("--outdir", default=OUTDIR)
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
                     help="rolling-mean window (m) behind both the drawn "

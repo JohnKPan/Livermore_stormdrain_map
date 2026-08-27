@@ -1,0 +1,44 @@
+# conda-forge environment for the Bay Area-wide DEM work.
+#
+# The uv venv (.venv/, requirements.txt) is still the primary environment and is
+# enough for everything except one thing: mosaicking lidar collects that sit in
+# DIFFERENT projections. A VRT cannot reproject, and rasterio ships no
+# multi-source warp, so that needs GDAL's own gdal.Warp -- and GDAL has no
+# Windows wheels on PyPI at any version. conda-forge is the way to get it.
+#
+# The point of using conda-forge for BOTH gdal and rasterio is that they then
+# link the SAME libgdal. Installing the `gdal` bindings alongside a wheel-built
+# rasterio would put two independent GDALs in one process, each with its own
+# driver registry and PROJ data path -- a well-known way to break CRS handling
+# on Windows, and this project leans on compound CRS with a NAVD88 vertical
+# datum.
+#
+# Create it (micromamba.exe is fetched into .conda/ by the readme's recipe):
+#
+#     .conda/micromamba.exe create -y -p .conda/env -f environment.yml
+#     .conda/micromamba.exe run -p .conda/env python add_elevation.py
+#
+# run_pipeline.sh picks this env up automatically when .conda/env exists.
+# Delete .conda/ to undo all of it; the uv venv is untouched either way.
+
+name: stormdrain
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # The reason this file exists.
+  - gdal>=3.9
+  - libgdal-core>=3.9
+  # Same libgdal as gdal, above.
+  - rasterio>=1.4
+  - pyproj>=3.7
+  # Everything else matches requirements.txt.
+  - pandas>=2.2
+  - pyarrow>=17
+  - numpy>=2.0
+  - matplotlib>=3.10
+  - contextily>=1.6
+  - bokeh>=3.9
+  - xyzservices>=2024.9
+  - plotly>=6.0
+  - shapely>=2.0

@@ -1,6 +1,6 @@
 """City-wide index map over the per-street pages from plot_street_bokeh.py.
 
-Draws every Livermore centerline on one CartoDB map, coloured by functional
+Draws every Livermore centerline on one Esri Gray Canvas map, coloured by functional
 class or by the street's sag count -- a radio button on the page switches
 between the two, and --color-by picks which one it opens on. Tapping a street
 -- or picking one from the search box -- loads that street's existing
@@ -12,7 +12,9 @@ the `file` column of the index that `--all` writes. By default the overview
 lands at Stormdrain_map/index.html and the pages in Stormdrain_map/streets/,
 and the iframe srcs are relative paths worked out from those two locations.
 
---pages-alt adds a SECOND corpus, built at a different --smooth window, and a
+--pages-alt may be repeated, adding further corpora built at different --smooth
+windows. With more than one corpus the page grows a selector that switches
+between them. Historically this took a SECOND corpus only, and a
 checkbox that switches the whole page between the two: which page the iframe
 loads, the sag counts in the tooltips, and the sag colouring itself. Sags come
 from the smoothed profile, so a shorter window finds more of them -- the two
@@ -23,6 +25,10 @@ Usage:
     python plot_city_overview.py             # then this
     python plot_city_overview.py --color-by sags    # open on the sag colouring
     python plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
+    python plot_city_overview.py \
+        --pages     Stormdrain_map/streets_25m --label     "25 m" \
+        --pages-alt Stormdrain_map/streets_10m --alt-label "10 m" \
+        --pages-alt Stormdrain_map/streets_5m  --alt-label "5 m"
 """
 
 import argparse
@@ -34,9 +40,9 @@ import xyzservices.providers as xyz
 from bokeh.document import Document
 from bokeh.events import DocumentReady
 from bokeh.layouts import column, row
-from bokeh.models import (AutocompleteInput, CDSView, CheckboxGroup,
+from bokeh.models import (AutocompleteInput, CDSView,
                           ColumnDataSource, CustomJS, Div, HoverTool,
-                          IndexFilter, InlineStyleSheet, Legend, LegendItem,
+                          IndexFilter, Legend, LegendItem,
                           RadioButtonGroup, Range1d, TapTool, WheelZoomTool)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
@@ -44,7 +50,7 @@ from pyproj import Transformer
 from plot_points_map import CLASS_COLORS, DRAW_ORDER
 
 VERTS = "derived/segments_vertices.csv"
-PAGES = "Stormdrain_map/streets"
+PAGES = "Stormdrain_map/streets_25m"
 PAGES_ALT = "Stormdrain_map/streets_10m"
 OUT = "Stormdrain_map/index.html"
 INDEX = "_index.csv"
@@ -95,27 +101,6 @@ SAG_BINS = [
 ]
 
 
-# The smoothing checkbox sits under the map, between the two things it changes,
-# and is sized to be seen: Bokeh's default is a 13 px browser checkbox with 12 px
-# text, which reads as a footnote beside a 1,240 px map. Injected into the
-# widget's own shadow root, so these bare selectors cannot leak anywhere else.
-CHECKBOX_CSS = """
-:host { padding: 12px 0 4px 2px; }
-label {
-    display: inline-flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 17px;
-    font-weight: 600;
-    cursor: pointer;
-}
-input[type="checkbox"] {
-    width: 21px;
-    height: 21px;
-    accent-color: #0a84ff;
-    cursor: pointer;
-}
-"""
 
 
 def sag_bin(n):
@@ -165,14 +150,17 @@ def main():
     ap.add_argument("--verts", default=VERTS)
     ap.add_argument("--pages", default=PAGES,
                     help="directory holding the per-street pages and _index.csv")
-    ap.add_argument("--pages-alt", default=None,
-                    help="second corpus, built at a different --smooth window; "
-                         "adds the checkbox that switches between the two "
-                         f"(e.g. {PAGES_ALT})")
+    ap.add_argument("--pages-alt", action="append", default=None,
+                    help="another corpus built at a different --smooth "
+                         "window; repeatable. Two or more corpora add the "
+                         f"selector that switches between them (e.g. {PAGES_ALT})")
     ap.add_argument("--label", default="25 m",
                     help="how --pages is named on the page")
-    ap.add_argument("--alt-label", default="10 m",
-                    help="how --pages-alt is named on the page")
+    # default=None, not a string: argparse's append action would try to
+    # .append() onto the default and blow up before main() ever runs.
+    ap.add_argument("--alt-label", default=None, action="append",
+                    help="how --pages-alt is named on the page; repeat once "
+                         "per --pages-alt, in the same order")
     ap.add_argument("--out", default=OUT,
                     help="path for the overview page itself")
     ap.add_argument("--color-by", "--colour-by", dest="color_by",
@@ -185,8 +173,12 @@ def main():
     # Primary first: it is the one the page opens on, and the one whose inlet
     # counts and lengths are used -- neither depends on the smoothing window.
     variants = [dict(pages=args.pages, label=args.label)]
-    if args.pages_alt:
-        variants.append(dict(pages=args.pages_alt, label=args.alt_label))
+    for i, alt in enumerate(args.pages_alt or []):
+        # Fall back to the directory name when a label is missing, rather than
+        # failing: an unlabelled corpus is still usable, just less well named.
+        labs = args.alt_label or []
+        lab = labs[i] if i < len(labs) else os.path.basename(alt.rstrip("/\\"))
+        variants.append(dict(pages=alt, label=lab))
 
     here = os.path.dirname(os.path.abspath(__file__))
     out = os.path.join(here, args.out)
@@ -230,7 +222,14 @@ def main():
                 y_range=Range1d(ys_all.min()-pady, ys_all.max()+pady),
                 x_axis_type="mercator", y_axis_type="mercator",
                 title=TITLE_SAG if sag_first else TITLE)
-    mp.add_tile(xyz.CartoDB.Positron)
+    # Esri.WorldGrayCanvas, not CartoDB.Positron. CARTO began requiring an API
+    # key for its raster basemaps around 2026-08-25/26 and now serves
+    # unauthenticated requests as a valid PNG watermarked "API KEY REQUIRED" --
+    # HTTP 200, no error, so the page just quietly renders a spoiled map. These
+    # tiles are fetched by the BROWSER on every page open, so every existing
+    # page was affected the moment CARTO flipped it, build date irrelevant.
+    # Gray Canvas is key-free and plays the same muted-backdrop role.
+    mp.add_tile(xyz.Esri.WorldGrayCanvas)
     # City scale means a lot of zooming; make the wheel do it without a toolbar
     # trip. The per-street pages leave this off, where panning matters more.
     mp.toolbar.active_scroll = mp.select_one(WheelZoomTool)
@@ -351,14 +350,15 @@ def main():
         min_characters=2, width=380, placeholder=f"search {len(names):,} streets")
     colour = RadioButtonGroup(labels=["road class", "sags per street"],
                               active=int(sag_first), width=260)
-    # A checkbox, not a second radio pair: there is one alternative corpus and
-    # the primary is the default. None of this exists without --pages-alt, and
-    # the JS below treats a null widget as "always the primary".
+    # A radio group, not a checkbox: there can be any number of corpora now, and
+    # a radio's `active` IS the variant index, which is what both JS callbacks
+    # want. The JS below treats a null widget as "always the primary", so a
+    # single-corpus page needs no selector at all.
     smooth = None
     if len(variants) > 1:
-        smooth = CheckboxGroup(labels=[f"{variants[1]['label']} smoothing"],
-                               active=[], width=320,
-                               stylesheets=[InlineStyleSheet(css=CHECKBOX_CSS)])
+        smooth = RadioButtonGroup(
+            labels=[f"{var['label']} smoothing" for var in variants],
+            active=0, width=max(320, 150 * len(variants)))
 
     labels = [var["label"] for var in variants]
     titles_sag = [TITLE_SAG if len(variants) == 1
@@ -368,7 +368,7 @@ def main():
     # which renderers are on, and each has to honour the other's state.
     VIS_JS = """
         const sag = colour.active === 1;
-        const v = (SM && SM.active.length) ? 1 : 0;
+        const v = SM ? SM.active : 0;
         // Legends hide by flipping renderer.visible, so switching also clears
         // whatever the other mode had hidden -- deliberate: the legends filter
         // on different keys and cannot be kept in step. The hit targets come
@@ -387,8 +387,8 @@ def main():
     colour.js_on_change("active", CustomJS(args=vis_args, code=VIS_JS))
 
     opens = ("" if len(variants) == 1 else
-             f" &middot; pages open at {labels[0]} smoothing, "
-             f"tick the box for {labels[1]}")
+             f" &middot; pages open at {labels[0]} smoothing; "
+             f"switch to {', '.join(labels[1:])} above the map")
     pick = Div(text="<i>tap a street on the map, or search above</i>" + opens,
                width=MAP_W,
                styles={"font-family": "monospace", "font-size": "13px",
@@ -427,7 +427,7 @@ def main():
         if (M === undefined) { return; }
         // Named vi, not v: VIS_JS declares its own v and the two get
         // concatenated into one function body on the checkbox callback.
-        const vi = (SM && SM.active.length) ? 1 : 0;
+        const vi = SM ? SM.active : 0;
         // Repaint the highlight from the geometry already in the browser --
         // the class sources hold it, so META does not have to carry a second
         // copy of every coordinate.

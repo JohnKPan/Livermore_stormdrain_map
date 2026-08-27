@@ -23,8 +23,10 @@ The steps themselves, should you want to run them by hand:
 
     .venv/Scripts/python.exe fetch_livermore_street_centerlines.py
     .venv/Scripts/python.exe fetch_inlets.py
-    .venv/Scripts/python.exe fetch_dem.py
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet
+    .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
+        --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
+        --manifest livermore_tiles.csv
+    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv
     .venv/Scripts/python.exe add_elevation.py --no-csv
     .venv/Scripts/python.exe plot_street_bokeh.py --all
     .venv/Scripts/python.exe plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
@@ -47,8 +49,8 @@ _index.csv that EACH plot_street_bokeh.py --all run writes -- one per smoothing
 window, both before the overview.
 
 All three fetches are safe to re-run. The centerline and inlet fetches
-overwrite their outputs; fetch_dem.py skips tiles already fully downloaded and
-resumes partial ones.
+overwrite their outputs; fetch_usgs_lidar.py skips tiles already fully
+downloaded, resumes partial ones, and re-merges only what changed.
 
 
 0. Street centerline
@@ -111,45 +113,155 @@ sources sit on one datum. Pass --no-datum-shift to see raw values.
 2. Lidar DEM tiles
 ------------------
 
-    .venv/Scripts/python.exe fetch_dem.py
+    .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
+        --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
+        --manifest livermore_tiles.csv
 
-Source: USGS 3DEP 1 m DEM, via the National Map (TNM) Access API
+Source: USGS 3DEP OPR (Original Product Resolution) DEM, via the National Map
+        (TNM) Access API
         https://tnmaccess.nationalmap.gov/api/v1/products
 
-Writes: dem/*.tif
+Writes: dem_livermore/*.tif             whole tiles, the only thing to read
+        dem_livermore/_fragments/*.tif  staged multi-block pieces, see below
+        dem_livermore/_mosaic.vrt       rebuilt per run by add_elevation.py
+        livermore_tiles.csv             manifest of every matching file
 
-The bounding box defaults to the extent of the centerline GeoJSON plus a
-buffer, so the tiles always follow the data. --project pins one lidar
-acquisition (default CA_AlamedaCounty_2021_B21) so tiles share a date and
-vertical reference instead of mixing flights -- 6 products intersect this
-bbox but only 4 belong to that project.
+OPR is the collection's NATIVE grid, not the resampled national product. For
+CA_AlamedaCounty_2021_B21 that is 1 US survey foot (0.3048 m) in EPSG:6420
+(NAD83(2011) / California zone 3, ftUS) on a NAVD88 ftUS vertical datum -- about
+3.3x finer per axis than the 1 m DEM this project used until 2026-08-25.
+
+fetch_dem.py, which pulls the 1 m product into dem/, is kept but is no longer
+in the pipeline. The two agree closely: sampled at 59,472 points, the 1 ft
+product sits 0.19 cm above the 1 m one with 1.05 cm RMS, which is what you would
+expect of two derivatives of the same collect.
+
+--aoi livermore is a named preset. It was widened on 2026-08-25 from
+(-121.82, 37.63, -121.68, 37.73) to (-121.86, 37.62, -121.68, 37.74): the first
+box stopped short of the western end of the street network and left 4,352
+centerline points with no elevation.
+
+MULTI-BLOCK TILES. This collect ships in two delivery blocks, CA_AlamedaCo_1_2021
+and CA_AlamedaCo_3_2021. Where a block boundary crosses a tile, USGS publishes
+that tile once per block -- same filename, same footprint, different URL -- each
+clipped to its own block with the rest NoData. They are a partition, not
+duplicates and not overlapping flight lines: they agree exactly on the hairline
+seam where they meet, and together reconstruct the tile with no gap.
+
+Downloading both to the basename would race and leave one arbitrary fragment
+behind, so colliding tiles are staged under _fragments/ and merged back into the
+plain filename. dem_livermore/*.tif is therefore always whole tiles. Fragments
+are kept so a re-run is a no-op rather than a re-download; --prune-fragments
+reclaims the space once you are done.
+
+ANOTHER AOI. Nothing here is Livermore-specific. Pick a box, see what covers
+it, pin ONE collect, and point the pipeline at the result:
+
+    python fetch_usgs_lidar.py --bbox -122.53 37.70 -122.35 37.83 --list-projects
+    python fetch_usgs_lidar.py --bbox ... --project CA_SanFrancisco_B23 --out ./dem_sf
+    python add_elevation.py --dem-dir ./dem_sf
+
+The VRT mosaic is regenerated from whatever tiles are in the directory, every
+run -- there is nothing to hand-edit per AOI. --project matters though: every
+Bay Area box is covered by several collects at different resolutions and years
+(SF has 5, Contra Costa 7), and add_elevation.py refuses a directory holding
+more than one grid rather than blending acquisition dates and vertical
+references into a single surface. The refusal names the grids it found.
+
+MIXED RESOLUTION. If one collect does not cover the AOI, add_elevation.py can
+mosaic collects of DIFFERENT resolutions. Each VRT source declares its own
+source rectangle and the destination rectangle it covers, so GDAL resamples it
+onto a common grid on read:
+
+    --vrt-resolution highest   target the finest source (default), or
+                     lowest    the coarsest, or a number in CRS units
+    --vrt-resampling bilinear  nearest | bilinear (default) | cubic | average
+
+Two things to know before relying on it.
+
+First, provenance. Every point gets dem_tile (which source tile) and dem_res
+(that tile's NATIVE resolution). Where dem_res is larger than mosaic_res in the
+meta.json, that sample sits on UPSAMPLED data -- the number is real but the
+detail is not there. Collects also differ in acquisition date and vertical
+reference, so a sag sitting on a boundary between two of them may be the seam
+rather than the ground. Check dem_tile before believing one.
+
+Second, seam accuracy. VRT sources are resampled independently and then
+composited, so at the outermost pixel of a rescaled source there is no
+neighbour to interpolate against and the value clamps. Measured on a synthetic
+ramp: exactly 2 pixels of 600 are affected -- the source's first and last -- by
+up to half a source pixel; the interior is exact. Negligible for a 3 ft seam,
+worth knowing if you mosaic many small tiles.
+
+MIXED PROJECTIONS need the conda-forge environment. Bay Area collects do not
+share a CRS -- CA_SanFrancisco_B23 is San Francisco CS13 at 0.25 m,
+CA_ContraCosta_B22 is UTM 10N at 0.5 m, CA_AlamedaCounty_2021_B21 and
+CA_SantaClaraCounty_2020_A20 are California zone 3 at 1 ftUS. A VRT cannot
+reproject and neither can gdalbuildvrt, so that path uses gdal.Warp, and GDAL
+has no Windows wheel on PyPI at any version. See environment.yml:
+
+    .conda/micromamba.exe create -y -p .conda/env -f environment.yml
+    ./run_pipeline.sh          # picks the env up automatically
+
+Everything else still runs in the uv venv exactly as before -- the same-CRS VRT
+is written by rasterio alone and is byte-for-byte what it always was. Only a
+cross-projection mosaic needs osgeo, and the error says so if it is missing.
+
+How the cross-CRS mosaic is built, and why it is three stages rather than one:
+gdal.Warp(format="VRT") honours only its FIRST source dataset -- it warns about
+this and returns a mosaic that is otherwise NoData. GDAL's own remedy is to
+mosaic same-projection sources first and warp the result. So:
+
+    tiles -> one plain VRT per (CRS, resolution) group     [rasterio]
+          -> gdal.Warp each group onto the target grid     [osgeo, 1 source]
+          -> one plain VRT over the warped groups          [rasterio]
+
+Grouping on (CRS, resolution) rather than CRS alone keeps each group internally
+uniform, so ordering groups coarsest-first reproduces the per-tile "finest wins"
+rule exactly. targetAlignedPixels snaps every group to the same whole-pixel
+grid, so they compose without sub-pixel registration drift.
+
+PREFER HIGHEST RESOLUTION is the overlap rule throughout. Where collects
+overlap, the finest-resolution tile wins; the target grid takes the finest
+source's CRS and pixel size. Resolutions are compared in METRES, which matters:
+a 1 ftUS tile is 0.3048 m and is FINER than a 0.5 m one despite the larger
+number, so ranking on the raw CRS value would order them backwards. dem_res is
+recorded in metres for the same reason.
 
 Useful flags:
+    --list-projects                which collects cover the AOI, with sizes
     --dry-run                      list tiles and total size, download nothing
-    --bbox -121.9 37.6 -121.6 37.8 override the extent
-    --project ""                   no project filter (may mix acquisitions)
+    --bbox -121.9 37.6 -121.6 37.8 override the AOI
+    --dataset 1m                   the resampled 1 m product instead of OPR
+    --prune-fragments              delete _fragments/ after a clean merge
 
-Run of 2026-08-09: 4 tiles, 1.35 GB.
-    USGS_1M_10_x60y417_CA_AlamedaCounty_2021_B21.tif   351.6 MB
-    USGS_1M_10_x60y418_CA_AlamedaCounty_2021_B21.tif   324.5 MB
-    USGS_1M_10_x61y417_CA_AlamedaCounty_2021_B21.tif   338.2 MB
-    USGS_1M_10_x61y418_CA_AlamedaCounty_2021_B21.tif   332.7 MB
+Run of 2026-08-25: 296 tiles, 6.2 GB, plus 144 staged fragments (1.5 GB).
+72 tiles arrived split across the two delivery blocks and were merged, each
+back to 100% valid.
 
 
 3. Centerline resampling
 ------------------------
 
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet
+    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv
 
 Source: streets/Street_Centerline_-_Public.geojson (step 0; --src overrides)
 
-Writes: derived/segments_endpoints.csv     one row per centerline feature
-        derived/segments_vertices.csv      one row per native shape vertex
-        derived/segments_points_1m.csv     resampled points
-        derived/segments_points_1m.parquet same, ~4x smaller
+Writes: derived/segments_endpoints.csv       one row per centerline feature
+        derived/segments_vertices.csv        one row per native shape vertex
+        derived/segments_points_0p1m.csv     resampled points (--no-csv removes)
+        derived/segments_points_0p1m.parquet same, ~4x smaller
 
---spacing now defaults to 1 metre, so the bare command gives the 1 m file the
-rest of the pipeline wants. Pass --spacing 10 for a coarser pass.
+--spacing defaults to 0.1 metre (SPACING in that module), which is what the rest
+of the pipeline expects. The interval is in the filename, so corpora at
+different spacings sit side by side instead of overwriting each other, and
+points_path() is the single place that name is built -- every consumer imports
+it rather than hardcoding a path. Pass --spacing 1 for a coarser pass.
+
+0.1 m is deliberately ~3x finer than the 1 ft DEM grid it will be sampled
+against. That oversamples: neighbouring points are correlated and carry no
+independent elevation information. The reason to do it is horizontal -- placing
+points precisely along the centerline -- not vertical.
 
 Both flags matter and neither is the default:
 
@@ -159,13 +271,16 @@ Both flags matter and neither is the default:
              times.
   --parquet  add_elevation.py reads the parquet, not the csv. Without this the
              next step has nothing to open.
+  --no-csv   delete the points csv once --parquet has converted it. At 0.1 m
+             that csv is 358 MB and nothing downstream reads it. Requires
+             --parquet.
 
 Do NOT pass --points-only: add_elevation.py needs segments_endpoints.csv for
 that attribute join.
 
-Run of 2026-08-09: 667,425 points at 1 m, from 4,867 centerline features
-(44,230 native vertices). 9.6 MB parquet vs 35.4 MB csv -- both grow once
-add_elevation.py adds its 13 columns.
+Run of 2026-08-25: 6,630,822 points at 0.1 m, from 4,867 centerline features
+(44,230 native vertices). 83.7 MB parquet vs 358.0 MB csv -- the parquet grows
+once add_elevation.py adds its columns.
 
 
 4. Elevation join
@@ -173,26 +288,54 @@ add_elevation.py adds its 13 columns.
 
     .venv/Scripts/python.exe add_elevation.py --no-csv
 
-Reads : derived/segments_points_1m.parquet, dem/*.tif,
+Reads : derived/segments_points_0p1m.parquet, dem_livermore/*.tif,
         derived/segments_endpoints.csv
-Writes: derived/segments_points_1m.parquet   (in place, 6 columns -> 19)
-        derived/segments_points_1m.meta.json
+Writes: derived/segments_points_0p1m.parquet   (in place, 6 columns -> 21)
+        derived/segments_points_0p1m.meta.json
+        dem_livermore/_mosaic.vrt              rebuilt every run
 
-Adds easting/northing (UTM 10N, the DEM's own CRS), the containing 1 m cell,
-elev_m (bilinear -- the better estimator), elev_cell_m (raw nearest cell),
+Adds easting/northing (UTM 10N metres -- the frame every plot works in),
+dem_x/dem_y (the same point in the DEM's EPSG:6420 ftUS), the containing 1 ftUS
+cell, elev_m (bilinear -- the better estimator), elev_cell_m (raw nearest cell),
 elev_disc_cm (their disagreement; >20 suggests a curb, wall or bridge edge),
 bearing_deg, and FunctionalClass/RoadType joined on OBJECTID.
 
---no-csv skips rewriting the 129 MB csv alongside the parquet and is much
-faster. Nothing downstream reads that csv except plot_points_map.py, which only
-wants lat/lon and is fine with the pre-elevation version left by step 3.
+Elevations are converted from the DEM's US survey feet to METRES on read, so
+every column here -- and everything downstream -- stays metric and on NAVD88,
+exactly as under the old 1 m product. Nothing else in the pipeline had to learn
+that the DEM changed units.
 
-The meta.json it writes records the DEM tiles, datum, and measured accuracy --
-read it before trusting a gradient. Short version: compute grades over >=25 m
-baselines, because adjacent 1 m deltas are noise-dominated.
+Two properties of the OPR tiles are handled here:
 
-Run of 2026-08-09: 667,425 points sampled across all 4 tiles, no NaN
-elevations, range 109.12..240.71 m. 23.7 MB parquet.
+  * They do not overlap; they butt up exactly on a 3000 ft grid. A point within
+    one pixel of a tile edge therefore has no bilinear neighbourhood inside its
+    own tile. Sampling goes through a VRT mosaic (hand-written, since there is
+    no osgeo binding in the venv) so those neighbours come from the adjoining
+    tile -- the job the 1 m product's 12 m tile overlap did for free.
+
+  * AREA_OR_POINT=Point rather than Area. This does NOT move the sample
+    location: GDAL's geotransform is corner-based either way, and the flag only
+    records that the value is a point measurement rather than a cell average.
+    The half-pixel shift to cell centres is right for both. Checked against the
+    1 m product at 59,472 points -- centre 1.05 cm RMS, node 1.26 cm.
+
+--no-csv skips rewriting the csv alongside the parquet and is much faster.
+Nothing downstream reads that csv; plot_points_map.py now reads the parquet.
+
+The meta.json it writes records the DEM, datum, point spacing and measured
+accuracy -- read it before trusting a gradient. Short version: compute grades
+over >=25 m baselines. Adjacent deltas are noise-dominated, and at 0.1 m
+spacing on a 0.3 m grid neighbouring samples are correlated as well.
+
+Run of 2026-08-25: 6,630,822 points sampled across 112 tiles, no NaN
+elevations, range 109.12..240.71 m -- the same range the 1 m product gave.
+242.7 MB parquet.
+
+elev_disc_cm is much tighter on the finer grid: median 0.24 cm and p99 2.07 cm,
+against 1.5 cm / 8.2 cm on the 1 m product. The >20 cm flag still means what it
+did, though -- above about 8 cm the two grids flag near-identical counts
+(1,610 vs 1,593 points), because up there it is real curbs and walls rather
+than the grid's own noise floor. So the threshold did not need rescaling.
 
 
 5. Render
@@ -262,25 +405,46 @@ legend counts streets; the road-class legend counts centerline segments.
 Smoothing -- 25 m or 10 m, and the checkbox between them
 --------------------------------------------------------
 
---smooth is the rolling-mean window over the 1 m elevation samples, in metres.
+--smooth is the rolling-mean window over the elevation samples, in METRES.
 It lives in plot_street_profiles.py (SMOOTH_M = 25.0, the default) and
 plot_street_drains.py and plot_street_bokeh.py take the same flag, because all
 three build their profile through that module's build_profile(). It is the one
 knob they share; changing SMOOTH_M moves all of them.
 
-It is not cosmetic. Sags are found ON the smoothed profile -- at 1 m the ~2 cm
-DEM noise manufactures minima everywhere -- so the window decides how shallow a
-dip still counts, and the two builds genuinely disagree:
+The window is converted from metres to samples using the spacing MEASURED from
+the data (sample_step in that module). It used to be converted 1:1, which
+silently assumed 1 m spacing -- at the current 0.1 m that would have turned
+--smooth 25 into a 2.5 m window and moved every sag count with it.
+
+It is not cosmetic. Sags are found ON the smoothed profile -- unsmoothed, the
+~2 cm DEM noise manufactures minima everywhere -- so the window decides how
+shallow a dip still counts, and the two builds genuinely disagree:
 
                         25 m          10 m
     sags                 597           823
     unserved sags        168           246
     streets with a sag   356           464
 
+Re-measured on 2026-08-26 against the 1 ft DEM at 0.1 m spacing, 25 m window
+(Stormdrain_map/streets_0.1m):
+
+                    1 m DEM / 1 m    1 ft DEM / 0.1 m
+    sags                 597               599
+    unserved sags        168               168
+    streets with a sag   356               357
+
+So the DEM change moved the sag count by TWO, out of 599, and left the unserved
+count untouched. The smoothing window moved it by 226. That is the useful
+result: what counts as a sag is set almost entirely by the 25 m rolling mean,
+not by the resolution underneath it -- a 25 m average over 250 samples of a
+0.3 m grid lands in the same place as a 25 m average over 25 samples of a 1 m
+grid. The finer DEM buys horizontal precision and a tighter elev_disc_cm, not
+different sags.
+
 176 streets differ, and never in the other direction: a shorter window only ever
 keeps more dips, because a longer one averages them away. Neither is the right
 answer. 25 m is the baseline the DEM's own accuracy note argues for (see
-derived/segments_points_1m.meta.json -- adjacent 1 m deltas are noise); 10 m
+derived/segments_points_0p1m.meta.json -- adjacent deltas are noise); 10 m
 catches real but shallow ponding that 25 m flattens, at the cost of promoting
 some noise. The checkbox exists so the two can be read against each other rather
 than one being picked blind.
@@ -320,7 +484,7 @@ Static renders -- optional, none of the above depends on them:
 
     .venv/Scripts/python.exe plot_street_drains.py --all    -> derived/drains/
     .venv/Scripts/python.exe plot_street_profiles.py        -> derived/profiles/
-    .venv/Scripts/python.exe plot_points_map.py             -> derived/map_points_1m.html
+    .venv/Scripts/python.exe plot_points_map.py --every 100 -> derived/map_points_0p1m_every100.html
     .venv/Scripts/python.exe preview_dem.py                 -> derived/dem_*.png
     .venv/Scripts/python.exe map_street_cells.py --street "AIRWAY BL"
 
@@ -329,6 +493,12 @@ analysis, same numbers, ~580 MB of images. --unserved-only narrows it to the
 streets with an unserved sag, which is usually what is actually wanted;
 --outdir redirects the output; --min-drains skips sparse streets.
 
+plot_points_map.py wants --every at the 0.1 m default: 6.6 M markers is far
+more than a browser will draw comfortably. --every 100 gives ~66k, which is
+about what the old 1 m corpus plotted whole.
+
 preview_dem.py and map_street_cells.py are DEM sanity checks rather than
-deliverables: hillshaded tile overviews, and one street drawn against the
-native 1 m grid.
+deliverables: hillshaded mosaic overviews, and one street drawn against the
+native 1 ft grid. map_street_cells.py is the one plot that works in the DEM's
+own CRS (EPSG:6420, ftUS) rather than UTM -- the grid is only square and
+whole-numbered there.
