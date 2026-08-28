@@ -43,6 +43,11 @@ o2s/*.geojson
 dem_livermore/
 livermore_tiles.csv
 livermore_download.log
+# Same, per city: run_pipeline.sh --city <slug> writes dem_<slug>/ and
+# <slug>_tiles.csv. Pleasanton alone is 12 GB over 414 tiles.
+dem_*/
+*_tiles.csv
+*_download.log
 
 # conda-forge environment. Only needed to mosaic collects that sit in DIFFERENT
 # projections -- gdal.Warp, which has no PyPI wheel on Windows. environment.yml

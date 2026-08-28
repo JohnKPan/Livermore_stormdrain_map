@@ -23,6 +23,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import re
 
@@ -35,12 +36,23 @@ import numpy as np
 import pandas as pd
 from pyproj import Transformer
 
-from extract_centerline_latlon import points_path
+from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import (SMOOTH_M, chain_segments, build_profile,
-                                  safe_name, sample_step)
+                                  merge_components, safe_name, sample_step,
+                                  segs_of, split_components)
 
+# resolved per --city in main(); this is only the default shown in --help
 POINTS = points_path()
-INLETS = "derived/storm_inlets.csv"
+# One file for every city fetch_inlets.py knows, filtered to the city's AOI at
+# load time. The pre-merge per-city file is still read if the merged one has not
+# been built, so an old checkout keeps working.
+INLETS = "derived/storm_inlets_all.csv"
+INLETS_LEGACY = "derived/storm_inlets.csv"
+# fetch_city_boundaries.py writes one polygon per city under this name. A
+# buffered AOI from make_aoi.py can be passed with --aoi instead, which is the
+# point of buffering: it catches inlets that drain INTO the city from outside
+# its limits, and those are exactly the ones a source filter would miss.
+AOI_DIR = "city_geojson"
 OUTDIR = "derived/drains"
 FT_TO_M = 0.3048
 DATUM_SHIFT_M = 0.794          # measured NGVD29 -> NAVD88 offset, see module docstring
@@ -73,8 +85,56 @@ STYLE = {
 DEFAULT_STYLE = dict(marker="v", color="#555555")
 
 
-def load_inlets(path, shift):
-    d = pd.read_csv(path)
+def load_aoi(path):
+    """The AOI polygon as one shapely geometry, prepared for repeated hits."""
+    from shapely.geometry import shape
+    from shapely.ops import unary_union
+
+    with open(path, encoding="utf-8") as f:
+        gj = json.load(f)
+    geoms = ([shape(ft["geometry"]) for ft in gj["features"]]
+             if gj.get("type") == "FeatureCollection"
+             else [shape(gj.get("geometry", gj))])
+    geoms = [g for g in geoms if not g.is_empty]
+    if not geoms:
+        raise SystemExit(f"no usable geometry in {path}")
+    return unary_union(geoms)
+
+
+def clip_to_aoi(d, aoi):
+    """Keep the inlets inside the AOI.
+
+    A bbox pre-filter first: the polygon test is per-point and the corpus is
+    every city at once, so rejecting the ~90% that are not even in the bounding
+    box before touching shapely is most of the runtime.
+    """
+    from shapely import points as _points, contains as _contains
+
+    x0, y0, x1, y1 = aoi.bounds
+    near = (d.lon.between(x0, x1) & d.lat.between(y0, y1)).to_numpy()
+    keep = np.zeros(len(d), dtype=bool)
+    if near.any():
+        sub = d.loc[near, ["lon", "lat"]].to_numpy()
+        keep[near] = _contains(aoi, _points(sub))
+    return d.loc[keep].reset_index(drop=True)
+
+
+def load_inlets(path, shift, aoi=None):
+    # low_memory=False: the merged corpus has columns a city fills and its
+    # neighbours leave blank, so chunked type inference would give one column
+    # different dtypes depending on where the chunk boundary landed.
+    d = pd.read_csv(path, low_memory=False)
+    before, srcs = len(d), None
+    if aoi is not None:
+        srcs = d.source.value_counts().to_dict() if "source" in d.columns else None
+        d = clip_to_aoi(d, aoi)
+        kept = d.source.value_counts().to_dict() if "source" in d.columns else None
+        print(f"  inlets: {before:,} -> {len(d):,} within the AOI"
+              + (f"  {kept}" if kept else ""))
+        if srcs and not kept:
+            raise SystemExit(
+                f"no inlets fall inside the AOI. The corpus covers "
+                f"{', '.join(srcs)} -- is this the right city?")
     g = d.TopOfGrate.where((d.TopOfGrate >= GRATE_MIN_FT) & (d.TopOfGrate <= GRATE_MAX_FT))
     iv = d.InvertElevation1.where((d.InvertElevation1 >= GRATE_MIN_FT - 50)
                                   & (d.InvertElevation1 <= GRATE_MAX_FT))
@@ -82,6 +142,36 @@ def load_inlets(path, shift):
     d["invert_m"] = iv * FT_TO_M + shift
     d["type"] = d.TypeDescription.fillna("Unknown")
     return d
+
+
+def resolve_inlets(here, explicit=None):
+    """The merged corpus if it has been built, else the pre-merge Livermore file."""
+    if explicit:
+        return os.path.join(here, explicit)
+    merged = os.path.join(here, INLETS)
+    if os.path.exists(merged):
+        return merged
+    legacy = os.path.join(here, INLETS_LEGACY)
+    if os.path.exists(legacy):
+        print(f"  ! {INLETS} not built, falling back to {INLETS_LEGACY}"
+              f" -- run: python fetch_inlets.py --all")
+        return legacy
+    raise SystemExit(f"no inlet corpus: run `python fetch_inlets.py --all` "
+                     f"to write {INLETS}")
+
+
+def resolve_aoi(here, city, explicit=None, disabled=False):
+    """The AOI polygon path for a city, or None when filtering is off."""
+    if disabled:
+        return None
+    path = os.path.join(here, explicit) if explicit else \
+        os.path.join(here, AOI_DIR, f"{city}.geojson")
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"AOI not found: {path}\n"
+            f"Run `python fetch_city_boundaries.py` to write {AOI_DIR}/, pass "
+            f"--aoi with your own polygon, or --no-aoi to skip the filter.")
+    return path
 
 
 def snap(inlets, e, n, dist, max_offset):
@@ -156,14 +246,26 @@ def find_sags(d, z, run, min_prom, min_sep, edge_m=10.0):
     return sorted(kept, key=lambda t: t[0])
 
 
-def prepare(st, inlets, args):
+def street_parts(st):
+    """A street's physically connected runs, ready for prepare().
+
+    One entry for an ordinary street; more where a divided road gives a
+    carriageway each way, or where the name covers roads in different parts of
+    town. Chaining across those produces a profile that doubles back or counts
+    kilometres of open country as chainage -- see split_components().
+    """
+    return merge_components(split_components(segs_of(st)))
+
+
+def prepare(st, inlets, args, segs=None):
     """Chain the street and attach inlets -- cheap, so a batch can filter on the
-    inlet count before paying for a figure and its map tiles."""
-    segs = []
-    for oid, sg in st.groupby("OBJECTID", sort=True):
-        sg = sg.sort_values("dist_along_m")
-        segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
-                     sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
+    inlet count before paying for a figure and its map tiles.
+
+    `segs` is one run from street_parts(); without it the whole street is
+    chained as a single path, which is only right when it has one run.
+    """
+    if segs is None:
+        segs = segs_of(st)
     e, n, z, disc, run, _, origin = chain_segments(segs)
     d, smooth = build_profile(e, n, z, run, args.smooth)
     near = snap(inlets, e, n, d, args.max_offset)
@@ -534,6 +636,15 @@ def main():
                          "you have a key configured, and they return HTTP 200 "
                          "while doing it, so the failure is silent.")
     ap.add_argument("--outdir", default=OUTDIR)
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help="city slug; reads derived/<city>/ and city_geojson/<city>.geojson")
+    ap.add_argument("--inlets", default=None,
+                    help=f"inlet CSV (default {INLETS}, or {INLETS_LEGACY})")
+    ap.add_argument("--aoi", default=None,
+                    help=f"AOI polygon to clip inlets to "
+                         f"(default {AOI_DIR}/<city>.geojson)")
+    ap.add_argument("--no-aoi", dest="aoi_filter", action="store_false",
+                    help="skip the AOI clip and use every inlet in the file")
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
                     help="rolling-mean window (m) behind both the drawn "
                          f"profile and sag detection (default {SMOOTH_M:g})")
@@ -584,29 +695,39 @@ def main():
         pass
 
     shift = DATUM_SHIFT_M if args.datum_shift else 0.0
-    inlets = load_inlets(os.path.join(here, INLETS), shift)
+    aoi_path = resolve_aoi(here, args.city, args.aoi, not args.aoi_filter)
+    inlets = load_inlets(resolve_inlets(here, args.inlets), shift,
+                         load_aoi(aoi_path) if aoi_path else None)
     tr = Transformer.from_crs("EPSG:4326", "EPSG:26910", always_xy=True)
     inlets["x"], inlets["y"] = tr.transform(inlets.lon.values, inlets.lat.values)
 
-    df = pd.read_parquet(os.path.join(here, POINTS))
+    df = pd.read_parquet(os.path.join(here, points_path(SPACING, "parquet", args.city)))
+# Segments with no display_name get no page: a page is identified by its
+# street, and Overture leaves 8% of the kept network nameless -- unnamed stubs,
+# alleys and junction connectors that no amount of fetching will name. They stay
+# in the point corpus, where they still drain, and the overview draws them; they
+# just have nothing to be a page of. The portal never raised this because it
+# labels its nameless roads with the literal string UNNAMED.
     if args.unserved_only:
         # prepare() is cheap; scan every street and keep those holding a sag
         # with no qualifying inlet
         names = []
-        for nm in sorted(df.FullStreetName.unique()):
-            if prepare(df[df.FullStreetName == nm], inlets, args)["unserved"]:
+        for nm in sorted(df.display_name.dropna().unique()):
+            sub = df[df.display_name == nm]
+            if any(prepare(sub, inlets, args, segs=sg)["unserved"]
+                   for sg in street_parts(sub)):
                 names.append(nm)
         print(f"{len(names)} streets hold at least one unserved sag")
     elif args.all:
-        names = sorted(df.FullStreetName.unique())
+        names = sorted(df.display_name.dropna().unique())
     elif args.random:
         # sample only from streets that actually carry inlets, otherwise most
         # draws land on the 648 streets with none and show no arrows at all
         with_inlets = set(
-            df.loc[df.FullStreetName.notna(), "FullStreetName"].unique())
+            df.loc[df.display_name.notna(), "display_name"].unique())
         cand = []
         for nm in sorted(with_inlets):
-            sub = df[df.FullStreetName == nm]
+            sub = df[df.display_name == nm]
             bx = (inlets.x.between(sub.easting.min()-args.max_offset,
                                    sub.easting.max()+args.max_offset)
                   & inlets.y.between(sub.northing.min()-args.max_offset,
@@ -627,27 +748,36 @@ def main():
     used = {}
     rows = []
     for i, name in enumerate(names, 1):
-        st = df[df.FullStreetName == name]
+        st = df[df.display_name == name]
         if st.empty:
             print(f"No points for {name!r}")
             continue
-        try:
-            prep = prepare(st, inlets, args)
-            near = prep["near"]
-            if args.all and len(near) < args.min_drains:
-                skipped += 1
+        parts = street_parts(st)
+        for pi, segs in enumerate(parts, 1):
+            label = name if len(parts) == 1 else (
+                "%s %d of %d" % (name, pi, len(parts)))
+            try:
+                prep = prepare(st, inlets, args, segs=segs)
+                near = prep["near"]
+                if args.all and len(near) < args.min_drains:
+                    skipped += 1
+                    continue
+                out, near = render(label, st, prep, args, outdir, used)
+            except Exception as exc:                           # noqa: BLE001
+                failed += 1
+                print(f"  FAILED {label!r}: {type(exc).__name__}: {exc}")
                 continue
-            out, near = render(name, st, prep, args, outdir, used)
-        except Exception as exc:                               # noqa: BLE001
-            failed += 1
-            print(f"  FAILED {name!r}: {type(exc).__name__}: {exc}")
-            continue
-        made += 1
-        rows.append({"FullStreetName": name, "file": os.path.basename(out),
-                     "n_points": len(st), "n_inlets": len(near),
-                     "n_grate_elev": int(near.grate_m.notna().sum()) if len(near) else 0,
-                     "n_invert_elev": int(near.invert_m.notna().sum()) if len(near) else 0,
-                     "median_offset_m": round(float(near.offset_m.median()), 1) if len(near) else None})
+            made += 1
+            rows.append({
+                "display_name": name, "part": pi, "n_parts": len(parts),
+                "page": label,
+                "segments": " ".join(str(x[0]) for x in segs),
+                "file": os.path.basename(out),
+                "n_points": sum(len(x[1]) for x in segs),
+                "n_inlets": len(near),
+                "n_grate_elev": int(near.grate_m.notna().sum()) if len(near) else 0,
+                "n_invert_elev": int(near.invert_m.notna().sum()) if len(near) else 0,
+                "median_offset_m": round(float(near.offset_m.median()), 1) if len(near) else None})
         if args.all and i % 100 == 0:
             print(f"  {i}/{len(names)} processed, {made} written", flush=True)
         if not args.all:

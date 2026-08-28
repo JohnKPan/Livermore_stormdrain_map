@@ -21,8 +21,8 @@ It picks the venv python if there is one, and falls back to whatever is on PATH.
 
 The steps themselves, should you want to run them by hand:
 
-    .venv/Scripts/python.exe fetch_livermore_street_centerlines.py
-    .venv/Scripts/python.exe fetch_inlets.py
+    .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
+    .venv/Scripts/python.exe fetch_inlets.py --all
     .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
@@ -40,7 +40,7 @@ The two plot_street_bokeh.py runs differ only in the elevation smoothing window
 and where they write. Both corpora are kept, and the overview's checkbox
 switches between them -- see section 5.
 
-(Plain `python fetch_inlets.py` works too if the venv is activated -- the
+(Plain `python fetch_inlets.py --all` works too if the venv is activated -- the
 explicit interpreter path just avoids depending on that.)
 
 Order matters in exactly two places: add_elevation.py needs the parquet that
@@ -56,53 +56,50 @@ downloaded, resumes partial ones, and re-merges only what changed.
 0. Street centerline
 --------------------
 
-    .venv/Scripts/python.exe fetch_livermore_street_centerlines.py
+    .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
 
-Source: City of Livermore open GIS portal, dataset 08e97ae0e0ee43cea3b376ef0bbc9884_1
-        https://gisopendata.livermoreca.gov/datasets/08e97ae0e0ee43cea3b376ef0bbc9884_1
-        which resolves to layer 1 of
-        https://services7.arcgis.com/BJisQXdgVScP0JMy/arcgis/rest/services
-            /Street_Centerline_-_Public/FeatureServer/1
+Source: Overture Maps transportation theme. One source for all 101 cities,
+        selected by --cities against city_geojson/.
 
-Writes: streets/Street_Centerline_-_Public.geojson
+Writes: streets/overture/<city>.geojson
 
-The portal's export carried a long numeric suffix; nothing depended on it,
-so it is dropped. extract_centerline_latlon.py defaults to this same path
-and takes --src to override; fetch takes --out. Change both to move it.
-
-Paged 2,000 at a time (the layer's maxRecordCount). The service speaks GeoJSON
-natively, so f=geojson with outSR=4326 gives the file directly -- its own
-storage is EPSG:6420.
-
-The nine attribute fields it returns are exactly the ATTRS list in
-extract_centerline_latlon.py. That script skips any feature whose geometry is
-not a LineString, so a multi-part polyline would vanish without an error; the
-fetch counts geometry types and warns if any appear.
-
-Run of 2026-08-09: 4,867 features, 44,230 vertices, all LineString, 3.4 MB.
-Verified against the portal export it replaces: same OBJECTID set, zero
-differing property values, and coordinates identical to the last decimal.
+Livermore's own portal layer (Street_Centerline_-_Public, 4,867 features) was
+the baseline the Overture corpus was checked against -- same OBJECTID set, zero
+differing property values, coordinates identical to the last decimal. It is no
+longer a pipeline step: one fetch that works everywhere beat two that disagree
+about which city they serve. fetch_livermore_street_centerlines.py is still in
+the tree for that comparison, and nothing calls it.
 
 
 1. Storm drain inlets
 ---------------------
 
-    .venv/Scripts/python.exe fetch_inlets.py
+    .venv/Scripts/python.exe fetch_inlets.py --all
 
-Source: City of Livermore public ArcGIS FeatureServer, layer 2 (Inlet)
-        https://gisweb.cityoflivermore.net/arcgis/rest/services
-            /WetUtilities/StormStructures/FeatureServer/2/query
+Source: one vetted ArcGIS layer per city, see fetch_inlets.py --list.
+        livermore   gisweb.cityoflivermore.net  ...StormStructures/FeatureServer/2
+        san_jose    geo.sanjoseca.gov           ...OPN_OpenDataService/MapServer/295
+        pleasanton  gisdata.cityofpleasantonca.gov  ...UtStormDrain/MapServer/1
 
-Writes: derived/storm_inlets.csv       (lon, lat + 15 asset fields)
-        derived/storm_inlets.geojson
+Writes: derived/storm_inlets_all.csv   (lon, lat, source + 8 canonical + extras)
+        derived/storm_inlets_all.geojson
 
-Paged 2,000 records at a time until the server stops setting
-exceededTransferLimit; coordinates requested in WGS84 (outSR=4326) to match
-the centerline data.
+Each publisher's fields are mapped onto one canonical schema -- Livermore's
+names, because the plotters already read them -- and every row carries a
+`source` column. A single city still writes its own file: `fetch_inlets.py
+pleasanton` -> derived/storm_inlets_pleasanton.csv.
 
-Run of 2026-08-09: 6,987 inlets, all OperationalStatus=Active, no missing
-geometry. 4,488 carry TopOfGrate, 4,899 carry InvertElevation1. Types are
-4,912 Curb Inlet / 2,070 Grated Inlet / 5 other.
+The plotters clip this corpus to city_geojson/<city>.geojson at load, so one
+fetch serves any --city. That polygon is buffered 2 miles, so the clip keeps a
+neighbouring city's inlets where they fall inside it -- deliberate, since those
+drain into the city, but it means the clip is not the same as the city limit.
+Pass --no-aoi to skip it, or --aoi with your own polygon.
+
+Run of 2026-08-28: 51,334 inlets over 37 columns -- livermore 6,987,
+san_jose 36,094, pleasanton 8,253. For Livermore alone: all
+OperationalStatus=Active, no missing geometry, 4,488 carry TopOfGrate,
+4,899 carry InvertElevation1, types 4,912 Curb Inlet / 2,070 Grated Inlet /
+5 other.
 
 DATUM -- important. TopOfGrate and InvertElevation1 are in FEET on NGVD29,
 while the DEM is metres on NAVD88. plot_street_drains.py applies a measured

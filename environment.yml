@@ -42,3 +42,5 @@ dependencies:
   - xyzservices>=2024.9
   - plotly>=6.0
   - shapely>=2.0
+  # Same reason as rasterio: conda-forge so pyogrio links the one libgdal.
+  - geopandas>=1.0

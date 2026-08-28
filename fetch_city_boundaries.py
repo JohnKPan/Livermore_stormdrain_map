@@ -8,10 +8,11 @@ Writes: city_geojson/<slug>.geojson   one Polygon/MultiPolygon feature each
         city_geojson/_index.csv       one row per city -- what was written
 
 One publisher for all 101 cities, deliberately. Every city also draws its own
-limits on its own portal, and fetch_inlets.py already documents where that
-leads: 33 publishers, 33 schemas, 33 field-name maps. Boundaries have a single
-national source that is authoritative for all of them, so this script carries a
-registry of nine county codes rather than a registry of a hundred endpoints.
+limits on its own portal, and bay_area_stormdrain_sources.csv already documents
+where that leads: 34 publishers, 34 schemas, 34 field-name maps. Boundaries have
+a single national source that is authoritative for all of them, so this script
+carries a registry of nine county codes rather than a registry of a hundred
+endpoints.
 
 The trade is vintage, not accuracy: TIGER reflects annexations as of its
 January 1 snapshot, so a parcel annexed last spring sits outside its city here
@@ -33,8 +34,9 @@ polygon (unlike a centroid, which for a crescent-shaped city need not). A
 straddling city lands in the county holding that point and is fetched whole,
 so the polygon is never clipped to the county.
 
-Slugs match fetch_inlets.py's city keys -- livermore, san_jose -- so a city's
-boundary, inlets and streets can be found under one name across the fetches.
+Slugs match the city keys the inlet fetches use -- livermore, san_jose -- so a
+city's boundary, inlets and streets can be found under one name across the
+fetches, and under one name in derived/ (storm_inlets_san_jose.csv).
 
 --buffer-miles dilates every polygon outward before writing, for catching what
 drains INTO a city from outside it. Read the caveats on BUFFER below before
@@ -122,7 +124,7 @@ def query(service, layer, params):
 
 
 def slugify(name):
-    """BASENAME -> the key fetch_inlets.py would use. 'St. Helena' -> st_helena."""
+    """BASENAME -> the key the inlet fetches use. 'St. Helena' -> st_helena."""
     return re.sub("[^a-z0-9]+", "_", name.lower()).strip("_")
 
 

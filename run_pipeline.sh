@@ -31,37 +31,55 @@ SMOOTHS=(25 10 5)
 # open on any of them. 25 m is the smoothest and misses shallow sags; 5 m keeps
 # noise; 10 m is the working default. Must match one of SMOOTHS.
 OPENS_AT=10
-DIRS=("Stormdrain_map/streets_25m"
-      "Stormdrain_map/streets_10m"
-      "Stormdrain_map/streets_5m")
-# Must track SPACING in extract_centerline_latlon.py, which names this file.
-POINTS="derived/segments_points_0p1m.parquet"
-DEM_DIR="dem_livermore"
+# The city is the unit of work. Everything below derives from it, so a second
+# city collides with nothing and "region-wide" is a loop over the slugs in
+# city_geojson/_index.csv. One at a time is the practical mode regardless:
+# dem_livermore/ alone is 8 GB of 1 ft tiles, so a region-wide run means
+# fetching, processing and deleting a city before starting the next.
+CITY="${CITY:-livermore}"
+# The USGS OPR collect covering the AOI. Varies by county; find another city's
+# with fetch_usgs_lidar.py --aoi-file ... --list-projects.
+DEM_PROJECT="${DEM_PROJECT:-CA_AlamedaCounty_2021_B21}"
 
 usage() {
     cat <<'EOF'
 usage: run_pipeline.sh [options]
 
   (no options)     full rebuild: fetch, derive, render
+  --city SLUG      which city (default livermore). Everything derives from it:
+                   derived/<slug>/, dem_<slug>/, Stormdrain_map/<slug>/
   --render-only    skip the fetches and the elevation join; rebuild the pages
                    and the overview from the existing derived/ parquet
   --no-parallel    build the page corpora one after the other
   -h, --help       this message
 
-Writes Stormdrain_map/ -- the whole deliverable. Open Stormdrain_map/index.html.
+Writes Stormdrain_map/<city>/ -- the whole deliverable for one city.
+Region-wide is a loop:  for c in $(cut -d, -f1 city_geojson/_index.csv | tail -n +2);
+do ./run_pipeline.sh --city "$c"; done   -- but see the 8 GB/city DEM note above.
 EOF
 }
 
 render_only=0
 parallel=1
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --render-only) render_only=1 ;;
         --no-parallel) parallel=0 ;;
+        --city)        CITY="$2"; shift ;;
+        --city=*)      CITY="${1#*=}" ;;
         -h|--help)     usage; exit 0 ;;
-        *) echo "run_pipeline.sh: unknown option '$arg'" >&2; usage >&2; exit 2 ;;
+        *) echo "run_pipeline.sh: unknown option '$1'" >&2; usage >&2; exit 2 ;;
     esac
+    shift
 done
+
+DIRS=("Stormdrain_map/$CITY/streets_25m"
+      "Stormdrain_map/$CITY/streets_10m"
+      "Stormdrain_map/$CITY/streets_5m")
+# Must track SPACING in extract_centerline_latlon.py, which names this file.
+POINTS="derived/$CITY/segments_points_0p1m.parquet"
+DEM_DIR="dem_$CITY"
+OVERVIEW="Stormdrain_map/$CITY/index.html"
 
 # Interpreter choice, in preference order. PY is an ARRAY because the conda
 # case is a multi-word command.
@@ -93,15 +111,27 @@ step() {
 }
 
 if [ "$render_only" -eq 0 ]; then
-    step "street centerline"     "${PY[@]}" fetch_livermore_street_centerlines.py
-    step "storm drain inlets"    "${PY[@]}" fetch_inlets.py
-    step "lidar DEM tiles"       "${PY[@]}" fetch_usgs_lidar.py --aoi livermore \
-        --project CA_AlamedaCounty_2021_B21 --out "./$DEM_DIR" \
-        --manifest livermore_tiles.csv
+    # Overture for every city. Livermore's own portal layer was the baseline the
+    # corpus was checked against, not a second supported path.
+    step "street centerline" "${PY[@]}" fetch_overture_streets.py \
+        --cities "$CITY" --roads-only
+    SRC="streets/overture/$CITY.geojson"
+    # Every city in the registry, into derived/storm_inlets_all.csv. The
+    # plotters clip it to city_geojson/$CITY.geojson at load, so fetching the
+    # whole corpus once serves any --city without a refetch.
+    step "storm drain inlets"    "${PY[@]}" fetch_inlets.py --all
+    # The buffered boundary, not a hand-kept bbox: it already reaches two miles
+    # past the city limit, which is the margin the DEM needs for streets on the
+    # edge, and it exists for all 101 cities.
+    step "lidar DEM tiles"       "${PY[@]}" fetch_usgs_lidar.py \
+        --aoi-file "city_geojson/$CITY.geojson" \
+        --project "$DEM_PROJECT" --out "./$DEM_DIR" \
+        --manifest "${CITY}_tiles.csv"
     # --no-csv: at 0.1 m the intermediate CSV is ~600 MB and nothing reads it.
     step "centerline resampling" "${PY[@]}" extract_centerline_latlon.py --slim \
-        --parquet --no-csv
-    step "elevation join"        "${PY[@]}" add_elevation.py --no-csv
+        --parquet --no-csv --city "$CITY" --src "$SRC"
+    step "elevation join"        "${PY[@]}" add_elevation.py --no-csv \
+        --city "$CITY" --dem-dir "$DEM_DIR"
 elif [ ! -f "$POINTS" ]; then
     echo "run_pipeline.sh: --render-only needs $POINTS, which is not there." >&2
     echo "Run without --render-only once to build it." >&2
@@ -117,7 +147,7 @@ if [ "$parallel" -eq 1 ]; then
     for i in "${!SMOOTHS[@]}"; do
         lg=$(mktemp); logs+=("$lg")
         "${PY[@]}" plot_street_bokeh.py --all --smooth "${SMOOTHS[$i]}" \
-            --outdir "${DIRS[$i]}" >"$lg" 2>&1 &
+            --city "$CITY" --outdir "${DIRS[$i]}" >"$lg" 2>&1 &
         pids+=($!)
     done
     # Wait on ALL of them before failing: bailing on the first non-zero exit
@@ -134,7 +164,7 @@ if [ "$parallel" -eq 1 ]; then
 else
     for i in "${!SMOOTHS[@]}"; do
         step "street pages, ${SMOOTHS[$i]} m" "${PY[@]}" plot_street_bokeh.py \
-            --all --smooth "${SMOOTHS[$i]}" --outdir "${DIRS[$i]}"
+            --all --smooth "${SMOOTHS[$i]}" --city "$CITY" --outdir "${DIRS[$i]}"
     done
 fi
 
@@ -146,8 +176,8 @@ for i in "${!SMOOTHS[@]}"; do
     [ "$i" -eq 0 ] && continue
     ovw+=(--pages-alt "${DIRS[$i]}" --alt-label "${SMOOTHS[$i]} m")
 done
-ovw+=(--opens-at "${OPENS_AT} m")
+ovw+=(--opens-at "${OPENS_AT} m" --city "$CITY" --out "$OVERVIEW")
 step "city overview" "${PY[@]}" plot_city_overview.py "${ovw[@]}"
 
-printf '\ndone in %dm %ds -- open Stormdrain_map/index.html\n' \
-    "$(((SECONDS - start) / 60))" "$(((SECONDS - start) % 60))"
+printf '\ndone in %dm %ds -- open %s\n' \
+    "$(((SECONDS - start) / 60))" "$(((SECONDS - start) % 60))" "$OVERVIEW"

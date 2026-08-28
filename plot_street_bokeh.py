@@ -38,13 +38,15 @@ from bokeh.models import (Arrow, BoxSelectTool, ColumnDataSource, CustomJS,
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
-from plot_street_drains import (DATUM_SHIFT_M, DEFAULT_STYLE, STYLE,
-                                load_inlets, prepare)
-from extract_centerline_latlon import points_path
+from plot_street_drains import (AOI_DIR, DATUM_SHIFT_M, DEFAULT_STYLE,
+                                INLETS as INLETS_ALL, INLETS_LEGACY, STYLE,
+                                street_parts, load_aoi, load_inlets, prepare,
+                                resolve_aoi, resolve_inlets)
+from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import SMOOTH_M, safe_name, sample_step
 
+# resolved per --city in main(); this is only the default shown in --help
 POINTS = points_path()
-INLETS = "derived/storm_inlets.csv"
 OUTDIR = "Stormdrain_map/streets"
 # The profile is the panel the page is read for, and at 320 px a Livermore
 # street -- tens of metres of relief over kilometres -- was drawn nearly flat.
@@ -83,8 +85,8 @@ def draw_stride(d, run, draw_spacing):
     return keep
 
 
-def build(street, st, inlets, args, outdir, used):
-    p = prepare(st, inlets, args)
+def build(street, st, inlets, args, outdir, used, segs=None):
+    p = prepare(st, inlets, args, segs=segs)
     d, z, sm = p["d"], p["z"], p["smooth"]
     e, n, near = p["e"], p["n"], p["near"]
 
@@ -442,6 +444,15 @@ def main():
                          "(m) for DRAWING only; sags, inlets and the rolling "
                          "mean are still computed on every point. "
                          "0 = keep all points (default)")
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help="city slug; reads derived/<city>/ and city_geojson/<city>.geojson")
+    ap.add_argument("--inlets", default=None,
+                    help=f"inlet CSV (default {INLETS_ALL}, or {INLETS_LEGACY})")
+    ap.add_argument("--aoi", default=None,
+                    help=f"AOI polygon to clip inlets to "
+                         f"(default {AOI_DIR}/<city>.geojson)")
+    ap.add_argument("--no-aoi", dest="aoi_filter", action="store_false",
+                    help="skip the AOI clip and use every inlet in the file")
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
                     help=f"rolling-mean window (m) (default {SMOOTH_M:g})")
     ap.add_argument("--sag-prom", type=float, default=0.20)
@@ -466,18 +477,26 @@ def main():
     outdir = os.path.join(here, args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    inlets = load_inlets(os.path.join(here, INLETS),
-                         DATUM_SHIFT_M if args.datum_shift else 0.0)
+    aoi_path = resolve_aoi(here, args.city, args.aoi, not args.aoi_filter)
+    inlets = load_inlets(resolve_inlets(here, args.inlets),
+                         DATUM_SHIFT_M if args.datum_shift else 0.0,
+                         load_aoi(aoi_path) if aoi_path else None)
     tr = Transformer.from_crs("EPSG:4326", "EPSG:26910", always_xy=True)
     inlets["x"], inlets["y"] = tr.transform(inlets.lon.values, inlets.lat.values)
 
-    df = pd.read_parquet(os.path.join(here, POINTS))
+    df = pd.read_parquet(os.path.join(here, points_path(SPACING, "parquet", args.city)))
+# Segments with no display_name get no page: a page is identified by its
+# street, and Overture leaves 8% of the kept network nameless -- unnamed stubs,
+# alleys and junction connectors that no amount of fetching will name. They stay
+# in the point corpus, where they still drain, and the overview draws them; they
+# just have nothing to be a page of. The portal never raised this because it
+# labels its nameless roads with the literal string UNNAMED.
     if args.all:
-        names = sorted(df.FullStreetName.unique())
+        names = sorted(df.display_name.dropna().unique())
     elif args.random:
         cand = []
-        for nm in sorted(df.FullStreetName.unique()):
-            sub = df[df.FullStreetName == nm]
+        for nm in sorted(df.display_name.dropna().unique()):
+            sub = df[df.display_name == nm]
             bx = (inlets.x.between(sub.easting.min()-30, sub.easting.max()+30)
                   & inlets.y.between(sub.northing.min()-30, sub.northing.max()+30))
             if bx.sum() >= 3:
@@ -490,22 +509,36 @@ def main():
 
     used, rows, failed = {}, [], 0
     for i, nm in enumerate(names, 1):
-        st = df[df.FullStreetName == nm]
+        st = df[df.display_name == nm]
         if st.empty:
             print(f"  no points for {nm!r}")
             continue
-        try:
-            out, p = build(nm, st, inlets, args, outdir, used)
-        except Exception as exc:                                # noqa: BLE001
-            failed += 1
-            print(f"  FAILED {nm!r}: {type(exc).__name__}: {exc}", flush=True)
-            continue
-        rows.append(dict(FullStreetName=nm, file=os.path.basename(out),
-                         n_points=len(st), n_inlets=len(p["near"]),
-                         n_sags=len(p["sags"]), n_served=len(p["marked"]),
-                         n_unserved=len(p["unserved"]),
-                         length_m=round(float(p["d"][-1]), 1),
-                         kb=round(os.path.getsize(out)/1e3, 1)))
+        parts = street_parts(st)
+        for pi, segs in enumerate(parts, 1):
+            label = nm if len(parts) == 1 else (
+                "%s %d of %d" % (nm, pi, len(parts)))
+            try:
+                out, p = build(label, st, inlets, args, outdir, used, segs=segs)
+            except Exception as exc:                            # noqa: BLE001
+                failed += 1
+                print(f"  FAILED {label!r}: {type(exc).__name__}: {exc}", flush=True)
+                continue
+            # `page` is the unique key for this file and `segments` lists the
+            # OBJECTIDs it covers, so plot_city_overview.py can map a tapped
+            # segment straight to its page. Keying the overview on the street
+            # name cannot work once a name has several pages -- and its
+            # per-name bbox would span the whole town for a street like
+            # THIRD ST, whose runs are 4.5 km apart.
+            rows.append(dict(display_name=nm, part=pi, n_parts=len(parts),
+                             page=label,
+                             segments=" ".join(str(x[0]) for x in segs),
+                             file=os.path.basename(out),
+                             n_points=sum(len(x[1]) for x in segs),
+                             n_inlets=len(p["near"]),
+                             n_sags=len(p["sags"]), n_served=len(p["marked"]),
+                             n_unserved=len(p["unserved"]),
+                             length_m=round(float(p["d"][-1]), 1),
+                             kb=round(os.path.getsize(out)/1e3, 1)))
         if args.all:
             if i % 100 == 0:
                 print(f"  {i}/{len(names)} processed", flush=True)
