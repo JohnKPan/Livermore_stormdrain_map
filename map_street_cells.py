@@ -35,7 +35,7 @@ from matplotlib.patches import Rectangle
 from rasterio.windows import from_bounds
 
 from add_elevation import DEMDIR, FT_TO_M, VRT_NAME, build_vrt
-from extract_centerline_latlon import SPACING, points_path
+from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import DISC_CM
 
 
@@ -79,8 +79,8 @@ def main():
         return 1
     vrt = build_vrt(files, os.path.join(demdir, VRT_NAME)).path
 
-    df = pd.read_parquet(os.path.join(here, points_path(args.spacing)))
-    st = df[df.FullStreetName == args.street].copy()
+    df = pd.read_parquet(os.path.join(here, points_path(args.spacing, "parquet", args.city)))
+    st = df[df.display_name == args.street].copy()
     if st.empty:
         print(f"No points for {args.street!r}")
         return 1

@@ -39,8 +39,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from extract_centerline_latlon import points_path
+from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 
+# resolved per --city in main(); this is only the default shown in --help
 POINTS = points_path()
 OUTDIR = "derived/profiles"
 GAP_BREAK_M = 40.0        # larger jumps between segments are drawn as a break
@@ -69,9 +70,10 @@ def safe_name(name, used):
 def endpoint_nodes(segs):
     """Cluster segment endpoints into the junction nodes they share.
 
-    Returns (pos, degree): node positions as an (N, 2) array, and how many
-    segment ends meet at each. Degree 1 marks a terminal -- a true end of the
-    street, rather than a joint with the next segment along.
+    Returns (pos, degree, node): node positions as an (N, 2) array, how many
+    segment ends meet at each, and the node index of every endpoint in order
+    (segment i owns entries 2i and 2i+1). Degree 1 marks a terminal -- a true
+    end of the street, rather than a joint with the next segment along.
     """
     eps = np.array([(s[1][i], s[2][i]) for s in segs for i in (0, -1)])
     node = np.full(len(eps), -1)
@@ -84,7 +86,7 @@ def endpoint_nodes(segs):
         node[same] = k
         pos.append(eps[same].mean(axis=0))
         k += 1
-    return np.array(pos), np.bincount(node, minlength=k)
+    return np.array(pos), np.bincount(node, minlength=k), node
 
 
 def path_origin(segs):
@@ -103,13 +105,140 @@ def path_origin(segs):
     """
     all_e = np.concatenate([s[1] for s in segs])
     all_n = np.concatenate([s[2] for s in segs])
-    pos, deg = endpoint_nodes(segs)
+    pos, deg, _ = endpoint_nodes(segs)
     cand = pos[deg == 1]
     if not len(cand):
         cand = pos                       # a closed loop has no terminal at all
     if np.ptp(all_e) >= np.ptp(all_n):
         return cand[cand[:, 0].argmin()], "W"
     return cand[cand[:, 1].argmax()], "N"
+
+
+def split_components(segs):
+    """Group a street's segments into physically connected runs, largest first.
+
+    A street is not always one path, and chain_segments() assumes it is. Two
+    cases break that assumption, and the first breaks it silently:
+
+      - A divided road. Overture models each carriageway as its own line, and
+        once ramps are excluded the two touch nowhere. chain_segments() walks
+        up one carriageway, finds the far end of the other a dozen metres away
+        -- well inside GAP_BREAK_M, so no gap is drawn -- and walks back down
+        it. The profile comes out twice the street's length, folded over
+        itself, and looks entirely plausible. 67% of Livermore's Principal
+        Arterials are two carriageways in Overture.
+      - A street interrupted by a park or a freeway. Two real pieces, in any
+        source. Here the jump is usually over GAP_BREAK_M, so it is at least
+        drawn as a break -- but chaining still orders the pieces as though a
+        driver could run them end to end.
+
+    Splitting first means each run gets its own profile, which is also the
+    honest unit for drainage: two carriageways drain to their own gutters.
+    """
+    _, _, node = endpoint_nodes(segs)
+    parent = list(range(len(segs)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    first_at = {}
+    for i in range(len(segs)):
+        for end in (2 * i, 2 * i + 1):
+            j = first_at.setdefault(node[end], i)
+            ra, rb = find(i), find(j)
+            if ra != rb:
+                parent[ra] = rb
+
+    groups = {}
+    for i in range(len(segs)):
+        groups.setdefault(find(i), []).append(i)
+    order = sorted(groups.values(),
+                   key=lambda g: -sum(len(segs[i][1]) for i in g))
+    return [[segs[i] for i in g] for g in order]
+
+
+# Rejoining components. A street's centerline stops at each side of an
+# intersection, so a road crossing one arrives as two components separated by
+# the width of the cross street -- 7 to 48 m in Livermore. Those must be put
+# back together, or every crossing becomes a page.
+#
+# What must NOT be put back together is a divided road, whose two carriageways
+# are also a dozen metres apart. Distance alone cannot tell them apart, and
+# neither can the terminals: two uniformly separated carriageways have ends
+# about as far apart as the carriageways themselves, so an end-to-end test
+# reads 1.0 for both cases and wrongly merges 20 of Livermore's 24 carriageway
+# pairs, Holmes Street and Valley Avenue among them.
+#
+# What separates them is whether they run ALONGSIDE each other. A carriageway
+# pair overlaps for 50-100% of its length, because that is what a divided road
+# is; two pieces meeting at an intersection overlap for 0%.
+# 50 m, not GAP_BREAK_M's 40: Livermore's intersection gaps run 7 to 49.7 m and
+# the next pair up is 65.9 m, so 50 sits in the empty band between the two
+# populations -- 50 and 55 give identical results. The gap is only a secondary
+# guard anyway; carriageways survive every threshold to 80 m because it is the
+# overlap test, not the distance, that keeps them apart.
+MERGE_GAP_M = 50.0
+MERGE_NEAR_M = 30.0       # counted as "alongside" at this separation
+MERGE_OVERLAP = 0.25      # alongside for more of its length than this: not one road
+
+
+def _samples(cs, cap=400):
+    """Up to `cap` points spanning a component, for the pairwise geometry."""
+    e = np.concatenate([x[1] for x in cs])
+    n = np.concatenate([x[2] for x in cs])
+    step = max(1, len(e) // cap)
+    return np.column_stack([e[::step], n[::step]])
+
+
+def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP):
+    """Put back the components that an intersection split, and only those.
+
+    Two components are one road when they come within `gap` of each other and
+    do not run alongside each other. Returns the same shape as
+    split_components(), largest first.
+    """
+    if len(comps) < 2:
+        return comps
+    pts = [_samples(cs) for cs in comps]
+    parent = list(range(len(comps)))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in range(len(comps)):
+        for j in range(i + 1, len(comps)):
+            d = np.hypot(pts[i][:, 0][:, None] - pts[j][:, 0][None, :],
+                         pts[i][:, 1][:, None] - pts[j][:, 1][None, :])
+            if d.min() > gap:
+                continue
+            alongside = max((d.min(axis=1) < MERGE_NEAR_M).mean(),
+                            (d.min(axis=0) < MERGE_NEAR_M).mean())
+            if alongside >= overlap:
+                continue                      # a carriageway pair, or a loop's arms
+            ra, rb = find(i), find(j)
+            if ra != rb:
+                parent[ra] = rb
+
+    groups = {}
+    for i in range(len(comps)):
+        groups.setdefault(find(i), []).extend(comps[i])
+    return sorted(groups.values(), key=lambda g: -sum(len(x[1]) for x in g))
+
+
+def segs_of(st, key="OBJECTID"):
+    """A street's points, grouped into the per-segment arrays chaining wants."""
+    segs = []
+    for oid, sg in st.groupby(key, sort=True):
+        sg = sg.sort_values("dist_along_m")
+        segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
+                     sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
+    return segs
 
 
 def chain_segments(segs):
@@ -207,18 +336,20 @@ def main():
     ap.add_argument("--street", default=None, help="render a single street name")
     ap.add_argument("--outdir", default=OUTDIR)
     ap.add_argument("--dpi", type=int, default=110)
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help="city slug; reads derived/<city>/")
     ap.add_argument("--smooth", type=float, default=SMOOTH_M,
                     help="rolling-mean window in metres, converted to samples "
                          f"using the corpus spacing (default {SMOOTH_M:g})")
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
-    df = pd.read_parquet(os.path.join(here, POINTS),
-                         columns=["OBJECTID", "FullStreetName", "dist_along_m",
+    df = pd.read_parquet(os.path.join(here, points_path(SPACING, "parquet", args.city)),
+                         columns=["OBJECTID", "display_name", "dist_along_m",
                                   "easting", "northing", "elev_m", "elev_disc_cm"])
     df = df.dropna(subset=["elev_m"])
     if args.street:
-        df = df[df.FullStreetName == args.street]
+        df = df[df.display_name == args.street]
         if df.empty:
             print(f"No points for street {args.street!r}")
             return 1
@@ -229,73 +360,83 @@ def main():
     fig, ax = plt.subplots(figsize=(11, 4.6), dpi=args.dpi)
     used, rows, skipped = {}, [], 0
 
-    for name, grp in df.groupby("FullStreetName", sort=True):
-        segs = []
-        for oid, sg in grp.groupby("OBJECTID", sort=True):
-            sg = sg.sort_values("dist_along_m")
-            segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
-                         sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
-        e, n, z, disc, run, gaps, origin = chain_segments(segs)
-        far = OPPOSITE[origin]
-        d, smooth = build_profile(e, n, z, run, args.smooth)
-        step = sample_step(d, run)
+    # groupby drops a NaN key, which is what should happen: a nameless
+    # segment has no street to be a page of. See plot_street_bokeh.py.
+    for name, grp in df.groupby("display_name", sort=True):
+        comps = merge_components(split_components(segs_of(grp)))
+        for part, segs in enumerate(comps, 1):
+            # A street that splits is drawn once per run, and says so:
+            # "FIRST ST (2 of 4)" is four real pieces of road, not one
+            # street chained through three jumps it cannot make.
+            # "_2_of_4", not "_2": the part count is in the name so a page
+            # cannot silently change meaning. If a refetch splits this street
+            # into three instead of four, the filename changes and a stale link
+            # breaks, rather than resolving to a different road.
+            label = name if len(comps) == 1 else (
+                "%s %d of %d" % (name, part, len(comps)))
+            e, n, z, disc, run, gaps, origin = chain_segments(segs)
+            far = OPPOSITE[origin]
+            d, smooth = build_profile(e, n, z, run, args.smooth)
+            step = sample_step(d, run)
 
-        if d[-1] < args.min_length:
-            skipped += 1
-            continue
+            if d[-1] < args.min_length:
+                skipped += 1
+                continue
 
-        fname = safe_name(name, used) + ".png"
-        # signed end-minus-start: positive means the street climbs going origin -> far
-        change = z[-1] - z[0]
-        grade = change / d[-1] * 100 if d[-1] > 0 else 0.0
+            fname = safe_name(label, used) + ".png"
+            # signed end-minus-start: positive means the street climbs going origin -> far
+            change = z[-1] - z[0]
+            grade = change / d[-1] * 100 if d[-1] > 0 else 0.0
 
-        ax.clear()
-        for r in np.unique(run):
-            m = run == r
-            ax.plot(d[m], z[m], color="#9fb3c8", lw=0.7,
-                    label=f"raw {step:.3g} m" if r == 0 else None)
-            ax.plot(d[m], smooth[m], color="#2e86c1", lw=1.9,
-                    label=f"{args.smooth:g} m rolling mean" if r == 0 else None)
-        ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5,
-                label=f"{origin} start")
-        ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5,
-                label=f"{far} end")
+            ax.clear()
+            for r in np.unique(run):
+                m = run == r
+                ax.plot(d[m], z[m], color="#9fb3c8", lw=0.7,
+                        label=f"raw {step:.3g} m" if r == 0 else None)
+                ax.plot(d[m], smooth[m], color="#2e86c1", lw=1.9,
+                        label=f"{args.smooth:g} m rolling mean" if r == 0 else None)
+            ax.plot(d[0], z[0], "o", color="#1a9850", ms=7, zorder=5,
+                    label=f"{origin} start")
+            ax.plot(d[-1], z[-1], "s", color="#d73027", ms=6, zorder=5,
+                    label=f"{far} end")
 
-        bad = disc > DISC_CM
-        nbad = int(bad.sum())
-        if nbad:
-            ax.plot(d[bad], z[bad], "x", color="#d73027", ms=5, mew=1.2,
-                    ls="none", zorder=6,
-                    label=f"discontinuity ({nbad})")
+            bad = disc > DISC_CM
+            nbad = int(bad.sum())
+            if nbad:
+                ax.plot(d[bad], z[bad], "x", color="#d73027", ms=5, mew=1.2,
+                        ls="none", zorder=6,
+                        label=f"discontinuity ({nbad})")
 
-        ax.set_xlabel(f"distance along street from {origin} end (m)")
-        ax.set_ylabel("elevation (m, NAVD88)")
-        nseg = len(segs)
-        nbreak = int(run.max())
-        bits = [f"{d[-1]:,.0f} m", f"{nseg} segment{'s' if nseg != 1 else ''}"]
-        if nbreak:
-            bits.append(f"{nbreak} gap{'s' if nbreak != 1 else ''}")
-        if nbad:
-            bits.append(f"{nbad} point{'s' if nbad != 1 else ''} flagged")
-        ax.set_title(f"{name}   —   " + " · ".join(bits) + "\n"
-                     f"{origin} end {z[0]:.1f} m → {far} end {z[-1]:.1f} m   "
-                     f"(net {change:+.2f} m, {grade:+.2f}% mean grade)",
-                     fontsize=10)
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=8, loc="best")
-        fig.tight_layout()
-        fig.savefig(os.path.join(outdir, fname))
+            ax.set_xlabel(f"distance along street from {origin} end (m)")
+            ax.set_ylabel("elevation (m, NAVD88)")
+            nseg = len(segs)
+            nbreak = int(run.max())
+            bits = [f"{d[-1]:,.0f} m", f"{nseg} segment{'s' if nseg != 1 else ''}"]
+            if nbreak:
+                bits.append(f"{nbreak} gap{'s' if nbreak != 1 else ''}")
+            if nbad:
+                bits.append(f"{nbad} point{'s' if nbad != 1 else ''} flagged")
+            ax.set_title(f"{label}   —   " + " · ".join(bits) + "\n"
+                         f"{origin} end {z[0]:.1f} m → {far} end {z[-1]:.1f} m   "
+                         f"(net {change:+.2f} m, {grade:+.2f}% mean grade)",
+                         fontsize=10)
+            ax.grid(alpha=0.3)
+            ax.legend(fontsize=8, loc="best")
+            fig.tight_layout()
+            fig.savefig(os.path.join(outdir, fname))
 
-        rows.append({"FullStreetName": name, "file": fname, "n_segments": nseg,
-                     "length_m": round(float(d[-1]), 1), "n_gaps": nbreak,
-                     "origin": origin,
-                     "elev_start_m": round(float(z[0]), 3),
-                     "elev_end_m": round(float(z[-1]), 3),
-                     "elev_min_m": round(float(np.nanmin(z)), 3),
-                     "elev_max_m": round(float(np.nanmax(z)), 3),
-                     "net_change_m": round(float(change), 3),
-                     "mean_grade_pct": round(float(grade), 3),
-                     "pts_flagged_disc": nbad})
+            rows.append({"display_name": name, "part": part,
+                         "n_parts": len(comps), "file": fname,
+                         "n_segments": nseg,
+                         "length_m": round(float(d[-1]), 1), "n_gaps": nbreak,
+                         "origin": origin,
+                         "elev_start_m": round(float(z[0]), 3),
+                         "elev_end_m": round(float(z[-1]), 3),
+                         "elev_min_m": round(float(np.nanmin(z)), 3),
+                         "elev_max_m": round(float(np.nanmax(z)), 3),
+                         "net_change_m": round(float(change), 3),
+                         "mean_grade_pct": round(float(grade), 3),
+                         "pts_flagged_disc": nbad})
 
     plt.close(fig)
     idx = pd.DataFrame(rows).sort_values("length_m", ascending=False)

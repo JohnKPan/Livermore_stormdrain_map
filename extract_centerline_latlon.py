@@ -43,13 +43,37 @@ from fetch_livermore_street_centerlines import DEFAULT_OUT as SRC
 OUTDIR = "derived"
 R = 6371008.8  # mean earth radius, m
 
+# The city is the unit of work. Every derived file lands under derived/<city>/,
+# so one city's run never collides with another's, and "region-wide" is a loop
+# over slugs rather than a second code path. Livermore is the default because
+# it is the city with a published centerline to check the rest against.
+DEFAULT_CITY = "livermore"
+
 # Default resample interval, metres. Matched to the 1 ft OPR DEM -- see the
 # module docstring. Consumers import this so the whole pipeline moves together.
 SPACING = 0.1
 
-ATTRS = ["OBJECTID", "FullStreetName", "StreetName", "StreetType",
-         "PrefixDir", "SuffixDir", "FunctionalClass", "RoadType", "GlobalID"]
-SLIM_ATTRS = ["OBJECTID", "FullStreetName"]
+# One normalised column set, whatever the source. The portal centerline and an
+# Overture city file carry the same facts under different names:
+#
+#     portal            Overture           here
+#     OBJECTID          (none)             OBJECTID
+#     FullStreetName    display_name       display_name
+#     FunctionalClass   class              road_class
+#     RoadType          subclass           subclass
+#
+# `road_class`, not `class`: `class` is a Python keyword, and every consumer
+# reaches for these by attribute (df.road_class), which a keyword forbids.
+#
+# The portal's StreetName/StreetType/PrefixDir/SuffixDir/GlobalID are dropped.
+# They were written to the endpoints and vertices files and read by nothing.
+ATTRS = ["OBJECTID", "display_name", "road_class", "subclass"]
+SLIM_ATTRS = ["OBJECTID", "display_name"]
+
+PORTAL_ATTRS = {"display_name": "FullStreetName",
+                "road_class": "FunctionalClass", "subclass": "RoadType"}
+OVERTURE_ATTRS = {"display_name": "display_name",
+                  "road_class": "class", "subclass": "subclass"}
 
 
 def dist_m(a, b):
@@ -88,23 +112,64 @@ def label(spacing):
     return f"{s}m"
 
 
-def points_path(spacing=SPACING, ext="parquet"):
+def detect_schema(props):
+    """Which publisher wrote this feature, from the names it uses."""
+    if "FullStreetName" in props:
+        return "portal"
+    if "class" in props and ("display_name" in props or "name" in props):
+        return "overture"
+    raise SystemExit(
+        "unrecognised centerline schema: expected the portal's FullStreetName "
+        "or Overture's class/display_name, found " + ", ".join(sorted(props)))
+
+
+def attrs_of(props, schema, seq):
+    """One feature's ATTRS row, normalised.
+
+    Overture has no stable per-segment id -- its `id` is a UUID minted fresh
+    each release -- so OBJECTID is the sequence number of the feature in the
+    file. That is enough: nothing keys a page off it, it only has to separate
+    segments within a street so they can be chained end to end, and every
+    derived file is rebuilt from a single run.
+    """
+    m = PORTAL_ATTRS if schema == "portal" else OVERTURE_ATTRS
+    oid = props.get("OBJECTID") if schema == "portal" else seq
+    return [oid] + [props.get(m[k]) for k in ATTRS[1:]]
+
+
+def city_dir(city=DEFAULT_CITY):
+    """Where one city's derived files live."""
+    return os.path.join(OUTDIR, city)
+
+
+def points_path(spacing=SPACING, ext="parquet", city=DEFAULT_CITY):
     """Where the resampled points for a given spacing live.
 
     One source of truth for the name, imported by add_elevation.py and every
-    plotter, so changing SPACING moves the whole pipeline in step.
+    plotter, so changing SPACING or the city moves the whole pipeline in step.
     """
-    return os.path.join(OUTDIR, f"segments_points_{label(spacing)}.{ext}")
+    return os.path.join(city_dir(city), f"segments_points_{label(spacing)}.{ext}")
+
+
+def endpoints_path(city=DEFAULT_CITY):
+    return os.path.join(city_dir(city), "segments_endpoints.csv")
+
+
+def vertices_path(city=DEFAULT_CITY):
+    return os.path.join(city_dir(city), "segments_vertices.csv")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src", default=SRC,
                     help=f"input centerline GeoJSON (default {SRC})")
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help=f"city slug; outputs land in derived/<city>/ "
+                         f"(default {DEFAULT_CITY})")
     ap.add_argument("--spacing", type=float, default=SPACING,
                     help=f"resample interval in metres (default {SPACING:g})")
     ap.add_argument("--slim", action="store_true",
-                    help="keep only OBJECTID + FullStreetName; join the rest on OBJECTID")
+                    help="keep only OBJECTID + display_name; join the rest on OBJECTID")
     ap.add_argument("--parquet", action="store_true",
                     help="also write the resampled points as .parquet")
     ap.add_argument("--points-only", action="store_true",
@@ -125,12 +190,14 @@ def main():
     with open(src, encoding="utf-8-sig") as fh:
         features = json.load(fh)["features"]
 
-    outdir = os.path.join(here, OUTDIR)
+    schema = detect_schema(features[0]["properties"]) if features else "portal"
+    print(f"{len(features):,} features, {schema} schema -> derived/{args.city}/")
+
+    outdir = os.path.join(here, city_dir(args.city))
     os.makedirs(outdir, exist_ok=True)
 
     attr_cols = SLIM_ATTRS if args.slim else ATTRS
-    suffix = label(args.spacing)
-    pts_path = os.path.join(outdir, f"segments_points_{suffix}.csv")
+    pts_path = os.path.join(here, points_path(args.spacing, "csv", args.city))
 
     f_pts = open(pts_path, "w", newline="", encoding="utf-8")
     w_pts = csv.writer(f_pts)
@@ -138,8 +205,10 @@ def main():
 
     w_end = w_vtx = None
     if not args.points_only:
-        f_end = open(os.path.join(outdir, "segments_endpoints.csv"), "w", newline="", encoding="utf-8")
-        f_vtx = open(os.path.join(outdir, "segments_vertices.csv"), "w", newline="", encoding="utf-8")
+        f_end = open(os.path.join(here, endpoints_path(args.city)), "w",
+                     newline="", encoding="utf-8")
+        f_vtx = open(os.path.join(here, vertices_path(args.city)), "w",
+                     newline="", encoding="utf-8")
         w_end = csv.writer(f_end)
         w_vtx = csv.writer(f_vtx)
         w_end.writerow(ATTRS + ["start_lat", "start_lon", "end_lat", "end_lon",
@@ -147,14 +216,16 @@ def main():
         w_vtx.writerow(ATTRS + ["vertex_index", "lat", "lon", "dist_along_m"])
 
     n_pts = 0
+    seq = 0
     for feat in features:
         geom = feat["geometry"]
         if not geom or geom["type"] != "LineString":
             continue
+        seq += 1
         coords = geom["coordinates"]
         props = feat["properties"]
-        full = [props.get(k) for k in ATTRS]
-        slim = [props.get(k) for k in attr_cols]
+        full = attrs_of(props, schema, seq)
+        slim = full[:len(attr_cols)]
 
         cum = cumulative(coords)
         length = cum[-1]

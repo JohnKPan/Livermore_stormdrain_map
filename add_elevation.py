@@ -22,7 +22,7 @@ Adds, in place, to derived/segments_points_<spacing>.{parquet,csv}:
     elev_disc_cm         |bilinear - cell|; large values flag a discontinuity
                          such as a curb, wall, or bridge edge
     bearing_deg          local heading, for generating curb offsets later
-    FunctionalClass/RoadType  joined from the segment attributes
+    road_class/subclass  joined from the segment attributes
 
 The DEM
 -------
@@ -67,13 +67,15 @@ import rasterio
 from pyproj import Transformer
 from rasterio.windows import Window
 
-from extract_centerline_latlon import SPACING, label, points_path
+from extract_centerline_latlon import (DEFAULT_CITY, SPACING, label,
+                                       points_path)
 
 PROJ_CRS = "EPSG:26910"          # NAD83 / UTM zone 10N -- the project's frame
 DEM_CRS = "EPSG:6420"            # NAD83(2011) / California zone 3 (ftUS) -- the DEM's
 VDATUM = "NAVD88"
 FT_TO_M = 1200.0 / 3937.0        # US survey foot -> metre, exact by definition
-ENDPOINTS = "derived/segments_endpoints.csv"
+# endpoints live beside the points, under derived/<city>/
+from extract_centerline_latlon import endpoints_path
 DEMDIR = "dem_livermore"
 VRT_NAME = "_mosaic.vrt"
 
@@ -88,7 +90,7 @@ HALO = 2
 DERIVED_COLS = ["easting", "northing", "dem_x", "dem_y", "cell_e", "cell_n",
                 "cell_center_dist_m", "same_cell_as_prev", "bearing_deg",
                 "elev_m", "elev_cell_m", "elev_disc_cm", "dem_tile", "dem_res",
-                "FunctionalClass", "RoadType"]
+                "road_class", "subclass"]
 
 
 def local_bearing(oid, e, n):
@@ -471,6 +473,9 @@ def sample_mosaic(vrt_path, x, y):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-csv", action="store_true", help="write parquet only")
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help=f"city slug; reads derived/<city>/ (default {DEFAULT_CITY})")
+
     ap.add_argument("--spacing", type=float, default=SPACING,
                     help=f"which point corpus to enrich (default {SPACING:g} m)")
     ap.add_argument("--vrt-resolution", default="highest",
@@ -492,7 +497,7 @@ def main():
         print(f"No .tif in {args.dem_dir}/ -- run fetch_usgs_lidar.py first")
         return 1
 
-    pq = os.path.join(here, points_path(args.spacing, "parquet"))
+    pq = os.path.join(here, points_path(args.spacing, "parquet", args.city))
     if not os.path.exists(pq):
         print(f"No point corpus at {pq}\n"
               f"run: python extract_centerline_latlon.py --spacing {args.spacing:g} "
@@ -501,7 +506,7 @@ def main():
 
     df = pd.read_parquet(pq)
     # Enriching "in place" has to survive being run twice. Drop anything this
-    # script produces before regenerating it, or the FunctionalClass/RoadType
+    # script produces before regenerating it, or the road_class/subclass
     # merge below collides with the previous run's columns and the reindex at
     # the end raises KeyError.
     df = df.drop(columns=[c for c in DERIVED_COLS if c in df.columns])
@@ -580,8 +585,8 @@ def main():
     print(f"  sampled {len(df) - missing:,} / {len(df):,} points"
           + (f"   ({missing:,} outside the DEM)" if missing else ""))
 
-    attrs = pd.read_csv(os.path.join(here, ENDPOINTS),
-                        usecols=["OBJECTID", "FunctionalClass", "RoadType"])
+    attrs = pd.read_csv(os.path.join(here, endpoints_path(args.city)),
+                        usecols=["OBJECTID", "road_class", "subclass"])
     df = df.merge(attrs, on="OBJECTID", how="left")
 
     df = df[base_cols + DERIVED_COLS]
@@ -589,7 +594,7 @@ def main():
     df.to_parquet(pq, index=False, compression="zstd")
     print(f"\nwrote {pq}  ({os.path.getsize(pq)/1e6:.1f} MB)")
     if not args.no_csv:
-        csv = os.path.join(here, points_path(args.spacing, "csv"))
+        csv = os.path.join(here, points_path(args.spacing, "csv", args.city))
         df.to_csv(csv, index=False)
         print(f"wrote {csv}  ({os.path.getsize(csv)/1e6:.1f} MB)")
 
@@ -652,7 +657,7 @@ def main():
             "bearing_deg": "local heading, degrees from north",
         },
     }
-    mp = os.path.join(here, points_path(args.spacing, "meta.json"))
+    mp = os.path.join(here, points_path(args.spacing, "meta.json", args.city))
     with open(mp, "w", encoding="utf-8") as fh:
         json.dump(meta, fh, indent=2)
     print(f"wrote {mp}")

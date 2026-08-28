@@ -106,6 +106,20 @@ FALLBACK_RELEASE = "2026-08-19.0"
 COLUMNS = ["id", "names", "class", "subtype", "subclass", "road_flags",
            "road_surface", "width_rules", "routes", "geometry", "bbox"]
 
+# The road network this project keeps, for --roads-only. The eight classified
+# classes carry the streets a drainage study is about; `service` is 35% of the
+# corpus at 3% named -- driveways and parking aisles -- and only its alleys are
+# real back-lanes worth having, so it is admitted by subclass alone.
+#
+# `link` is excluded throughout. A link is a ramp, and a ramp is not a street:
+# it has no name (0.3% of motorway links), no route, and no counterpart in the
+# portal centerline beyond a local asset label. Excluding it is also what
+# lifts the classified network from 93% to 97.7-99.9% named, because ramps
+# were the whole of the gap.
+ROAD_CLASSES = ["motorway", "trunk", "primary", "secondary", "tertiary",
+                "residential", "living_street", "unclassified"]
+SERVICE_KEEP = "alley"
+
 # RECOVERED COMMENT: rows per streamed batch. Large enough that the vectorised
 # bbox test pays for itself, small enough that a batch and its geometries fit
 # in memory alongside the next one being read ahead.
@@ -415,7 +429,7 @@ def open_dataset(release):
         raise SystemExit("cannot open %s: %s" % (path, e)) from None
 
 
-def build_filter(bbox, subtypes, classes):
+def build_filter(bbox, subtypes, classes, roads_only=False):
     xmin, ymin, xmax, ymax = bbox
     # RECOVERED COMMENT: bbox overlap, not containment -- a segment crossing
     # into the window counts, and its own bbox is what Overture indexes on.
@@ -423,6 +437,14 @@ def build_filter(bbox, subtypes, classes):
          & (pc.field("bbox", "ymin") < ymax) & (pc.field("bbox", "ymax") > ymin))
     if subtypes:
         f = f & pc.field("subtype").isin(subtypes)
+    if roads_only:
+        # A null subclass is the common case and must survive the != test:
+        # in Arrow, null != "link" is null, which a filter reads as false, so
+        # the whole road network would be dropped without the is_null() arm.
+        sub = pc.field("subclass")
+        not_link = sub.is_null() | (sub != "link")
+        f = f & ((pc.field("class").isin(ROAD_CLASSES) & not_link)
+                 | ((pc.field("class") == "service") & (sub == SERVICE_KEEP)))
     if classes:
         f = f & pc.field("class").isin(classes)
     return f
@@ -540,6 +562,10 @@ def main():
                     help="keep only these road classes, e.g. motorway primary")
     ap.add_argument("--all-subtypes", action="store_true",
                     help="keep rail and water segments too, not just subtype=road")
+    ap.add_argument("--roads-only", action="store_true",
+                    help="keep only the drivable street network: the eight "
+                         "classified classes plus service alleys, ramps "
+                         "(subclass=link) excluded. Cuts the corpus ~64%%")
     ap.add_argument("--clip", action="store_true",
                     help="cut geometry at the city boundary instead of keeping whole segments (mutates geometry; see the docstring)")
     # RECOVERED COMMENT: --batch trades memory against per-batch overhead.
@@ -562,7 +588,7 @@ def main():
     print("release: " + release)
     dataset = open_dataset(release)
     subtypes = None if args.all_subtypes else ["road"]
-    filt = build_filter(bbox, subtypes, args.classes)
+    filt = build_filter(bbox, subtypes, args.classes, args.roads_only)
     print("filter: subtype=%s  class=%s"
           % ("any" if subtypes is None else ",".join(subtypes),
              "any" if not args.classes else ",".join(args.classes)))
@@ -581,6 +607,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = {"release": release, "theme": "transportation", "type": "segment",
             "subtype": subtypes, "classes": args.classes, "clipped": args.clip,
+            "roads_only": args.roads_only,
             "fetched": time.strftime("%Y-%m-%d")}
     for c in cities:
         c.fh = open(out_dir / (c.slug + ".geojson"), "w", encoding="utf-8")

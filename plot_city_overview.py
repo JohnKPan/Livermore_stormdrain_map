@@ -48,14 +48,15 @@ from bokeh.models import (AutocompleteInput, CDSView,
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
+from extract_centerline_latlon import DEFAULT_CITY, vertices_path
 from plot_points_map import CLASS_COLORS, DRAW_ORDER
 
-VERTS = "derived/segments_vertices.csv"
+VERTS = vertices_path()
 PAGES = "Stormdrain_map/streets_25m"
 PAGES_ALT = "Stormdrain_map/streets_10m"
 OUT = "Stormdrain_map/index.html"
 INDEX = "_index.csv"
-UNCLASSIFIED = "(unclassified)"
+UNCLASSIFIED = "(unknown)"
 MAP_W, MAP_H = 1240, 700
 # FRAME_H is the embedded street page's own height, measured: read + pick Divs,
 # then plot_street_bokeh.py's PROF_H and MAP_H panels with their titles and
@@ -120,13 +121,13 @@ def load(here, args, variants):
     loaded street between them, so one that exists in only one set would break
     on the toggle rather than at load.
     """
-    v = pd.read_csv(os.path.join(here, args.verts),
-                    usecols=["OBJECTID", "FullStreetName", "FunctionalClass",
+    v = pd.read_csv(os.path.join(here, args.verts or vertices_path(args.city)),
+                    usecols=["OBJECTID", "display_name", "road_class",
                              "vertex_index", "lat", "lon"])
     # Anything unrecognised joins the unclassified bucket rather than vanishing:
     # only the classes in DRAW_ORDER get drawn.
-    v["FunctionalClass"] = v.FunctionalClass.where(
-        v.FunctionalClass.isin(CLASS_COLORS), UNCLASSIFIED)
+    v["road_class"] = v.road_class.where(
+        v.road_class.isin(CLASS_COLORS), UNCLASSIFIED)
     v = v.sort_values(["OBJECTID", "vertex_index"], kind="stable")
 
     # One transform over the whole file, then slice: per-group transforms would
@@ -134,21 +135,41 @@ def load(here, args, variants):
     to3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
     v["mx"], v["my"] = to3857.transform(v.lon.to_numpy(), v.lat.to_numpy())
 
+    # The page, not the street, is the unit here. A street whose runs are
+    # disconnected gets a page each -- THIRD ST has four, 4.5 km apart -- so a
+    # name no longer identifies a page, and a bbox drawn per name would span
+    # the whole town. Each page declares the OBJECTIDs it covers, so a segment
+    # maps straight to its own page.
     for var in variants:
         idx = pd.read_csv(os.path.join(here, var["pages"], INDEX))
-        var["idx"] = idx.set_index("FullStreetName")
+        if "page" not in idx.columns or "segments" not in idx.columns:
+            raise SystemExit(
+                f"{var['pages']}/{INDEX} predates the per-run pages: rebuild it "
+                "with plot_street_bokeh.py --all")
+        var["idx"] = idx.set_index("page")
+        var["oid2page"] = {int(o): pg
+                           for pg, segs in zip(idx["page"], idx["segments"])
+                           for o in str(segs).split()}
+    v["page"] = v.OBJECTID.map(variants[0]["oid2page"])
     have = set.intersection(*[set(var["idx"].index) for var in variants])
-    missing = sorted(set(v.FullStreetName) - have)
+    orphan = int(v.page.isna().sum())
+    if orphan:
+        print(f"  {orphan:,} vertices belong to no page, dropped")
+        v = v[v.page.notna()]
+    missing = sorted(set(v.page) - have)
     if missing:
-        print(f"  {len(missing)} street(s) have no page, dropped: "
+        print(f"  {len(missing)} page(s) missing from a corpus, dropped: "
               f"{', '.join(missing[:5])}{' ...' if len(missing) > 5 else ''}")
-        v = v[v.FullStreetName.isin(have)]
+        v = v[v.page.isin(have)]
     return v
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--verts", default=VERTS)
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help="city slug; sets the default --verts")
+    ap.add_argument("--verts", default=None,
+                    help=f"vertices CSV (default {VERTS})")
     ap.add_argument("--pages", default=PAGES,
                     help="directory holding the per-street pages and _index.csv")
     ap.add_argument("--pages-alt", action="append", default=None,
@@ -216,7 +237,7 @@ def main():
     rows = {c: dict(xs=[], ys=[], name=[], cls=[]) for c in CLASS_COLORS}
     bbox = {}
     for (oid, nm, cls), g in v.groupby(
-            ["OBJECTID", "FullStreetName", "FunctionalClass"], sort=False):
+            ["OBJECTID", "page", "road_class"], sort=False):
         mx, my = g.mx.to_numpy(), g.my.to_numpy()
         r = rows.setdefault(cls, dict(xs=[], ys=[], name=[], cls=[]))
         r["xs"].append(mx)
@@ -364,7 +385,7 @@ def main():
     names = sorted(bbox)
     search = AutocompleteInput(
         completions=names, search_strategy="includes", case_sensitive=False,
-        min_characters=2, width=380, placeholder=f"search {len(names):,} streets")
+        min_characters=2, width=380, placeholder=f"search {len(names):,} pages")
     colour = RadioButtonGroup(labels=["road class", "sags per street"],
                               active=int(sag_first), width=260)
     # A radio group, not a checkbox: there can be any number of corpora now, and
@@ -550,7 +571,7 @@ def main():
     output_file(out, title="Livermore stormdrain — street index", mode="cdn")
     save(doc)
     n_seg = sum(len(s.data["xs"]) for s in srcs)
-    print(f"{n_seg:,} segments over {len(names):,} streets -> {out}  "
+    print(f"{n_seg:,} segments over {len(names):,} pages -> {out}  "
           f"({os.path.getsize(out)/1e6:.1f} MB)")
     for var in variants:
         sub = var["idx"].reindex(names)
