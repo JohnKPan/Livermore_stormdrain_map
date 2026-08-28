@@ -111,6 +111,17 @@ step() {
 }
 
 if [ "$render_only" -eq 0 ]; then
+    # The AOI everything downstream is cut against: the Overture split, the DEM
+    # bbox, and the clip the plotters apply to the inlet corpus. Buffered two
+    # miles, which is the margin the DEM needs for streets on the city edge and
+    # the reason a neighbouring city's inlets are kept -- they drain into this
+    # one. A buffered polygon is no longer a city limit; see fetch_city_
+    # boundaries.py. One TIGER fetch writes all 101 cities, not just $CITY, so
+    # this runs once and every later --city finds its file already there.
+    if [ ! -f "city_geojson/$CITY.geojson" ]; then
+        step "city boundaries" "${PY[@]}" fetch_city_boundaries.py \
+            --buffer-miles 2
+    fi
     # Overture for every city. Livermore's own portal layer was the baseline the
     # corpus was checked against, not a second supported path.
     step "street centerline" "${PY[@]}" fetch_overture_streets.py \

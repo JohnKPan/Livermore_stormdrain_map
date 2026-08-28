@@ -21,6 +21,7 @@ It picks the venv python if there is one, and falls back to whatever is on PATH.
 
 The steps themselves, should you want to run them by hand:
 
+    .venv/Scripts/python.exe fetch_city_boundaries.py --buffer-miles 2
     .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
     .venv/Scripts/python.exe fetch_inlets.py --all
     .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
