@@ -11,35 +11,61 @@ branch. Everything below is how to rebuild it from scratch.
 
 Everything runs from the project root. One command runs the lot:
 
-    ./run_pipeline.sh                 full rebuild -- fetch, derive, render
-    ./run_pipeline.sh --render-only   skip the fetches, rebuild the deliverable
+    bash run_pipeline.sh --city livermore                 full rebuild
+    bash run_pipeline.sh --city livermore --render-only   rebuild pages only
 
-That script is the list below, in order, with the two page builds run at the
-same time -- they are independent, so the render step takes about 6 minutes
-instead of the ~12 it takes back to back. --no-parallel puts them back to back.
-It picks the venv python if there is one, and falls back to whatever is on PATH.
+It is a bash script, so on Windows run it from Git Bash -- `bash run_pipeline.sh`
+rather than PowerShell or cmd. --city defaults to livermore; it is spelled out
+above because everything derives from it, and getting it wrong silently builds
+the wrong city:
+
+    derived/<city>/   dem_<city>/   Stormdrain_map/<city>/   city_geojson/<city>.geojson
+
+Slugs are lowercase, matching city_geojson/. `--city Pleasanton` fails on the
+AOI lookup; `--city pleasanton` works.
+
+That script is the list below, in order, with the three page builds run at the
+same time -- they are independent, so the render step costs one build instead of
+three. --no-parallel puts them back to back. It picks the conda env if .conda/
+exists, then the venv, then whatever is on PATH.
+
+Measured on Pleasanton (2,995 streets, 8,526 segments), full rebuild 51m 45s:
+boundaries and centerline under a minute, inlets 17s, DEM tiles 11m, resampling
+1m, elevation join 1m 36s, three page corpora together 37m, overview 5s. The DEM
+download and the page builds are the whole cost; everything else is noise.
 
 The steps themselves, should you want to run them by hand:
 
     .venv/Scripts/python.exe fetch_city_boundaries.py --buffer-miles 2
     .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
     .venv/Scripts/python.exe fetch_inlets.py --all
-    .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
+    .venv/Scripts/python.exe fetch_usgs_lidar.py \
+        --aoi-file city_geojson/livermore.geojson \
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv
-    .venv/Scripts/python.exe add_elevation.py --no-csv
-    .venv/Scripts/python.exe plot_street_bokeh.py --all
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
-    .venv/Scripts/python.exe plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
+    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv \
+        --city livermore --src streets/overture/livermore.geojson
+    .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
+        --dem-dir dem_livermore
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
+        --smooth 25 --outdir Stormdrain_map/livermore/streets_25m
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
+        --smooth 10 --outdir Stormdrain_map/livermore/streets_10m
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
+        --smooth 5  --outdir Stormdrain_map/livermore/streets_5m
+    .venv/Scripts/python.exe plot_city_overview.py --city livermore \
+        --pages Stormdrain_map/livermore/streets_25m --label "25 m" \
+        --pages-alt Stormdrain_map/livermore/streets_10m --alt-label "10 m" \
+        --pages-alt Stormdrain_map/livermore/streets_5m --alt-label "5 m" \
+        --opens-at "10 m" --out Stormdrain_map/livermore/index.html
 
-The first three pull every external input; the rest derive everything else from
+The first four pull every external input; the rest derive everything else from
 them. Nothing has to be downloaded by hand. Sections below document each step,
 then the optional static renders.
 
-The two plot_street_bokeh.py runs differ only in the elevation smoothing window
-and where they write. Both corpora are kept, and the overview's checkbox
-switches between them -- see section 5.
+The three plot_street_bokeh.py runs differ only in the elevation smoothing
+window and where they write. All three corpora are kept, and the overview's
+selector switches between them, opening at 10 m -- see section 5.
 
 (Plain `python fetch_inlets.py --all` works too if the venv is activated -- the
 explicit interpreter path just avoids depending on that.)
@@ -47,11 +73,13 @@ explicit interpreter path just avoids depending on that.)
 Order matters in exactly two places: add_elevation.py needs the parquet that
 extract_centerline_latlon.py writes, and plot_city_overview.py needs the
 _index.csv that EACH plot_street_bokeh.py --all run writes -- one per smoothing
-window, both before the overview.
+window, all three before the overview.
 
-All three fetches are safe to re-run. The centerline and inlet fetches
-overwrite their outputs; fetch_usgs_lidar.py skips tiles already fully
-downloaded, resumes partial ones, and re-merges only what changed.
+All four fetches are safe to re-run. Boundaries, centerline and inlets overwrite
+their outputs; fetch_usgs_lidar.py skips tiles already fully downloaded, resumes
+partial ones, and re-merges only what changed. run_pipeline.sh runs the boundary
+fetch only when city_geojson/<city>.geojson is missing, since one TIGER fetch
+writes all 101 cities at once.
 
 
 0. Street centerline
@@ -111,7 +139,8 @@ sources sit on one datum. Pass --no-datum-shift to see raw values.
 2. Lidar DEM tiles
 ------------------
 
-    .venv/Scripts/python.exe fetch_usgs_lidar.py --aoi livermore \
+    .venv/Scripts/python.exe fetch_usgs_lidar.py \
+        --aoi-file city_geojson/livermore.geojson \
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
 
@@ -134,10 +163,15 @@ in the pipeline. The two agree closely: sampled at 59,472 points, the 1 ft
 product sits 0.19 cm above the 1 m one with 1.05 cm RMS, which is what you would
 expect of two derivatives of the same collect.
 
---aoi livermore is a named preset. It was widened on 2026-08-25 from
-(-121.82, 37.63, -121.68, 37.73) to (-121.86, 37.62, -121.68, 37.74): the first
-box stopped short of the western end of the street network and left 4,352
-centerline points with no elevation.
+--aoi-file takes the bbox from the buffered city polygon, which is the same AOI
+the plotters clip inlets to, so the DEM cannot end up narrower than the streets
+it has to cover. Reading it needs geopandas -- see requirements.txt.
+
+There is also a named --aoi livermore preset, no longer used by the pipeline. It
+was widened on 2026-08-25 from (-121.82, 37.63, -121.68, 37.73) to
+(-121.86, 37.62, -121.68, 37.74): the first box stopped short of the western end
+of the street network and left 4,352 centerline points with no elevation. That
+class of mistake is what --aoi-file removes.
 
 MULTI-BLOCK TILES. This collect ships in two delivery blocks, CA_AlamedaCo_1_2021
 and CA_AlamedaCo_3_2021. Where a block boundary crosses a tile, USGS publishes
@@ -199,7 +233,7 @@ reproject and neither can gdalbuildvrt, so that path uses gdal.Warp, and GDAL
 has no Windows wheel on PyPI at any version. See environment.yml:
 
     .conda/micromamba.exe create -y -p .conda/env -f environment.yml
-    ./run_pipeline.sh          # picks the env up automatically
+    bash run_pipeline.sh --city livermore    # picks the env up automatically
 
 Everything else still runs in the uv venv exactly as before -- the same-CRS VRT
 is written by rasterio alone and is byte-for-byte what it always was. Only a
@@ -241,14 +275,17 @@ back to 100% valid.
 3. Centerline resampling
 ------------------------
 
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv
+    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet \
+        --no-csv --city livermore --src streets/overture/livermore.geojson
 
-Source: streets/Street_Centerline_-_Public.geojson (step 0; --src overrides)
+Source: streets/overture/<city>.geojson (step 0; --src overrides)
 
-Writes: derived/segments_endpoints.csv       one row per centerline feature
-        derived/segments_vertices.csv        one row per native shape vertex
-        derived/segments_points_0p1m.csv     resampled points (--no-csv removes)
-        derived/segments_points_0p1m.parquet same, ~4x smaller
+Writes, all under derived/<city>/:
+
+        segments_endpoints.csv       one row per centerline feature
+        segments_vertices.csv        one row per native shape vertex
+        segments_points_0p1m.csv     resampled points (--no-csv removes)
+        segments_points_0p1m.parquet same, ~4x smaller
 
 --spacing defaults to 0.1 metre (SPACING in that module), which is what the rest
 of the pipeline expects. The interval is in the filename, so corpora at
@@ -284,13 +321,14 @@ once add_elevation.py adds its columns.
 4. Elevation join
 -----------------
 
-    .venv/Scripts/python.exe add_elevation.py --no-csv
+    .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
+        --dem-dir dem_livermore
 
-Reads : derived/segments_points_0p1m.parquet, dem_livermore/*.tif,
-        derived/segments_endpoints.csv
-Writes: derived/segments_points_0p1m.parquet   (in place, 6 columns -> 21)
-        derived/segments_points_0p1m.meta.json
-        dem_livermore/_mosaic.vrt              rebuilt every run
+Reads : derived/<city>/segments_points_0p1m.parquet, dem_<city>/*.tif,
+        derived/<city>/segments_endpoints.csv
+Writes: derived/<city>/segments_points_0p1m.parquet  (in place, 6 cols -> 21)
+        derived/<city>/segments_points_0p1m.meta.json
+        dem_<city>/_mosaic.vrt                       rebuilt every run
 
 Adds easting/northing (UTM 10N metres -- the frame every plot works in),
 dem_x/dem_y (the same point in the DEM's EPSG:6420 ftUS), the containing 1 ftUS
@@ -341,15 +379,24 @@ than the grid's own noise floor. So the threshold did not need rescaling.
 
 The deliverable -- interactive, one page per street plus a city-wide picker:
 
-    .venv/Scripts/python.exe plot_street_bokeh.py --all
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --smooth 10 --outdir Stormdrain_map/streets_10m
-    .venv/Scripts/python.exe plot_city_overview.py --pages-alt Stormdrain_map/streets_10m
+    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
+        --smooth 25 --outdir Stormdrain_map/livermore/streets_25m
 
-Writes: Stormdrain_map/index.html            city-wide picker -- OPEN THIS ONE
-        Stormdrain_map/streets/<STREET>.html linked profile + plan view, one
-                                             per street, 25 m smoothing
-        Stormdrain_map/streets/_index.csv    per-street inlet and sag counts
-        Stormdrain_map/streets_10m/...       the same, at 10 m smoothing
+    (and again at --smooth 10 and --smooth 5, then plot_city_overview.py --city
+     livermore over all three -- the full commands are in the list at the top)
+
+Writes, all under Stormdrain_map/<city>/:
+
+        index.html                     city-wide picker -- OPEN THIS ONE
+        streets_25m/<STREET>.html      linked profile + plan view, one per
+                                       street, at 25 m smoothing
+        streets_25m/_index.csv         per-street inlet and sag counts
+        streets_10m/...  streets_5m/   the same, at 10 m and 5 m
+
+Run of 2026-08-28 for Pleasanton: 2,995 pages per corpus, 609 MB at 5 m, and a
+7.4 MB overview over 8,526 segments. 1,693 pages carry inlets; the rest are
+profile-only, which the buffered AOI makes expected -- it reaches past the city
+limit and picks up streets the inlet layer does not cover.
 
 Stormdrain_map/ is the whole deliverable: self-contained, and the only thing
 outside derived/. Zip that one folder to hand the study to someone.
@@ -384,7 +431,7 @@ Legend entries hide their streets in either colouring -- hiding "no sag" leaves
 just the streets that have one (356 at 25 m, 464 at 10 m), which is the view
 worth bookmarking. The switch resets whatever the other legend had hidden, since
 the legends filter on different keys and cannot be kept in step; so does the
-smoothing checkbox, for the same reason. Tap, hover, search and the #street
+smoothing selector, for the same reason. Tap, hover, search and the #street
 bookmark work the same in both, and so does the tapped-street highlight: one
 blue line in either colouring. Blue rather than the obvious red because red
 vanishes into the top of the sag ramp, which is itself red. It does sit near
@@ -392,7 +439,8 @@ Major Collector's blue under the road-class colouring, but at 5 px against 2 it
 is the widest and brightest line on the map.
 
 The #street bookmark holds the street name only, not the smoothing -- a
-bookmarked link reopens at 25 m whichever box was ticked when it was made.
+bookmarked link reopens at whatever --opens-at the overview was built with
+(10 m from run_pipeline.sh), whichever window was selected when it was made.
 
 Note what the sag colouring is and is not: it is a count per street, painted
 along the whole street, so ISABEL AV reads dark red over all 15 km for 11 sags
@@ -400,8 +448,8 @@ that sit at 11 points. Long streets collect more sags -- take the colour as
 "how much of this street's drainage is worth reading", not as a density. The
 legend counts streets; the road-class legend counts centerline segments.
 
-Smoothing -- 25 m or 10 m, and the checkbox between them
---------------------------------------------------------
+Smoothing -- 25 m, 10 m or 5 m, and the selector between them
+-------------------------------------------------------------
 
 --smooth is the rolling-mean window over the elevation samples, in METRES.
 It lives in plot_street_profiles.py (SMOOTH_M = 25.0, the default) and
@@ -424,7 +472,7 @@ shallow a dip still counts, and the two builds genuinely disagree:
     streets with a sag   356           464
 
 Re-measured on 2026-08-26 against the 1 ft DEM at 0.1 m spacing, 25 m window
-(Stormdrain_map/streets_0.1m):
+(the 25 m corpus at 0.1 m spacing):
 
                     1 m DEM / 1 m    1 ft DEM / 0.1 m
     sags                 597               599
@@ -442,21 +490,28 @@ different sags.
 176 streets differ, and never in the other direction: a shorter window only ever
 keeps more dips, because a longer one averages them away. Neither is the right
 answer. 25 m is the baseline the DEM's own accuracy note argues for (see
-derived/segments_points_0p1m.meta.json -- adjacent deltas are noise); 10 m
+derived/<city>/segments_points_0p1m.meta.json -- adjacent deltas are noise); 10 m
 catches real but shallow ponding that 25 m flattens, at the cost of promoting
-some noise. The checkbox exists so the two can be read against each other rather
-than one being picked blind.
+some noise; 5 m keeps more of both again. The selector exists so they can be
+read against each other rather than one being picked blind. The pipeline builds
+all three and opens at 10 m.
 
-Ticking "10 m smoothing", between the map and the iframe, switches at once: the
-page in the iframe, the sag counts in the hover tooltips and the picked-street
-line, and the sag colouring with its own legend. The road-class colouring does
-not move -- it has nothing to do with elevation. The view does not re-zoom, so a
-street stays where it is while the smoothing changes underneath it.
+Pleasanton, 2026-08-28, shows the same monotone shape at city scale:
 
-The checkbox appears only when --pages-alt is given; without it the overview
-behaves exactly as before, over one corpus. Both corpora must cover the same
-streets -- a street missing from either is dropped, with a warning, since the
-toggle would otherwise break on a street that exists in only one of them.
+                    25 m     10 m      5 m
+    sags           1,606    1,996    2,195
+    unserved sags    801      989    1,099
+
+Choosing a window, between the map and the iframe, switches at once: the page in
+the iframe, the sag counts in the hover tooltips and the picked-street line, and
+the sag colouring with its own legend. The road-class colouring does not move --
+it has nothing to do with elevation. The view does not re-zoom, so a street
+stays where it is while the smoothing changes underneath it.
+
+The selector appears only when --pages-alt is given; with none the overview
+behaves as it always did, over one corpus. Every corpus must cover the same
+streets -- a street missing from any of them is dropped, with a warning, since
+switching would otherwise break on a street that exists in only some.
 
 Pages load BokehJS from a CDN, so viewing needs a network connection, but they
 work opened straight from disk -- no local server needed.
