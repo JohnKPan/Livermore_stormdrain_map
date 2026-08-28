@@ -44,6 +44,20 @@ mutates geometry and breaks the one-to-one tie back to an Overture segment id,
 which is usually the more valuable property. Segments wholly inside a city are
 never touched by --clip either way.
 
+Naming a freeway. `name` is not where a motorway's identity lives, so the
+`route` property carries its designation -- "I 580" -- from the routes
+column. Read names alone and 18% of mainline motorway looks anonymous, I-680
+included; read routes too and every mainline segment in the Livermore window
+is identifiable. Ramps stay anonymous either way, which is correct: a ramp is
+not a route. See flatten_routes().
+
+`display_name` is the one to read: names.primary where there is one, the route
+designation where there is not. `name` and `route` are both kept beside it
+rather than being collapsed into it, because the difference matters -- a
+consumer grouping streets into pages wants to know whether it is holding a
+street name or a route number. _index.csv counts all three: `named`, `routed`
+and `display_named`.
+
 Usage:
     python fetch_overture_streets.py
     python fetch_overture_streets.py --dry-run
@@ -83,8 +97,14 @@ FALLBACK_RELEASE = "2026-08-19.0"
 
 # RECOVERED COMMENT: only these columns are read. `bbox` is what makes the
 # predicate pushdown work, and it is cheap next to `geometry`.
+#
+# `routes` is here because a freeway's identity is not in `names` -- see
+# flatten_routes(). It is the only one of the schema's 21 columns added since
+# the recovery; the other ten omissions (connectors, speed_limits,
+# access_restrictions, destinations, level_rules, prohibited_transitions,
+# rail_flags, subclass_rules, sources, version) stay omitted.
 COLUMNS = ["id", "names", "class", "subtype", "subclass", "road_flags",
-           "road_surface", "width_rules", "geometry", "bbox"]
+           "road_surface", "width_rules", "routes", "geometry", "bbox"]
 
 # RECOVERED COMMENT: rows per streamed batch. Large enough that the vectorised
 # bbox test pays for itself, small enough that a batch and its geometries fit
@@ -360,6 +380,8 @@ class City:
         self.n = 0
         self.length = 0.0
         self.named = 0
+        self.routed = 0
+        self.display_named = 0
         self.classes = Counter()
         self.class_len = defaultdict(float)
 
@@ -406,14 +428,16 @@ def build_filter(bbox, subtypes, classes):
     return f
 
 
-def feature(seg_id, name, cls, subtype, subclass, flags, surface, width,
+def feature(seg_id, name, route, cls, subtype, subclass, flags, surface, width,
             city, release, coords, glength):
     geom = ({"type": "LineString", "coordinates": coords[0]} if len(coords) == 1
             else {"type": "MultiLineString", "coordinates": coords})
     return {
         "type": "Feature",
         "properties": {
-            "id": seg_id, "name": name, "class": cls, "subtype": subtype,
+            "id": seg_id, "name": name, "route": route,
+            "display_name": name or route, "class": cls,
+            "subtype": subtype,
             "subclass": subclass, "flags": flags, "surface": surface,
             "width_m": width,
             "city": city.slug, "city_geoid": city.geoid, "county": city.county,
@@ -461,6 +485,45 @@ def first_width(wr):
         if v is not None:
             return v
     return None
+
+
+def flatten_routes(rt):
+    """The route designations a segment carries -- "I 580" -- or None.
+
+    A freeway's identity is not in `names`. OSM keeps the route number in `ref`
+    and the proper name in `name`, and Overture follows it: I-680 through
+    Livermore carries no name at all, only routes=[{network: US:I, ref: 680}],
+    while I-580 carries both "Arthur H. Breed Junior Freeway" and ref 580.
+    Reading names alone leaves 18% of mainline motorway looking anonymous, and
+    the portal centerline this project compares against calls the same road
+    I580 EB -- a ref, not a name.
+
+    Entries with no `ref` are dropped: those are the scenic-byway and
+    historic-trail overlays (US:CA:Scenic, US:NHT) that decorate a road rather
+    than identify it. Entries carrying `between` are dropped for the reason
+    first_width() drops them -- they describe one stretch of the segment, and
+    this value is read as applying to the whole of it.
+
+    Ramps are not rescued by this. A link has neither name nor ref (5% of
+    motorway links carry either), because a ramp is not a route; the portal's
+    AIRWAY OFF I580 EB is a local asset label with no global counterpart.
+    """
+    if not rt:
+        return None
+    out = []
+    for e in rt:
+        if not e or e.get("between") is not None:
+            continue
+        ref = e.get("ref")
+        if not ref:
+            continue
+        # US:I -> I, US:CA -> CA, US:CA:CR -> CR. The leading namespace is
+        # Overture's way of scoping the network to a country and state; what
+        # goes on a sign, and what the portal centerline calls the same road,
+        # is the last component alone.
+        net = (e.get("network") or "").rsplit(":", 1)[-1]
+        out.append("%s %s" % (net, ref) if net else ref)
+    return ",".join(dict.fromkeys(out)) or None
 
 
 def main():
@@ -552,6 +615,7 @@ def main():
             rflags = batch.column("road_flags").to_pylist()
             rsurf = batch.column("road_surface").to_pylist()
             rwidth = batch.column("width_rules").to_pylist()
+            rroutes = batch.column("routes").to_pylist()
             wkbs = batch.column("geometry").to_pylist()
             # RECOVERED COMMENT: geometry is parsed lazily and cached per row,
             # because most rows in a batch are candidates for no city at all
@@ -600,7 +664,8 @@ def main():
                     glen = sum(length_m(p) for p in parts_out)
                     coords = [[[round(x, 7), round(y, 7)] for x, y in p]
                               for p in parts_out]
-                    ft = feature(ids[k], names[k], classes[k], subtys[k],
+                    route = flatten_routes(rroutes[k])
+                    ft = feature(ids[k], names[k], route, classes[k], subtys[k],
                                  subcls[k], flatten_flags(rflags[k]),
                                  first_surface(rsurf[k]), first_width(rwidth[k]),
                                  c, release, coords, glen)
@@ -608,6 +673,8 @@ def main():
                     c.n += 1
                     c.length += glen
                     c.named += 1 if names[k] else 0
+                    c.routed += 1 if route else 0
+                    c.display_named += 1 if (names[k] or route) else 0
                     c.classes[classes[k]] += 1
                     c.class_len[classes[k]] += glen
                     hit_any[k] = True
@@ -631,7 +698,8 @@ def main():
         rows.append({
             "slug": c.slug, "geoid": c.geoid, "name": c.name, "county": c.county,
             "segments": c.n, "length_km": round(c.length / 1000.0, 2),
-            "named": c.named, "unnamed": c.n - c.named,
+            "named": c.named, "unnamed": c.n - c.named, "routed": c.routed,
+            "display_named": c.display_named,
             "classes": len(c.classes),
             "top_class": c.classes.most_common(1)[0][0] if c.classes else "",
             "bytes": path.stat().st_size, "file": path.name,
