@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures as cf
 import os
 import re
 
@@ -41,6 +42,7 @@ from pyproj import Transformer
 from plot_street_drains import (AOI_DIR, DATUM_SHIFT_M, DEFAULT_STYLE,
                                 INLETS as INLETS_ALL, INLETS_LEGACY, STYLE,
                                 street_parts, load_aoi, load_inlets, prepare,
+                                prepare_geom, prepare_smooth,
                                 resolve_aoi, resolve_inlets)
 from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import SMOOTH_M, safe_name, sample_step
@@ -85,12 +87,104 @@ def draw_stride(d, run, draw_spacing):
     return keep
 
 
-def build(street, st, inlets, args, outdir, used, segs=None, p=None):
+# --- parallel rendering -------------------------------------------------------
+# One street is independent of every other, so the loop is embarrassingly
+# parallel -- except for two things, which is why this is not just a Pool.map.
+#
+#   1. safe_name() carries a collision counter, and plot_city_overview.py maps a
+#      tapped segment to a page BY FILENAME. Two processes racing that counter
+#      would give the same street a different name on every run. So names are
+#      assigned serially up front and handed to the worker.
+#   2. Windows spawns rather than forks, so the inlet corpus would be pickled
+#      once per task. _WORKER holds it per process instead, set by the
+#      initialiser.
+_WORKER = {}
+
+
+def _worker_init(inlets, args, by_name):
+    # Module level, not a closure: Windows spawns workers, and a nested
+    # function cannot be pickled to one.
+    _WORKER["inlets"] = inlets
+    _WORKER["args"] = args
+    _WORKER["by_name"] = by_name
+
+
+def _render_street(job):
+    """Every window for one street, from ONE pass over its geometry.
+
+    The three corpora differ only in the rolling mean: chaining, the chainage
+    axis and the inlet snap are identical across them (see prepare_geom). Doing
+    them once here is the difference between three processes each paying for
+    them and one process paying once.
+    """
+    nm, plan = job
+    inlets, args = _WORKER["inlets"], _WORKER["args"]
+    st = _WORKER["by_name"][nm]
+    out_rows, skipped, failed, msgs = [], 0, 0, []
+    parts = street_parts(st)
+    for pi, segs in enumerate(parts, 1):
+        entry = plan.get(pi)
+        if entry is None:               # part count changed under us: skip
+            continue
+        label, fname = entry
+        try:
+            geom = prepare_geom(st, inlets, args, segs=segs)
+            if len(geom["near"]) < args.min_drains:
+                skipped += len(args.smooth)
+                continue
+            for smooth_m, outdir in zip(args.smooth, args.outdir):
+                p = prepare_smooth(geom, args, smooth_m)
+                out, p = build(label, st, inlets, args, outdir, None,
+                               segs=segs, p=p, smooth_m=smooth_m, fname=fname)
+                out_rows.append((smooth_m, dict(
+                    display_name=nm, part=pi, n_parts=len(parts), page=label,
+                    segments=" ".join(str(x[0]) for x in segs),
+                    file=os.path.basename(out),
+                    n_points=sum(len(x[1]) for x in segs),
+                    n_drawn=len(p["drawn"]),
+                    n_inlets=len(p["near"]), n_sags=len(p["sags"]),
+                    n_served=len(p["marked"]), n_unserved=len(p["unserved"]),
+                    length_m=round(float(p["d"][-1]), 1),
+                    kb=round(os.path.getsize(out)/1e3, 1))))
+        except Exception as exc:                                # noqa: BLE001
+            failed += 1
+            msgs.append(f"  FAILED {label!r}: {type(exc).__name__}: {exc}")
+    return out_rows, skipped, failed, msgs
+
+
+def plan_names(by_name, names):
+    """label and filename for every (street, part), assigned in one serial pass.
+
+    This is the shared state a parallel render cannot have. It costs one
+    street_parts() per street, which the worker then repeats -- measured at 1.7%
+    of the build, against rendering which is the rest.
+    """
+    used, plan = {}, {}
+    for nm in names:
+        st = by_name.get(nm)
+        if st is None or st.empty:
+            continue
+        n = len(street_parts(st))
+        per = {}
+        for pi in range(1, n + 1):
+            label = nm if n == 1 else ("%s %d of %d" % (nm, pi, n))
+            per[pi] = (label, safe_name(label, used))
+        plan[nm] = per
+    return plan
+
+
+def build(street, st, inlets, args, outdir, used, segs=None, p=None,
+          smooth_m=None, fname=None):
     # `p` lets the caller reuse a prepare() it already paid for -- see
     # --min-drains, which has to know the inlet count to decide whether this
     # page is worth building at all.
     if p is None:
         p = prepare(st, inlets, args, segs=segs)
+    if smooth_m is None:
+        # args.smooth is a list here (one window per corpus); a lone caller
+        # means the first of them.
+        smooth_m = (args.smooth[0] if isinstance(args.smooth, (list, tuple))
+                    else args.smooth)
     d, z, sm = p["d"], p["z"], p["smooth"]
     e, n, near = p["e"], p["n"], p["near"]
 
@@ -135,7 +229,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None):
                   # below differ between them -- see prepare().
                   title=f"{street} — elevation profile "
                         f"({len(near)} inlets within {args.max_offset:g} m, "
-                        f"{args.smooth:g} m smoothing)")
+                        f"{smooth_m:g} m smoothing)")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     line_sm = prof.line("d", "sm", source=src, line_color="#33475b",
                         line_width=2)
@@ -329,7 +423,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None):
     cb_map = CustomJS(args=dict(SRC=src, cur=cur, vline=vline, read=read),
                       code=LINK_JS)
     path_tips = [("chainage", "@d{0.0} m"), ("elev", "@z{0.00} m"),
-                 (f"smoothed ({args.smooth:g} m)", "@sm{0.00} m"),
+                 (f"smoothed ({smooth_m:g} m)", "@sm{0.00} m"),
                  ("lat, lon", "@lat{0.000000}, @lon{0.000000}")]
     # vline mode on a scatter returns every point under the cursor, which
     # stacks five near-identical rows once zoomed in. Hovering the line with
@@ -420,7 +514,10 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None):
             # slot stays null and clicks never reach the tool. Bind it.
             f.toolbar.active_tap = tt
 
-    out = os.path.join(outdir, safe_name(street, used) + ".html")
+    # fname is pre-assigned when workers render in parallel: safe_name()
+    # carries a collision counter, and two processes would break it.
+    out = os.path.join(outdir,
+                       (fname or safe_name(street, used)) + ".html")
     output_file(out, title=f"{street} — profile + map", mode="cdn")
     plan = row(mp, sv) if sv is not None else mp
     save(column(*([read, pick] if inlet_srcs else [read]), prof, plan))
@@ -434,7 +531,13 @@ def main():
                     help="every street in the network")
     ap.add_argument("--random", type=int, default=0)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--outdir", default=OUTDIR)
+    ap.add_argument("--outdir", nargs="+", default=[OUTDIR], metavar="DIR",
+                    help="output directory. Give one per --smooth value to "
+                         "build several corpora in one pass.")
+    ap.add_argument("--jobs", "-j", type=int, default=1, metavar="N",
+                    help="render N streets at a time (default 1). Filenames "
+                         "are assigned serially first, so a parallel run "
+                         "produces the same names as a serial one.")
     ap.add_argument("--max-offset", type=float, default=30.0)
     # Moves both the drawn profile and the sags, so a second window means a
     # second output directory rather than an overwrite of the first.
@@ -467,8 +570,13 @@ def main():
                          f"(default {AOI_DIR}/<city>.geojson)")
     ap.add_argument("--no-aoi", dest="aoi_filter", action="store_false",
                     help="skip the AOI clip and use every inlet in the file")
-    ap.add_argument("--smooth", type=float, default=SMOOTH_M,
-                    help=f"rolling-mean window (m) (default {SMOOTH_M:g})")
+    ap.add_argument("--smooth", type=float, nargs="+", default=[SMOOTH_M],
+                    metavar="M",
+                    help=f"rolling-mean window(s) in metres (default "
+                         f"{SMOOTH_M:g}). Several windows share one pass over "
+                         f"each street: chaining, the chainage axis and the "
+                         f"inlet snap do not depend on the window, so only the "
+                         f"mean and the sags are recomputed per corpus.")
     ap.add_argument("--sag-prom", type=float, default=0.20)
     ap.add_argument("--sag-sep", type=float, default=10.0)
     ap.add_argument("--sag-window", type=float, default=60.0)
@@ -488,8 +596,15 @@ def main():
     args = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
-    outdir = os.path.join(here, args.outdir)
-    os.makedirs(outdir, exist_ok=True)
+    if len(args.outdir) == 1 and len(args.smooth) > 1:
+        raise SystemExit("--smooth takes several windows, so --outdir needs one "
+                         "directory per window")
+    if len(args.outdir) != len(args.smooth):
+        raise SystemExit(f"--smooth has {len(args.smooth)} value(s) but "
+                         f"--outdir has {len(args.outdir)}; they pair up")
+    args.outdir = [os.path.join(here, d) for d in args.outdir]
+    for d in args.outdir:
+        os.makedirs(d, exist_ok=True)
 
     aoi_path = resolve_aoi(here, args.city, args.aoi, not args.aoi_filter)
     inlets = load_inlets(resolve_inlets(here, args.inlets),
@@ -530,71 +645,64 @@ def main():
     else:
         names = [args.street]
 
-    used, rows, failed, skipped = {}, [], 0, 0
-    for i, nm in enumerate(names, 1):
-        st = by_name.get(nm)
-        if st is None or st.empty:
-            print(f"  no points for {nm!r}")
-            continue
-        parts = street_parts(st)
-        for pi, segs in enumerate(parts, 1):
-            label = nm if len(parts) == 1 else (
-                "%s %d of %d" % (nm, pi, len(parts)))
-            try:
-                # prepare() is the cheap half -- chaining and the inlet snap --
-                # and build() is the expensive half: the figures, the tiles and
-                # a megabyte of embedded JSON. So the drain filter is applied
-                # between them, and 0 keeps every page, as before.
-                p = prepare(st, inlets, args, segs=segs)
-                if len(p["near"]) < args.min_drains:
-                    skipped += 1
-                    continue
-                out, p = build(label, st, inlets, args, outdir, used,
-                               segs=segs, p=p)
-            except Exception as exc:                            # noqa: BLE001
-                failed += 1
-                print(f"  FAILED {label!r}: {type(exc).__name__}: {exc}", flush=True)
-                continue
-            # `page` is the unique key for this file and `segments` lists the
-            # OBJECTIDs it covers, so plot_city_overview.py can map a tapped
-            # segment straight to its page. Keying the overview on the street
-            # name cannot work once a name has several pages -- and its
-            # per-name bbox would span the whole town for a street like
-            # THIRD ST, whose runs are 4.5 km apart.
-            rows.append(dict(display_name=nm, part=pi, n_parts=len(parts),
-                             page=label,
-                             segments=" ".join(str(x[0]) for x in segs),
-                             file=os.path.basename(out),
-                             n_points=sum(len(x[1]) for x in segs),
-                             n_inlets=len(p["near"]),
-                             n_sags=len(p["sags"]), n_served=len(p["marked"]),
-                             n_unserved=len(p["unserved"]),
-                             length_m=round(float(p["d"][-1]), 1),
-                             kb=round(os.path.getsize(out)/1e3, 1)))
-        if args.all:
-            if i % 100 == 0:
-                print(f"  {i}/{len(names)} processed", flush=True)
-        else:
-            print(f"wrote {os.path.basename(out):<28} "
-                  f"{len(st):>7,}->{len(p['drawn']):>6,} pts  "
-                  f"{len(p['near']):>3} inlets  "
-                  f"{len(p['marked'])} sag  {len(p['unserved'])} unserved  "
-                  f"{os.path.getsize(out)/1e3:>6.0f} KB")
+    # Names first, serially: the filename counter cannot be shared across
+    # processes. Then render, one street per task, every window from one pass.
+    plan = plan_names(by_name, names)
+    jobs = [(nm, plan[nm]) for nm in names if nm in plan]
+    rows_by_smooth = {sm: [] for sm in args.smooth}
+    failed = skipped = 0
+
+    def collect(res):
+        nonlocal failed, skipped
+        out_rows, sk, fl, msgs = res
+        skipped += sk
+        failed += fl
+        for m in msgs:
+            print(m, flush=True)
+        for sm, row in out_rows:
+            rows_by_smooth[sm].append(row)
+        if not args.all:
+            for sm, row in out_rows:
+                print(f"wrote {row['file']:<28} "
+                      f"{row['n_points']:>7,}->{row['n_drawn']:>6,} pts  "
+                      f"{row['n_inlets']:>3} inlets  "
+                      f"{row['n_sags']} sag  {row['n_unserved']} unserved  "
+                      f"{row['kb']:>6.0f} KB")
+
+    if args.jobs == 1:
+        _worker_init(inlets, args, by_name)
+        for i, job in enumerate(jobs, 1):
+            collect(_render_street(job))
+            if args.all and i % 100 == 0:
+                print(f"  {i}/{len(jobs)} processed", flush=True)
+    else:
+        # by_name goes through the initialiser, not each task: on Windows the
+        # pool spawns, so a per-task frame would be pickled once per street.
+        with cf.ProcessPoolExecutor(max_workers=args.jobs,
+                                    initializer=_worker_init,
+                                    initargs=(inlets, args, by_name)) as ex:
+            for i, res in enumerate(ex.map(_render_street, jobs, chunksize=4), 1):
+                collect(res)
+                if args.all and i % 100 == 0:
+                    print(f"  {i}/{len(jobs)} processed", flush=True)
+
     if args.all:
-        idx = pd.DataFrame(rows).sort_values("n_inlets", ascending=False)
-        ipath = os.path.join(outdir, "_index.csv")
-        idx.to_csv(ipath, index=False)
-        print(f"wrote {len(rows):,} pages to {outdir}/  "
-              f"({idx.kb.sum()/1e3:.0f} MB total)")
+        for sm, outdir in zip(args.smooth, args.outdir):
+            rows = rows_by_smooth[sm]
+            idx = pd.DataFrame(rows).sort_values("n_inlets", ascending=False)
+            ipath = os.path.join(outdir, "_index.csv")
+            idx.to_csv(ipath, index=False)
+            print(f"wrote {len(rows):,} pages to {outdir}/  "
+                  f"({idx.kb.sum()/1e3:.0f} MB total)")
+            print(f"  {int((idx.n_inlets > 0).sum()):,} with inlets, "
+                  f"{int(idx.n_sags.sum()):,} sags, "
+                  f"{int(idx.n_unserved.sum()):,} unserved")
+            print(f"index: {ipath}")
         if skipped:
             print(f"  skipped {skipped:,} page(s) under --min-drains "
                   f"{args.min_drains}")
-        print(f"  {int((idx.n_inlets > 0).sum()):,} with inlets, "
-              f"{int(idx.n_sags.sum()):,} sags, "
-              f"{int(idx.n_unserved.sum()):,} unserved")
         if failed:
             print(f"  FAILED {failed}")
-        print(f"index: {ipath}")
     return 0
 
 

@@ -3,9 +3,8 @@
 # Rebuild the Livermore stormdrain study end to end.
 #
 # This is the command list from readme.txt, in order, with one difference: the
-# two page builds run at the same time. They read the same parquet, write to
-# different directories and never touch each other, so running them together
-# halves the longest step of the pipeline from about twenty minutes to ten.
+# page build renders every smoothing window in a single pass and spreads the
+# streets across cores, rather than running one process per window.
 #
 # Everything is reproducible from the three fetches, so a full run needs a
 # network connection and pulls ~6 GB of 1 ft DEM tiles (plus ~1.5 GB of staged
@@ -55,6 +54,10 @@ declare -A DEM_PROJECTS=(
     [san_jose]=CA_SantaClaraCounty_2020_A20
 )
 DEM_PROJECT="${DEM_PROJECT:-}"
+# Streets render independently, so this is the knob that decides how long the
+# longest step takes. Two cores are left free so the machine stays usable.
+_ncpu=$(nproc 2>/dev/null || echo 4)
+JOBS="${JOBS:-$(( _ncpu > 3 ? _ncpu - 2 : 1 ))}"
 
 usage() {
     cat <<'EOF'
@@ -65,7 +68,8 @@ usage: run_pipeline.sh [options]
                    derived/<slug>/, dem_<slug>/, Stormdrain_map/<slug>/
   --render-only    skip the fetches and the elevation join; rebuild the pages
                    and the overview from the existing derived/ parquet
-  --no-parallel    build the page corpora one after the other
+  --jobs N         render N streets at once (default: cores - 2)
+  --no-parallel    same as --jobs 1
   -h, --help       this message
 
 environment:
@@ -82,11 +86,12 @@ EOF
 }
 
 render_only=0
-parallel=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --render-only) render_only=1 ;;
-        --no-parallel) parallel=0 ;;
+        --no-parallel) JOBS=1 ;;
+        --jobs)        JOBS="$2"; shift ;;
+        --jobs=*)      JOBS="${1#*=}" ;;
         --city)        CITY="$2"; shift ;;
         --city=*)      CITY="${1#*=}" ;;
         -h|--help)     usage; exit 0 ;;
@@ -225,35 +230,14 @@ elif [ ! -f "$POINTS" ]; then
     exit 1
 fi
 
-if [ "$parallel" -eq 1 ]; then
-    printf '\n=== street pages, %s m together ===\n' "${SMOOTHS[*]}"
-    t0=$SECONDS
-    # Logs go to temp files rather than interleaving three progress counters
-    # into one unreadable stream; all are printed once the builds finish.
-    pids=(); logs=()
-    for i in "${!SMOOTHS[@]}"; do
-        lg=$(mktemp); logs+=("$lg")
-        "${PY[@]}" plot_street_bokeh.py --all --smooth "${SMOOTHS[$i]}" \
-            --city "$CITY" --outdir "${DIRS[$i]}" >"$lg" 2>&1 &
-        pids+=($!)
-    done
-    # Wait on ALL of them before failing: bailing on the first non-zero exit
-    # would leave the others still writing pages into Stormdrain_map/ behind us.
-    ok=1
-    for pid in "${pids[@]}"; do wait "$pid" || ok=0; done
-    cat "${logs[@]}"
-    rm -f "${logs[@]}"
-    printf -- '--- street pages: %ds\n' "$((SECONDS - t0))"
-    if [ "$ok" -ne 1 ]; then
-        echo "run_pipeline.sh: a page build failed, see above." >&2
-        exit 1
-    fi
-else
-    for i in "${!SMOOTHS[@]}"; do
-        step "street pages, ${SMOOTHS[$i]} m" "${PY[@]}" plot_street_bokeh.py \
-            --all --smooth "${SMOOTHS[$i]}" --city "$CITY" --outdir "${DIRS[$i]}"
-    done
-fi
+# One build, not one per window. The three corpora differ ONLY in the rolling
+# mean: chaining, the chainage axis and the inlet snap are identical across
+# them, and three processes each recomputed all of it. plot_street_bokeh.py now
+# takes every window in one pass and parallelises across STREETS instead, which
+# scales with cores rather than being stuck at three.
+step "street pages, ${SMOOTHS[*]} m" "${PY[@]}" plot_street_bokeh.py --all \
+    --city "$CITY" --jobs "$JOBS" \
+    --smooth "${SMOOTHS[@]}" --outdir "${DIRS[@]}"
 
 # Last, and it must be: it reads the _index.csv that each page build writes.
 # The first corpus is --pages; every other one is a repeated --pages-alt, which

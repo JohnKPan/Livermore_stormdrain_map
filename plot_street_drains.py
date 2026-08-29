@@ -257,9 +257,13 @@ def street_parts(st):
     return merge_components(split_components(segs_of(st)))
 
 
-def prepare(st, inlets, args, segs=None):
-    """Chain the street and attach inlets -- cheap, so a batch can filter on the
-    inlet count before paying for a figure and its map tiles.
+def prepare_geom(st, inlets, args, segs=None):
+    """The half of prepare() that --smooth cannot change.
+
+    Chaining, the chainage axis and the inlet snap are pure geometry: d is a
+    cumsum of segment lengths, and only the rolling mean in build_profile()
+    reads smooth_m. Splitting here lets one pass over a street feed every
+    smoothing window instead of three processes recomputing it identically.
 
     `segs` is one run from street_parts(); without it the whole street is
     chained as a single path, which is only right when it has one run.
@@ -267,13 +271,23 @@ def prepare(st, inlets, args, segs=None):
     if segs is None:
         segs = segs_of(st)
     e, n, z, disc, run, _, origin = chain_segments(segs)
-    d, smooth = build_profile(e, n, z, run, args.smooth)
+    d = np.r_[0.0, np.cumsum(np.hypot(np.diff(e), np.diff(n)))]
     near = snap(inlets, e, n, d, args.max_offset)
     if not near.empty:
         near = near.assign(dem_m=z[near.path_idx.to_numpy()])
         # sorted by chainage in snap(), so numbers run 1..N from the start end
         # and read left-to-right on the profile as well as along the map
         near = near.assign(num=np.arange(1, len(near) + 1))
+    return dict(e=e, n=n, z=z, run=run, d=d, near=near, origin=origin)
+
+
+def prepare_smooth(geom, args, smooth_m=None):
+    """The half that does depend on the window: the mean, the sags, and which
+    inlet serves each. Takes prepare_geom()'s output and does not modify it."""
+    e, n, z, run = geom["e"], geom["n"], geom["z"], geom["run"]
+    d, near, origin = geom["d"], geom["near"], geom["origin"]
+    _, smooth = build_profile(e, n, z, run,
+                              args.smooth if smooth_m is None else smooth_m)
 
     # Sags come from the smoothed profile: at 1 m the elevation noise (~2 cm)
     # would manufacture minima everywhere. --smooth therefore moves the sag
@@ -328,6 +342,12 @@ def prepare(st, inlets, args, segs=None):
 
     return dict(e=e, n=n, z=z, run=run, d=d, smooth=smooth, near=near,
                 sags=sags, marked=marked, unserved=unserved, origin=origin)
+
+
+def prepare(st, inlets, args, segs=None):
+    """Both halves, for callers that only ever want one window. Identical to
+    what this function did before it was split."""
+    return prepare_smooth(prepare_geom(st, inlets, args, segs=segs), args)
 
 
 def render(street, st, prep, args, outdir, used):
