@@ -85,8 +85,12 @@ def draw_stride(d, run, draw_spacing):
     return keep
 
 
-def build(street, st, inlets, args, outdir, used, segs=None):
-    p = prepare(st, inlets, args, segs=segs)
+def build(street, st, inlets, args, outdir, used, segs=None, p=None):
+    # `p` lets the caller reuse a prepare() it already paid for -- see
+    # --min-drains, which has to know the inlet count to decide whether this
+    # page is worth building at all.
+    if p is None:
+        p = prepare(st, inlets, args, segs=segs)
     d, z, sm = p["d"], p["z"], p["smooth"]
     e, n, near = p["e"], p["n"], p["near"]
 
@@ -439,6 +443,16 @@ def main():
     # screen pixel, but the raw samples stay inspectable in the page, which is
     # what this project wants. Pass a spacing in metres to thin the DRAWN line;
     # sags, inlets and the rolling mean are computed on every point regardless.
+    ap.add_argument("--min-drains", type=int, default=1, metavar="N",
+                    help="skip pages with fewer than N inlets (default 1). "
+                         "43%% of Pleasanton's pages carried no inlet at all "
+                         "and cost the same to build as the ones that did. "
+                         "--min-drains 0 restores every page. "
+                         "Those streets are NOT undrained: the AOI is buffered "
+                         "two miles, so it reaches past the city into ground "
+                         "the inlet layer does not cover. They stay in the "
+                         "point corpus and the overview still draws them; they "
+                         "just stop being clickable.")
     ap.add_argument("--draw-spacing", type=float, default=0.0,
                     help="thin the embedded polyline to roughly this spacing "
                          "(m) for DRAWING only; sags, inlets and the rolling "
@@ -491,12 +505,21 @@ def main():
 # in the point corpus, where they still drain, and the overview draws them; they
 # just have nothing to be a page of. The portal never raised this because it
 # labels its nameless roads with the literal string UNNAMED.
+    # One partition, not one full-corpus scan per street. `df[df.display_name
+    # == nm]` builds a boolean mask over every row and then materialises the
+    # matches, which profiling put at 61% of this script's runtime: 193 s in
+    # pyarrow's take() and 28 s comparing an Arrow string column, on 40
+    # Livermore streets alone. It is quadratic in (rows x streets), and San Jose
+    # is 65 M rows and 14,000 streets against Livermore's 6.6 M and 1,728.
+    # groupby partitions in a single pass and hands back the same frames.
+    by_name = {nm: g for nm, g in df.dropna(subset=["display_name"])
+                                    .groupby("display_name", sort=True)}
+
     if args.all:
-        names = sorted(df.display_name.dropna().unique())
+        names = sorted(by_name)
     elif args.random:
         cand = []
-        for nm in sorted(df.display_name.dropna().unique()):
-            sub = df[df.display_name == nm]
+        for nm, sub in by_name.items():
             bx = (inlets.x.between(sub.easting.min()-30, sub.easting.max()+30)
                   & inlets.y.between(sub.northing.min()-30, sub.northing.max()+30))
             if bx.sum() >= 3:
@@ -507,10 +530,10 @@ def main():
     else:
         names = [args.street]
 
-    used, rows, failed = {}, [], 0
+    used, rows, failed, skipped = {}, [], 0, 0
     for i, nm in enumerate(names, 1):
-        st = df[df.display_name == nm]
-        if st.empty:
+        st = by_name.get(nm)
+        if st is None or st.empty:
             print(f"  no points for {nm!r}")
             continue
         parts = street_parts(st)
@@ -518,7 +541,16 @@ def main():
             label = nm if len(parts) == 1 else (
                 "%s %d of %d" % (nm, pi, len(parts)))
             try:
-                out, p = build(label, st, inlets, args, outdir, used, segs=segs)
+                # prepare() is the cheap half -- chaining and the inlet snap --
+                # and build() is the expensive half: the figures, the tiles and
+                # a megabyte of embedded JSON. So the drain filter is applied
+                # between them, and 0 keeps every page, as before.
+                p = prepare(st, inlets, args, segs=segs)
+                if len(p["near"]) < args.min_drains:
+                    skipped += 1
+                    continue
+                out, p = build(label, st, inlets, args, outdir, used,
+                               segs=segs, p=p)
             except Exception as exc:                            # noqa: BLE001
                 failed += 1
                 print(f"  FAILED {label!r}: {type(exc).__name__}: {exc}", flush=True)
@@ -554,6 +586,9 @@ def main():
         idx.to_csv(ipath, index=False)
         print(f"wrote {len(rows):,} pages to {outdir}/  "
               f"({idx.kb.sum()/1e3:.0f} MB total)")
+        if skipped:
+            print(f"  skipped {skipped:,} page(s) under --min-drains "
+                  f"{args.min_drains}")
         print(f"  {int((idx.n_inlets > 0).sum()):,} with inlets, "
               f"{int(idx.n_sags.sum()):,} sags, "
               f"{int(idx.n_unserved.sum()):,} unserved")

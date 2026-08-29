@@ -203,6 +203,62 @@ def human_mb(nbytes: int) -> str:
     return f"{nbytes / 1_048_576:.1f} MB"
 
 
+def probe_resolution(tile, timeout=60):
+    """Metres per pixel for one tile, read from its header over the network.
+
+    TNM publishes no resolution field. The API item's `body` is boilerplate --
+    byte-identical across collects -- and nothing in the title or URL encodes
+    the grid, so the only honest source is the raster. /vsicurl/ range-reads the
+    GeoTIFF header rather than the tile, so this costs a few KB, not 20 MB.
+
+    METRES, always. A 1 US survey foot grid is 0.3048 m and is FINER than a
+    0.5 m one despite the larger number; ranking on the raw CRS value orders
+    them backwards. add_elevation.py records dem_res in metres for this reason.
+
+    Returns None when rasterio is absent or the probe fails -- downloading needs
+    only the standard library, and losing the resolution column is not a reason
+    to fail a fetch.
+    """
+    try:
+        import rasterio  # type: ignore
+    except ImportError:
+        return None
+    try:
+        with rasterio.open("/vsicurl/" + tile.url) as ds:
+            px = abs(ds.transform.a)
+            if not ds.crs:
+                return None
+            factor = ds.crs.linear_units_factor[1]
+            return px * factor
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def choose_project(by_proj, verbose=True):
+    """Pick the collect to use for an AOI: finest resolution, then coverage.
+
+    Resolution alone does not decide it. For San Jose's buffered AOI the Santa
+    Clara and Alameda collects are BOTH 1 ftUS, and only the tile count --
+    3,755 against 242 -- says which one is the city and which is the sliver
+    where the buffer crosses a county line. So: finest metres-per-pixel wins,
+    and an exact tie goes to whichever covers more of the AOI.
+
+    Projects whose resolution cannot be probed are ranked last rather than
+    dropped, so a total probe failure still returns the best-covered collect.
+    """
+    scored = []
+    for proj in sorted(by_proj):
+        ts = by_proj[proj]
+        res = probe_resolution(ts[0])
+        scored.append((res, len(ts), proj))
+        if verbose:
+            shown = f"{res:.4f} m" if res else "unknown"
+            print(f"  {proj:<45} {len(ts):>6} tiles  {shown:>12}", file=sys.stderr)
+    # (resolution ascending, tiles descending). None sorts last via the flag.
+    scored.sort(key=lambda s: (s[0] is None, s[0] if s[0] else 0.0, -s[1]))
+    return scored[0][2], scored
+
+
 def download_one(tile: Tile, dest: str, verbose=True) -> tuple[str, str]:
     """Download a single tile to an explicit path. Returns (status, path).
 
@@ -476,6 +532,19 @@ def main(argv=None):
 
     ap.add_argument("--list-projects", action="store_true",
                     help="Just list the projects/years covering the AOI, with tile counts & sizes.")
+    ap.add_argument("--best-project", action="store_true",
+                    help="Print the best collect for the AOI to stdout and exit -- "
+                         "finest resolution, ties broken by coverage. Everything "
+                         "else goes to stderr, so this is safe to capture in a "
+                         "shell substitution. Needs rasterio to read resolution.")
+    ap.add_argument("--check-project", metavar="NAME",
+                    help="Exit non-zero if NAME is not a credible collect for this "
+                         "AOI -- fewer than --min-coverage of the best-covered "
+                         "project's tiles. Catches a --project left pointing at "
+                         "the previous city's county, which otherwise downloads a "
+                         "sliver and fails much later at the elevation join.")
+    ap.add_argument("--min-coverage", type=float, default=0.25, metavar="FRAC",
+                    help="Coverage floor for --check-project (default 0.25).")
     ap.add_argument("--dry-run", action="store_true",
                     help="List matching tiles and total size, but don't download.")
     ap.add_argument("--manifest", default=None,
@@ -513,16 +582,51 @@ def main(argv=None):
     for t in tiles:
         by_proj.setdefault(t.project, []).append(t)
 
+    if args.check_project:
+        # Substring match, because --project itself matches on substring.
+        needle = args.check_project.lower()
+        hit = {p: ts for p, ts in by_proj.items() if needle in p.lower()}
+        best_n = max(len(ts) for ts in by_proj.values())
+        have = max((len(ts) for ts in hit.values()), default=0)
+        share = have / best_n if best_n else 0.0
+        biggest = max(by_proj, key=lambda p: len(by_proj[p]))
+        print(f"{args.check_project}: {have} tile(s) here, "
+              f"{share:.0%} of the best-covered collect ({biggest}, {best_n}).",
+              file=sys.stderr)
+        if share < args.min_coverage:
+            print(f"\nThat is below --min-coverage {args.min_coverage:.0%}. This "
+                  f"collect does not cover the AOI;\ndownloading it would give a "
+                  f"sliver and fail at the elevation join.\nUse --project "
+                  f"{biggest}, or --best-project to pick automatically.",
+                  file=sys.stderr)
+            return 2
+        return 0
+
+    if args.best_project:
+        print(f"\nProbing {len(by_proj)} project(s) for resolution:", file=sys.stderr)
+        best, scored = choose_project(by_proj)
+        res = next(r for r, _, p in scored if p == best)
+        print(f"-> {best}"
+              + (f"  ({res:.4f} m, {len(by_proj[best])} tiles)" if res
+                 else f"  ({len(by_proj[best])} tiles, resolution unknown)"),
+              file=sys.stderr)
+        print(best)                    # stdout, alone, for $(...) capture
+        return 0
+
     if args.list_projects:
         print("\nProjects covering this AOI (pick one with --project):\n")
-        print(f"{'PROJECT':<45} {'TILES':>6} {'SIZE':>12}")
-        print("-" * 66)
+        print(f"{'PROJECT':<45} {'TILES':>6} {'SIZE':>12} {'RES':>10}")
+        print("-" * 77)
         for proj in sorted(by_proj):
             ts = by_proj[proj]
             tot = sum(t.size_bytes for t in ts)
-            print(f"{proj:<45} {len(ts):>6} {human_mb(tot):>12}")
-        print("\nTip: newer/dedicated collects (e.g. CA_SanFrancisco_*_B23, 2023) are the "
-              "finest\nresolution (~0.25 m). Wildfire/older collects are ~0.5 m.")
+            res = probe_resolution(ts[0])
+            shown = f"{res:.4f} m" if res else "-"
+            print(f"{proj:<45} {len(ts):>6} {human_mb(tot):>12} {shown:>10}")
+        print("\nRES is metres per pixel, read from one tile's header -- TNM publishes\n"
+              "no resolution field. A 1 ftUS grid shows as 0.3048 m and is finer than\n"
+              "a 0.5 m one. '-' means rasterio is missing or the probe failed.\n"
+              "--best-project picks for you: finest resolution, ties broken by coverage.")
         return 0
 
     total_bytes = sum(t.size_bytes for t in tiles)

@@ -426,6 +426,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("city", nargs="?", default="livermore",
                     help="city key (default livermore); --list to see them")
+    ap.add_argument("--require", metavar="CITY", action="append", default=[],
+                    help="with --all: only these cities failing is fatal. A "
+                         "pipeline building one city should not be stopped by "
+                         "another publisher's server dropping a connection, but "
+                         "it must still fail if the city it needs is missing. "
+                         "Repeatable.")
     ap.add_argument("--all", action="store_true",
                     help="fetch every known city into one file "
                          "(default derived/storm_inlets_all.csv); rows carry a "
@@ -492,9 +498,19 @@ def main():
 
     if failed:
         # Written, but incomplete -- and the file cannot say so itself, since a
-        # missing city is indistinguishable from a city with no inlets.
-        raise SystemExit(f'\nINCOMPLETE: {len(failed)} city(s) failed and are '
-                         f'absent from the file: {", ".join(failed)}')
+        # missing city is indistinguishable from a city with no inlets. So the
+        # exit status has to carry it.
+        missing = [c for c in args.require if c in failed] if args.require else failed
+        note = (f'\nINCOMPLETE: {len(failed)} city(s) failed and are absent from '
+                f'the file: {", ".join(failed)}')
+        if not missing:
+            # Something failed, but nothing the caller said it needed. A run
+            # building San Jose should not die because Livermore's server
+            # dropped a connection.
+            print(note + f'\n  ...none of them required '
+                         f'({", ".join(args.require)}), continuing.')
+            return
+        raise SystemExit(note + f'\n  REQUIRED and missing: {", ".join(missing)}')
 
 
 if __name__ == "__main__":

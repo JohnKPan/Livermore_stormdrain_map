@@ -184,6 +184,32 @@ MERGE_GAP_M = 50.0
 MERGE_NEAR_M = 30.0       # counted as "alongside" at this separation
 MERGE_OVERLAP = 0.25      # alongside for more of its length than this: not one road
 
+# --- angular continuity, after COINS -----------------------------------------
+# Distance alone cannot settle the middle of the range. Measured on San Jose's
+# 13,217 names: of the 1,413 component pairs that are not carriageways, 158 sit
+# under 50 m, 469 between 50 m and 1 km, and 786 over 1 km -- and the histogram
+# is smooth from 20 m to tens of kilometres with no valley to put a threshold
+# in. Livermore had one (7-49.7 m, then nothing until 65.9 m), which is why
+# MERGE_GAP_M works there and strands most of San Jose.
+#
+# COINS (Tripathy et al.; momepy.COINS) decides continuity by BEARING instead:
+# segments belong to one stroke while the interior angle between them stays
+# above a threshold. Two pieces of road pointing at each other across a park
+# are one street; two meeting at a right angle are not, however close.
+#
+# The test below is the three-way form, not "are the two tangents parallel".
+# The gap vector must line up with BOTH tangents. Tangents alone would fuse two
+# parallel streets a block apart -- they are exactly parallel and merely offset,
+# and there are a lot of them on a grid like San Jose's.
+STROKE_MAX_DEFLECT_DEG = 45.0   # <=45 deg each side: interior angle >= 135 deg
+# A ceiling, not a criterion. Collinearity is what decides; this only stops the
+# search from reaching clear across the city, where a grid guarantees some pair
+# of same-named terminals is collinear by coincidence.
+STROKE_GAP_M = 600.0
+# Bearings are fitted over this much line, not from the last two vertices: at
+# 0.1 m spacing two adjacent points carry more digitising noise than direction.
+STROKE_TANGENT_M = 25.0
+
 
 def _samples(cs, cap=400):
     """Up to `cap` points spanning a component, for the pairwise geometry."""
@@ -193,13 +219,77 @@ def _samples(cs, cap=400):
     return np.column_stack([e[::step], n[::step]])
 
 
-def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP):
+def _terminals(comp, reach=STROKE_TANGENT_M):
+    """A component's free ends, each with the direction it leaves in.
+
+    Only degree-1 endpoints: an end that meets another segment of the same
+    component is interior to the run, and a stroke continues through it already.
+    The tangent points OUTWARD -- the direction the road would carry on in.
+    """
+    _, deg, node = endpoint_nodes(comp)
+    out = []
+    for i, s in enumerate(comp):
+        e, n = s[1], s[2]
+        if len(e) < 2:
+            continue
+        for k, slot in ((0, 2 * i), (-1, 2 * i + 1)):
+            if deg[node[slot]] != 1:
+                continue
+            p = np.array([e[k], n[k]])
+            d = np.hypot(e - p[0], n - p[1])
+            # Walk inward from this end until `reach` of line is behind us; on a
+            # segment shorter than that, use its far end.
+            idx = np.flatnonzero(d >= reach)
+            if len(idx):
+                far = idx[0] if k == 0 else idx[-1]
+            else:
+                far = -1 if k == 0 else 0
+            v = p - np.array([e[far], n[far]])
+            L = float(np.hypot(*v))
+            if L > 1e-6:
+                out.append((p, v / L))
+    return out
+
+
+def _stroke_continuous(ca, cb, max_deflect=STROKE_MAX_DEFLECT_DEG):
+    """True where two components read as one stroke across the gap between them.
+
+    For a candidate pair of free ends: leave `ca` along its outward tangent,
+    cross the gap, and arrive at `cb` running inward. All three directions have
+    to agree, so both deflections are measured and the WORSE one decides. Taking
+    the better of the two would accept a right-angle turn with one arm collinear
+    with the gap, which is a corner, not a continuation.
+    """
+    ta, tb = _terminals(ca), _terminals(cb)
+    if not ta or not tb:
+        return False
+    lim = np.cos(np.radians(max_deflect))
+    for pa, va in ta:
+        for pb, vb in tb:
+            w = pb - pa
+            L = float(np.hypot(*w))
+            if L < 1e-6:
+                continue
+            w /= L
+            # cos >= lim on both is the same test as angle <= max_deflect, and
+            # skips two arccos per pair.
+            if float(va @ w) >= lim and float(-vb @ w) >= lim:
+                return True
+    return False
+
+
+def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP,
+                     stroke_gap=STROKE_GAP_M):
     """Put back the components that an intersection split, and only those.
 
-    Two components are one road when they come within `gap` of each other and
-    do not run alongside each other. Returns the same shape as
-    split_components(), largest first.
+    Two components are one road when they do not run alongside each other AND
+    either come within `gap`, or stay collinear across a longer break -- a
+    street interrupted by a park, a freeway or a bridge is still one street.
+    See _stroke_continuous(); `stroke_gap=gap` disables the angular test.
+
+    Returns the same shape as split_components(), largest first.
     """
+    stroke_gap = max(stroke_gap, gap)
     if len(comps) < 2:
         return comps
     pts = [_samples(cs) for cs in comps]
@@ -215,12 +305,19 @@ def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP):
         for j in range(i + 1, len(comps)):
             d = np.hypot(pts[i][:, 0][:, None] - pts[j][:, 0][None, :],
                          pts[i][:, 1][:, None] - pts[j][:, 1][None, :])
-            if d.min() > gap:
+            near = float(d.min())
+            if near > stroke_gap:
                 continue
             alongside = max((d.min(axis=1) < MERGE_NEAR_M).mean(),
                             (d.min(axis=0) < MERGE_NEAR_M).mean())
             if alongside >= overlap:
                 continue                      # a carriageway pair, or a loop's arms
+            # Close enough to be one road, or far apart but pointing straight at
+            # each other. The angular test is only consulted beyond `gap`: under
+            # it the pieces are already an intersection apart, and asking for
+            # collinearity there would split streets that merely bend.
+            if near > gap and not _stroke_continuous(comps[i], comps[j]):
+                continue
             ra, rb = find(i), find(j)
             if ra != rb:
                 parent[ra] = rb

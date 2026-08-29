@@ -37,9 +37,24 @@ OPENS_AT=10
 # dem_livermore/ alone is 8 GB of 1 ft tiles, so a region-wide run means
 # fetching, processing and deleting a city before starting the next.
 CITY="${CITY:-livermore}"
-# The USGS OPR collect covering the AOI. Varies by county; find another city's
-# with fetch_usgs_lidar.py --aoi-file ... --list-projects.
-DEM_PROJECT="${DEM_PROJECT:-CA_AlamedaCounty_2021_B21}"
+# The USGS OPR collect covering the AOI. It varies by county, and a single
+# hardcoded default is a trap: --city san_jose against Livermore's Alameda
+# collect matches 242 real tiles, all of them the sliver where the buffered AOI
+# crosses the county line, so the fetch "succeeds" and the mistake only surfaces
+# at the elevation join with almost every point outside the DEM.
+#
+# Three ways to settle it, in precedence order:
+#   1. DEM_PROJECT in the environment -- explicit always wins
+#   2. this registry, for cities already pinned to a known-good collect
+#   3. derived from the AOI: finest resolution, ties broken by coverage
+# Whichever supplies it, the choice is checked against the AOI before any
+# download starts.
+declare -A DEM_PROJECTS=(
+    [livermore]=CA_AlamedaCounty_2021_B21
+    [pleasanton]=CA_AlamedaCounty_2021_B21
+    [san_jose]=CA_SantaClaraCounty_2020_A20
+)
+DEM_PROJECT="${DEM_PROJECT:-}"
 
 usage() {
     cat <<'EOF'
@@ -53,9 +68,16 @@ usage: run_pipeline.sh [options]
   --no-parallel    build the page corpora one after the other
   -h, --help       this message
 
+environment:
+  DEM_PROJECT      the USGS OPR collect to fetch. Unset, the script uses its
+                   DEM_PROJECTS registry for known cities and otherwise derives
+                   one from the AOI -- finest resolution, ties broken by
+                   coverage. Whatever supplies it is verified against the AOI
+                   before the download starts.
+
 Writes Stormdrain_map/<city>/ -- the whole deliverable for one city.
 Region-wide is a loop:  for c in $(cut -d, -f1 city_geojson/_index.csv | tail -n +2);
-do ./run_pipeline.sh --city "$c"; done   -- but see the 8 GB/city DEM note above.
+do bash run_pipeline.sh --city "$c"; done   -- but see the 8 GB/city DEM note above.
 EOF
 }
 
@@ -89,16 +111,41 @@ OVERVIEW="Stormdrain_map/$CITY/index.html"
 # gdal.Warp and GDAL has no PyPI wheel on Windows. It runs everything else
 # identically -- the package versions match the uv venv.
 #
-# It MUST go through `micromamba run`, not .conda/env/python.exe directly:
-# activation is what sets GDAL_DATA and PROJ_LIB, and without them CRS lookups
-# fail. This project leans on a compound CRS with a NAVD88 vertical datum.
-if [ -x .conda/env/python.exe ] && [ -x .conda/micromamba.exe ]; then
-    PY=(.conda/micromamba.exe run -p .conda/env python)
-elif [ -x .conda/env/bin/python ] && [ -x .conda/micromamba ]; then
-    PY=(.conda/micromamba run -p .conda/env python)
+# The env's python is called DIRECTLY, not through `micromamba run`. The wrapper
+# re-execs the interpreter from a second process, and under a PowerShell-hosted
+# Git Bash it has been seen to exit without running anything and without an
+# error -- the step prints its header and the script dies, `set -e` doing its
+# job on an exit status nothing explained.
+#
+# The comment this replaces claimed activation was mandatory because it sets
+# GDAL_DATA and PROJ_LIB. Only half of that is true: `micromamba run` sets
+# GDAL_DATA and leaves PROJ_LIB unset -- pyproj carries its own data. So the one
+# thing activation contributed is set here instead, and CRS lookups against the
+# compound NAVD88 datum were checked against both paths.
+#
+# PYTHON=... overrides all of it.
+# native_path: Git Bash's $PWD is /d/Claude/..., which the Windows GDAL build
+# cannot open. cygpath -w gives it back as D:\Claude\..., which is what
+# `micromamba run` was exporting. No-op where cygpath does not exist.
+native_path() {
+    if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi
+}
+if [ -n "${PYTHON:-}" ]; then
+    read -r -a PY <<< "$PYTHON"
+elif [ -x .conda/env/python.exe ]; then
+    PY=(.conda/env/python.exe)
+    GDAL_DATA=$(native_path "$PWD/.conda/env/Library/share/gdal"); export GDAL_DATA
+elif [ -x .conda/env/bin/python ]; then
+    PY=(.conda/env/bin/python)
+    GDAL_DATA=$(native_path "$PWD/.conda/env/share/gdal"); export GDAL_DATA
 elif [ -x .venv/Scripts/python.exe ]; then PY=(.venv/Scripts/python.exe)
 elif [ -x .venv/bin/python ];        then PY=(.venv/bin/python)
 else                                      PY=(python)
+fi
+# An `if`, not an && chain: under `set -e` the chain's status is the failed test
+# when the directory does exist, which is the normal case.
+if [ -n "${GDAL_DATA:-}" ] && [ ! -d "$GDAL_DATA" ]; then
+    echo "run_pipeline.sh: warning, GDAL_DATA=$GDAL_DATA does not exist" >&2
 fi
 
 start=$SECONDS
@@ -130,12 +177,41 @@ if [ "$render_only" -eq 0 ]; then
     # Every city in the registry, into derived/storm_inlets_all.csv. The
     # plotters clip it to city_geojson/$CITY.geojson at load, so fetching the
     # whole corpus once serves any --city without a refetch.
-    step "storm drain inlets"    "${PY[@]}" fetch_inlets.py --all
+    # --require "$CITY": another publisher's server dropping a connection must
+    # not kill a build that does not need that city. Only the city being built
+    # is fatal, and its absence still is.
+    step "storm drain inlets"    "${PY[@]}" fetch_inlets.py --all \
+        --require "$CITY"
+    # Settle the collect before downloading anything. See DEM_PROJECTS above.
+    AOI="city_geojson/$CITY.geojson"
+    if [ -n "$DEM_PROJECT" ]; then
+        echo "DEM collect: $DEM_PROJECT (from DEM_PROJECT)"
+    elif [ -n "${DEM_PROJECTS[$CITY]:-}" ]; then
+        DEM_PROJECT="${DEM_PROJECTS[$CITY]}"
+        echo "DEM collect: $DEM_PROJECT (from the registry in this script)"
+    else
+        printf '\n=== choosing a DEM collect for %s ===\n' "$CITY"
+        # Command substitution, so --best-project must keep stdout to the name
+        # alone. It probes one tile header per candidate; a few KB, not a tile.
+        DEM_PROJECT=$("${PY[@]}" fetch_usgs_lidar.py --aoi-file "$AOI" --best-project)
+        if [ -z "$DEM_PROJECT" ]; then
+            echo "run_pipeline.sh: could not derive a DEM collect for $CITY." >&2
+            echo "Set DEM_PROJECT=<name>, or add $CITY to DEM_PROJECTS." >&2
+            exit 1
+        fi
+        echo "DEM collect: $DEM_PROJECT (derived from the AOI)"
+    fi
+    # Fail before the download, not two steps later. A collect that covers a
+    # sliver of the AOI is the failure mode this catches, and the DEM fetch is
+    # the longest step in the pipeline -- Pleasanton's was 11 minutes, San
+    # Jose's is 68 GB.
+    step "verify DEM collect" "${PY[@]}" fetch_usgs_lidar.py \
+        --aoi-file "$AOI" --check-project "$DEM_PROJECT"
     # The buffered boundary, not a hand-kept bbox: it already reaches two miles
     # past the city limit, which is the margin the DEM needs for streets on the
     # edge, and it exists for all 101 cities.
     step "lidar DEM tiles"       "${PY[@]}" fetch_usgs_lidar.py \
-        --aoi-file "city_geojson/$CITY.geojson" \
+        --aoi-file "$AOI" \
         --project "$DEM_PROJECT" --out "./$DEM_DIR" \
         --manifest "${CITY}_tiles.csv"
     # --no-csv: at 0.1 m the intermediate CSV is ~600 MB and nothing reads it.
