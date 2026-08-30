@@ -197,8 +197,28 @@ def split_components(segs, branch_split=False):
 # guard anyway; carriageways survive every threshold to 80 m because it is the
 # overlap test, not the distance, that keeps them apart.
 MERGE_GAP_M = 50.0
-MERGE_NEAR_M = 30.0       # counted as "alongside" at this separation
-MERGE_OVERLAP = 0.25      # alongside for more of its length than this: not one road
+# 30 m and 0.25 were tuned on Livermore's urban arterials, where a median is a
+# painted stripe or a narrow island. A FREEWAY median is wider than that, and
+# the pair silently failed on one: I-580 (Arthur H. Breed Junior Freeway) has
+# its carriageways a measured 39.2 m apart through Pleasanton (p5 28.3, p95
+# 45.9) and 29.1 m through Livermore. At a 30 m radius that scores alongside
+# 0.10 in Pleasanton -- far under 0.25 -- so the two carriageways were merged
+# into one 37 km part that runs out and back. Livermore scraped through at 0.55
+# only because its stretch happens to be 10 m narrower.
+#
+# Both numbers move together, and they have to. A wider radius means more of an
+# INTERSECTION pair falls inside it too, so the fraction has to rise to keep
+# those apart -- raising the radius alone would start vetoing streets that
+# merely cross. At 50 m a real carriageway pair scores 0.98 (Livermore) and
+# 1.00 (Pleasanton), so 0.50 still clears it twofold.
+#
+# Measured over both corpora: Breed Freeway goes 1 part to 2 and Hopyard Road
+# 3 to 4, both to fold 1.00; Stanley Boulevard drops a fragment, 5 parts to 4.
+# Genuine loops are untouched -- Brookline, Inspiration, Commerce, Villa,
+# Canyon Meadows and Peregrine all render identically. Cost is +13 parts per
+# city, and Pleasanton's path sitting inside a folded part falls 144 km -> 104.
+MERGE_NEAR_M = 50.0       # counted as "alongside" at this separation
+MERGE_OVERLAP = 0.50      # alongside for more of its length than this: not one road
 
 # --- angular continuity, after COINS -----------------------------------------
 # Distance alone cannot settle the middle of the range. Measured on San Jose's
