@@ -403,6 +403,51 @@ def write_out(rows, cols, csv_path, want_geojson):
         print(f"wrote {gj_path}")
 
 
+def city_columns(cfg, all_fields=False):
+    """The columns build_rows() produces for a city, without fetching it.
+
+    Same construction as build_rows: the canonical block, then whatever native
+    fields the registry keeps that no canonical name already consumed. Lets a
+    reused city be reassembled from an existing file in exactly the shape a
+    fresh fetch would have written.
+    """
+    if all_fields:
+        return None                      # unknown without asking the server
+    consumed = set(cfg["canon"].values())
+    extras = [f for f in cfg["fields"] if f not in consumed]
+    return ["lon", "lat", "source"] + CANONICAL + extras
+
+
+def read_existing(path):
+    """{city: [row, ...]} from a merged file written by an earlier run."""
+    if not path.exists():
+        return {}
+    out = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            out.setdefault(row.get("source"), []).append(row)
+    return out
+
+
+def reuse_city(existing, key, cfg, all_fields=False):
+    """That city's rows from the existing file, in its own column order.
+
+    Returns None when the file has nothing for it, or when --all-fields makes
+    the column set unknowable without asking the server -- either way the
+    caller falls through to fetching.
+    """
+    rows = existing.get(key)
+    cols = city_columns(cfg, all_fields)
+    if not rows or cols is None:
+        return None
+    have = set(rows[0])
+    if not set(cols) <= have:
+        # The registry gained a field since the file was written, so the file
+        # cannot answer for this city any more.
+        return None
+    return [{c: r.get(c, "") for c in cols} for r in rows], cols
+
+
 def merge(per_city):
     """Concatenate every city into one table over the union of their columns.
 
@@ -426,6 +471,11 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("city", nargs="?", default="livermore",
                     help="city key (default livermore); --list to see them")
+    ap.add_argument("--refresh", metavar="CITY", action="append", default=[],
+                    help="refetch this city even though the output file already "
+                         "has it. Repeatable; --refresh-all does every city.")
+    ap.add_argument("--refresh-all", dest="refresh_all", action="store_true",
+                    help="refetch every city, ignoring what the file holds.")
     ap.add_argument("--require", metavar="CITY", action="append", default=[],
                     help="with --all: only these cities failing is fatal. A "
                          "pipeline building one city should not be stopped by "
@@ -470,9 +520,25 @@ def main():
         return
 
     # --- every city, one file -------------------------------------------
-    per_city, failed = {}, []
+    # A city already in the merged file is reused rather than refetched. The
+    # publishers are third-party servers of wildly differing robustness --
+    # Livermore's municipal box resets connections under load, where the two
+    # Esri-hosted ones never flinch -- so refetching two cities to rebuild one
+    # is slow and a failure mode for no gain. --refresh CITY overrides, and
+    # --refresh-all ignores the file entirely.
+    out_path = Path(args.out) if args.out else OUT_DIR / "storm_inlets_all.csv"
+    existing = {} if args.refresh_all else read_existing(out_path)
+    per_city, failed, reused = {}, [], []
     for i, (key, cfg) in enumerate(CITIES.items(), 1):
         print(f'\n=== [{i}/{len(CITIES)}] {key} ===')
+        if key not in args.refresh:
+            keep = reuse_city(existing, key, cfg, args.all_fields)
+            if keep:
+                print(f'  {len(keep[0]):,} row(s) already in {out_path.name}, '
+                      f'not refetching (--refresh {key} to force)')
+                per_city[key] = keep
+                reused.append(key)
+                continue
         try:
             per_city[key] = fetch_city(key, cfg, args)
         except SystemExit as e:
@@ -490,6 +556,8 @@ def main():
 
     rows, cols = merge(per_city)
     print('\n=== combined ===')
+    if reused:
+        print(f'  reused, not refetched: {", ".join(reused)}')
     for key, (city_rows, _) in per_city.items():
         print(f'  {key:<12} {len(city_rows):>7,}')
     print(f'  {"total":<12} {len(rows):>7,}  over {len(cols)} columns')
