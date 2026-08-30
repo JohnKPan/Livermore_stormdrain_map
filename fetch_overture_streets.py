@@ -10,6 +10,10 @@ Writes: streets/overture/<slug>.geojson   one FeatureCollection per city
         streets/overture/_index.csv       per-city totals
         streets/overture/_classes.csv     per-city, per-road-class totals
 
+Both index files ACCUMULATE. --cities fetches one city at a time, and the two
+CSVs are meant to describe the whole corpus, so each run merges its rows into
+what is already there rather than replacing it -- see merge_index().
+
 Why this and not another city portal: Livermore's centerline (step 0) is the
 gold standard for Livermore and exists for nowhere else. Overture is one schema
 over all 101 cities at once, which is what a regional comparison needs. It is
@@ -111,11 +115,23 @@ COLUMNS = ["id", "names", "class", "subtype", "subclass", "road_flags",
 # corpus at 3% named -- driveways and parking aisles -- and only its alleys are
 # real back-lanes worth having, so it is admitted by subclass alone.
 #
-# `link` is excluded throughout. A link is a ramp, and a ramp is not a street:
-# it has no name (0.3% of motorway links), no route, and no counterpart in the
-# portal centerline beyond a local asset label. Excluding it is also what
-# lifts the classified network from 93% to 97.7-99.9% named, because ramps
-# were the whole of the gap.
+# `link` is admitted only when it has a display_name. A link is usually a ramp,
+# and a ramp is not a street: it has no name, no route, and no counterpart in
+# the portal centerline beyond a local asset label.
+#
+# But "no name" was measured on MOTORWAY links and does not hold for the rest.
+# Across Livermore's 171 links: motorway 0 of 96 named, trunk 4 of 18, primary
+# 2 of 18, tertiary 1 of 9, secondary 1 of 30. The named ones are not ramps at
+# all -- they are the pieces that carry a road THROUGH a grade-separated
+# interchange, and Overture tags them `link` because of the geometry, not the
+# identity. Dropping them severs the road: Vallecitos Road lost 4 pieces (329 m)
+# at the Isabel Avenue interchange and rendered as two disconnected blue lines
+# with a hole between them. Railroad Avenue, Valley Avenue, Santa Rita Road and
+# Olivina Avenue lose the same way.
+#
+# Admitting only NAMED links keeps the original justification intact: the
+# 93% -> 97.7-99.9% named figure can only improve, because every segment this
+# adds back has a name by construction.
 ROAD_CLASSES = ["motorway", "trunk", "primary", "secondary", "tertiary",
                 "residential", "living_street", "unclassified"]
 SERVICE_KEEP = "alley"
@@ -396,6 +412,7 @@ class City:
         self.named = 0
         self.routed = 0
         self.display_named = 0
+        self.links = 0
         self.classes = Counter()
         self.class_len = defaultdict(float)
 
@@ -442,7 +459,14 @@ def build_filter(bbox, subtypes, classes, roads_only=False):
         # in Arrow, null != "link" is null, which a filter reads as false, so
         # the whole road network would be dropped without the is_null() arm.
         sub = pc.field("subclass")
-        not_link = sub.is_null() | (sub != "link")
+        # A SUPERSET of the links we want: display_name is names.primary or,
+        # failing that, the flattened route (see feature()), and a non-null
+        # routes list can still flatten to nothing. Arrow can only test for the
+        # nulls, so this admits a few extra and the exact test runs in the read
+        # loop, where display_name is actually known.
+        maybe_named = (pc.field("names", "primary").is_valid()
+                       | pc.field("routes").is_valid())
+        not_link = sub.is_null() | (sub != "link") | maybe_named
         f = f & ((pc.field("class").isin(ROAD_CLASSES) & not_link)
                  | ((pc.field("class") == "service") & (sub == SERVICE_KEEP)))
     if classes:
@@ -548,6 +572,59 @@ def flatten_routes(rt):
     return ",".join(dict.fromkeys(out)) or None
 
 
+def _row_sort(r):
+    """(county, name, most segments first, class) -- suits both index files."""
+    try:
+        n = -int(r.get("segments") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    return (str(r.get("county", "")), str(r.get("name", "")), n,
+            str(r.get("class", "")))
+
+
+def merge_index(path, fresh, fields, out_dir):
+    """Fold this run's rows into an index file, keeping the cities it did not touch.
+
+    --cities fetches one city at a time in normal use -- run_pipeline.sh always
+    passes exactly one -- but these two CSVs describe the CORPUS, not the last
+    run. Rewriting them from `cities` alone meant a Pleasanton fetch silently
+    erased Livermore's row, leaving a file that answered a question nobody had
+    asked: what did I fetch most recently.
+
+    So the previous file is read back and kept, minus two things: the slugs this
+    run just rewrote, and any row whose .geojson is no longer on disk. An index
+    that goes on naming deleted files is worse than one that is merely stale.
+
+    Fieldnames are unioned and gaps filled, so an index written before a column
+    existed (`named_links`, say) merges with one written after instead of
+    raising on the first unknown key.
+    """
+    slugs = {r["slug"] for r in fresh}
+    keep = []
+    if path.exists():
+        with open(path, newline="", encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                slug = r.get("slug") or ""
+                if slug in slugs or not (out_dir / (slug + ".geojson")).exists():
+                    continue
+                keep.append(r)
+    rows = keep + list(fresh)
+    names = list(fields)
+    for r in rows:
+        for k in r:
+            if k not in names:
+                names.append(k)
+    for r in rows:
+        for k in names:
+            r.setdefault(k, "")
+    rows.sort(key=_row_sort)
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=names)
+        w.writeheader()
+        w.writerows(rows)
+    return rows
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--city-dir", default=DEFAULT_CITY_DIR,
@@ -649,10 +726,20 @@ def main():
             # and parsing them would be the bulk of the work.
             geoms = [None] * batch.num_rows
             # RECOVERED COMMENT: which rows landed somewhere, for the totals.
+            # The exact half of the link rule -- see build_filter(). Only rows
+            # the pushdown already admitted reach here, and only links are
+            # tested, so this costs a string compare per row.
+            drop = np.zeros(batch.num_rows, dtype=bool)
+            if args.roads_only:
+                for k in np.nonzero(np.array([s == "link" for s in subcls]))[0]:
+                    if not (names[k] or flatten_routes(rroutes[k])):
+                        drop[k] = True
+
             hit_any = np.zeros(batch.num_rows, dtype=bool)
             for c in cities:
                 cand = np.nonzero((sx0 < c.xmax) & (sx1 > c.xmin)
                                   & (sy0 < c.ymax) & (sy1 > c.ymin))[0]
+                cand = cand[~drop[cand]]      # before any geometry is parsed
                 if cand.size == 0:
                     continue
                 for k in cand:
@@ -702,6 +789,7 @@ def main():
                     c.named += 1 if names[k] else 0
                     c.routed += 1 if route else 0
                     c.display_named += 1 if (names[k] or route) else 0
+                    c.links += 1 if subcls[k] == "link" else 0
                     c.classes[classes[k]] += 1
                     c.class_len[classes[k]] += glen
                     hit_any[k] = True
@@ -726,31 +814,34 @@ def main():
             "slug": c.slug, "geoid": c.geoid, "name": c.name, "county": c.county,
             "segments": c.n, "length_km": round(c.length / 1000.0, 2),
             "named": c.named, "unnamed": c.n - c.named, "routed": c.routed,
-            "display_named": c.display_named,
+            "display_named": c.display_named, "named_links": c.links,
             "classes": len(c.classes),
             "top_class": c.classes.most_common(1)[0][0] if c.classes else "",
             "bytes": path.stat().st_size, "file": path.name,
+            # Provenance, now that one file holds rows from many runs: a city
+            # fetched under an older release, or before the named-link rule,
+            # is otherwise indistinguishable from one fetched today.
+            "release": release, "fetched": meta["fetched"],
         })
 
     idx = out_dir / "_index.csv"
-    with open(idx, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
+    merged = merge_index(idx, rows, list(rows[0]), out_dir)
 
+    cls_rows = [{"slug": c.slug, "name": c.name, "county": c.county,
+                 "class": cls, "segments": n,
+                 "length_km": round(c.class_len[cls] / 1000.0, 2)}
+                for c in cities for cls, n in c.classes.most_common()]
     cls_path = out_dir / "_classes.csv"
-    with open(cls_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["slug", "name", "county", "class", "segments", "length_km"])
-        for c in sorted(cities, key=lambda c: (c.county, c.name)):
-            for cls, n in c.classes.most_common():
-                w.writerow([c.slug, c.name, c.county, cls, n,
-                            round(c.class_len[cls] / 1000.0, 2)])
+    merge_index(cls_path, cls_rows,
+                ["slug", "name", "county", "class", "segments", "length_km"],
+                out_dir)
 
     print("wrote %d file(s) to %s  (%.1f MB)" % (
         len(rows), out_dir, sum(r["bytes"] for r in rows) / 1e6))
     print("wrote %s\nwrote %s" % (idx, cls_path))
 
+    print("index covers %d city(ies); this run rewrote %d"
+          % (len(merged), len(rows)))
     empty = [r["slug"] for r in rows if r["segments"] == 0]
     if empty:
         print("\n! no segments for: " + ", ".join(empty))
