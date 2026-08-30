@@ -1,13 +1,29 @@
-Published build -- nothing to install, nothing to run:
+Published builds -- nothing to install, nothing to run:
 
     https://johnkpan.github.io/Livermore_stormdrain_map/
+    https://johnkpan.github.io/Pleasanton_stormdrain_map/
 
 
-Data acquisition -- Livermore stormdrain study
-==============================================
+Data acquisition -- stormdrain study
+====================================
 
-That is the Stormdrain_map/ folder of step 5, served from this repo's gh-pages
-branch. Everything below is how to rebuild it from scratch.
+Each is the Stormdrain_map/<city>/ folder of step 5, served from a gh-pages
+branch. Everything below is how to rebuild either from scratch.
+
+Two repositories, not two branches of one. GitHub Pages publishes ONE site per
+repository, from a single branch and folder, and caps a published site at 1 GB.
+Livermore's three corpora are 917 MB and Pleasanton's are ~890 MB, so they do
+not fit together and cannot be served as two sites from here. This repo holds
+the pipeline and publishes Livermore; JohnKPan/Pleasanton_stormdrain_map holds
+nothing but the rendered Pleasanton deliverable on an orphan gh-pages branch.
+Both are built by the same run_pipeline.sh in this repo.
+
+Republishing a city means force-pushing a fresh orphan commit rather than
+adding to history -- a second generation of ~900 MB would otherwise stay in the
+repo forever. And page FILENAMES are not stable across a spacing or split-flag
+change: Vallecitos Road was 4 parts at 0.1 m and is 3 at 0.15 m, so a link to
+..._1_of_4.html dies. The overview is the durable entry point; deep links are
+not.
 
 Everything runs from the project root. One command runs the lot:
 
@@ -30,6 +46,31 @@ share a pass over each street -- chaining, the chainage axis and the inlet snap
 do not depend on the window -- so three processes were recomputing all of it.
 --jobs sets the width, defaulting to cores - 2; --no-parallel means --jobs 1.
 It picks the conda env if .conda/ exists, then the venv, then whatever is on PATH.
+
+Everything it decides for you, and how to override it:
+
+    CITY            livermore            --city SLUG, or CITY= in the env
+    smoothing       25 10 5 m            SMOOTHS= in the script
+    overview opens  10 m                 OPENS_AT= in the script (must be in
+                                         SMOOTHS, or the selector opens on a
+                                         corpus that was never built)
+    jobs            cores - 2, min 1     --jobs N, --no-parallel, JOBS= in env
+    DEM collect     per-city registry    DEM_PROJECT= in the env wins; unknown
+                                         cities derive one from the AOI, finest
+                                         resolution, ties broken by coverage
+    splitting       OFF                  --branch-split, --fold-split
+    scope           full rebuild         --render-only
+
+Everything else is derived from CITY and changes with it -- derived/<city>/,
+dem_<city>/, Stormdrain_map/<city>/, city_geojson/<city>.geojson -- so the one
+setting worth being deliberate about is --city.
+
+Two of those defaults are worth a second look before a real build. The DEM
+registry only knows livermore, pleasanton and san_jose; any other city derives
+its collect from the AOI, and that derivation is checked against the AOI before
+the download starts but is still a guess. And the splitting flags are OFF, so a
+default run reproduces the divided-road folding they exist to fix -- the
+published builds were both made WITH them.
 
 Two optional flags change how a street is cut into pages. Both address the same
 symptom -- a divided road chained into one profile that walks out and comes back,
