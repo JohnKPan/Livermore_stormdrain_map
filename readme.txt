@@ -31,20 +31,61 @@ do not depend on the window -- so three processes were recomputing all of it.
 --jobs sets the width, defaulting to cores - 2; --no-parallel means --jobs 1.
 It picks the conda env if .conda/ exists, then the venv, then whatever is on PATH.
 
-Measured on Pleasanton twice, same machine:
+Two optional flags change how a street is cut into pages. Both address the same
+symptom -- a divided road chained into one profile that walks out and comes back,
+so half its chainage runs backwards -- from different causes, and both are off by
+default:
 
-                        2026-08-27   2026-08-29
-    centerline                50s          44s
-    inlets                    17s         122s   (Livermore retry backoff)
-    DEM tiles                669s           5s   (cached, not comparable)
-    resampling                57s          43s
-    elevation join            96s         100s
-    street pages           2,211s         425s
-    overview                   5s           4s
-    TOTAL                 51m 45s      12m 26s
+  --branch-split  cut at any junction of three or more segment ends. Handles a
+                  divided road that CONVERGES: Stanley Boulevard's carriageways
+                  meet at a Y where the median ends, so the street is one
+                  connected component and the carriageway test in
+                  merge_components() -- which only ever compares separate
+                  components -- never sees it. Costs ~12% more pages, most of
+                  them short stubs at the junctions it cuts.
+  --fold-split    cut a part that doubles back where the carriageways form a
+                  RING with no junction to cut at. Del Valle Parkway's are
+                  joined end to end by U-turns, so every node is degree 2 and
+                  --branch-split cannot reach it. Costs ~12 pages on Pleasanton.
 
-The page step did less work as well as less per page: --min-drains 1 skipped
-4,989 part-builds carrying no inlet. Per page it is 0.74s -> 0.11s.
+Together on Pleasanton they take the path length sitting inside a folded part
+from 447 km to 144 km, for 1,688 pages to 1,900. What remains folded is mostly
+genuine loops, which score the same on the measure and are correctly one page.
+
+Measured on Pleasanton, same machine, 18 jobs:
+
+                        2026-08-27   2026-08-29   2026-08-29
+                             0.1 m        0.1 m       0.15 m
+    centerline                 50s          44s          45s
+    inlets                     17s         122s           4s   (cached)
+    DEM tiles                 669s           5s           4s   (cached)
+    resampling                 57s          43s          46s
+    elevation join             96s         100s         102s
+    street pages            2,211s         425s         592s
+    overview                    5s           4s           8s
+    TOTAL                  51m 45s      12m 26s      13m 25s
+
+Read those as a history, not a controlled comparison -- each column changed more
+than one thing. The middle one introduced the single multi-window page build
+(--min-drains 1 also skipped 4,989 part-builds carrying no inlet; per page it
+went 0.74s -> 0.11s). The right one turned on --branch-split and --fold-split,
+which took the corpus from 1,688 to 1,900 pages, AS WELL AS coarsening the
+spacing -- so its page step is not slower than 425s because of the spacing.
+
+Isolating the spacing, at identical flags on the same corpus:
+
+                          0.1 m      0.15 m
+    points            12,671,251   8,450,663
+    parquet               461 MB      324 MB
+    street pages            867s        592s
+    pages per corpus      402 MB      296 MB
+
+Livermore the same day, same flags: 11m 56s total, 7,735,119 points, 289.6 MB
+parquet, 2,067 pages per corpus at 320 MB -- against 20m 24s and 438 MB at
+0.1 m. Sag counts moved by single digits either way (893/1,117/1,229 at
+25/10/5 m, against 890/1,115/1,228), which is the point: the smoothing window
+is converted from metres using the spacing measured from the data, so the
+corpora stay what they claim to be at any spacing.
 
 The steps themselves, should you want to run them by hand:
 
@@ -56,15 +97,15 @@ The steps themselves, should you want to run them by hand:
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
     .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv \
-        --city livermore --src streets/overture/livermore.geojson
+        --city livermore
     .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
         --dem-dir dem_livermore
     .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
-        --smooth 25 --outdir Stormdrain_map/livermore/streets_25m
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
-        --smooth 10 --outdir Stormdrain_map/livermore/streets_10m
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
-        --smooth 5  --outdir Stormdrain_map/livermore/streets_5m
+        --jobs 18 --branch-split --fold-split \
+        --smooth 25 10 5 \
+        --outdir Stormdrain_map/livermore/streets_25m \
+                 Stormdrain_map/livermore/streets_10m \
+                 Stormdrain_map/livermore/streets_5m
     .venv/Scripts/python.exe plot_city_overview.py --city livermore \
         --pages Stormdrain_map/livermore/streets_25m --label "25 m" \
         --pages-alt Stormdrain_map/livermore/streets_10m --alt-label "10 m" \
@@ -103,6 +144,27 @@ Source: Overture Maps transportation theme. One source for all 101 cities,
         selected by --cities against city_geojson/.
 
 Writes: streets/overture/<city>.geojson
+        streets/overture/_index.csv      per-city totals
+        streets/overture/_classes.csv    per-city, per-road-class totals
+
+Both index files ACCUMULATE across runs. --cities fetches one city at a time,
+but the two CSVs describe the corpus, so each run merges its rows into what is
+there rather than replacing it -- a Pleasanton fetch used to erase Livermore's
+row. Rows whose .geojson has since been deleted are dropped.
+
+--roads-only keeps the eight classified road classes plus service/alley, and
+drops `link`. A link is usually a ramp, and a ramp is not a street -- but that
+was measured on MOTORWAY links and does not generalise. Across Livermore's 171
+links: motorway 0 of 96 named, trunk 4 of 18, primary 2 of 18, tertiary 1 of 9,
+secondary 1 of 30. The named ones are not ramps at all; they carry a road
+THROUGH a grade-separated interchange, and Overture tags them `link` for the
+geometry rather than the identity. Dropping them severed Vallecitos Road at the
+Isabel Avenue interchange -- it rendered as two blue lines with a hole between
+them -- and did the same to Railroad Avenue, Valley Avenue, Santa Rita Road and
+Olivina Avenue. So a link is kept when it has a display_name: 8 such in
+Livermore, 16 in Pleasanton, zero motorway ramps in either. The original
+justification is untouched, since every segment this adds back has a name by
+construction.
 
 Livermore's own portal layer (Street_Centerline_-_Public, 4,867 features) was
 the baseline the Overture corpus was checked against -- same OBJECTID set, zero
@@ -303,19 +365,30 @@ Writes, all under derived/<city>/:
 
         segments_endpoints.csv       one row per centerline feature
         segments_vertices.csv        one row per native shape vertex
-        segments_points_0p1m.csv     resampled points (--no-csv removes)
-        segments_points_0p1m.parquet same, ~4x smaller
+        segments_points_0p15m.csv     resampled points (--no-csv removes)
+        segments_points_0p15m.parquet same, ~4x smaller
 
---spacing defaults to 0.1 metre (SPACING in that module), which is what the rest
-of the pipeline expects. The interval is in the filename, so corpora at
+--spacing defaults to 0.15 metre (SPACING in that module), which is what the
+rest of the pipeline expects. The interval is in the filename, so corpora at
 different spacings sit side by side instead of overwriting each other, and
 points_path() is the single place that name is built -- every consumer imports
-it rather than hardcoding a path. Pass --spacing 1 for a coarser pass.
+it rather than hardcoding a path. run_pipeline.sh is the one exception: it names
+the parquet as a shell literal, so POINTS there has to change in step with
+SPACING or --render-only will look for a file the build no longer writes. Pass
+--spacing 1 for a coarser pass.
 
-0.1 m is deliberately ~3x finer than the 1 ft DEM grid it will be sampled
-against. That oversamples: neighbouring points are correlated and carry no
-independent elevation information. The reason to do it is horizontal -- placing
-points precisely along the centerline -- not vertical.
+0.15 m is deliberately ~2x finer than the 1 ft (0.3048 m) DEM grid it will be
+sampled against. That still oversamples: neighbouring points are correlated and
+carry no independent elevation information. The reason to do it is horizontal --
+placing points precisely along the centerline -- not vertical.
+
+It was 0.1 m until 2026-08-29, which oversampled ~3x. The measurement that
+argued for coarsening: at 0.1 m, 62.9% of Pleasanton's points shared a DEM cell
+with the point before them (same_cell_as_prev), so nearly two thirds carried no
+new elevation at all. 0.15 m costs two thirds of the points, two thirds of the
+parquet, and two thirds of the per-point work in the page build -- Livermore's
+full rebuild went 20m 24s to 11m 56s and its pages 438 MB to 320 MB per corpus.
+Nothing real is lost until the spacing passes 0.3048 m, one DEM cell.
 
 Both flags matter and neither is the default:
 
@@ -325,16 +398,21 @@ Both flags matter and neither is the default:
              times.
   --parquet  add_elevation.py reads the parquet, not the csv. Without this the
              next step has nothing to open.
-  --no-csv   delete the points csv once --parquet has converted it. At 0.1 m
-             that csv is 358 MB and nothing downstream reads it. Requires
+  --no-csv   delete the points csv once --parquet has converted it. At 0.15 m
+             that csv is ~430 MB and nothing downstream reads it. Requires
              --parquet.
 
 Do NOT pass --points-only: add_elevation.py needs segments_endpoints.csv for
 that attribute join.
 
-Run of 2026-08-25: 6,630,822 points at 0.1 m, from 4,867 centerline features
-(44,230 native vertices). 83.7 MB parquet vs 358.0 MB csv -- the parquet grows
-once add_elevation.py adds its columns.
+Run of 2026-08-29, Livermore: 7,735,119 points at 0.15 m from 8,215 Overture
+centerline features. 97.9 MB parquet vs 431.0 MB csv, growing to 289.6 MB once
+add_elevation.py adds its columns. Pleasanton the same day: 8,450,663 points,
+112.4 MB -> 324.1 MB.
+
+(The 2026-08-25 Livermore figure, for comparison, was 6,630,822 points at 0.1 m
+from 4,867 portal centerline features. Both the spacing and the centerline
+source changed since, so it is not a like-for-like row.)
 
 
 4. Elevation join
@@ -343,10 +421,10 @@ once add_elevation.py adds its columns.
     .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
         --dem-dir dem_livermore
 
-Reads : derived/<city>/segments_points_0p1m.parquet, dem_<city>/*.tif,
+Reads : derived/<city>/segments_points_0p15m.parquet, dem_<city>/*.tif,
         derived/<city>/segments_endpoints.csv
-Writes: derived/<city>/segments_points_0p1m.parquet  (in place, 6 cols -> 21)
-        derived/<city>/segments_points_0p1m.meta.json
+Writes: derived/<city>/segments_points_0p15m.parquet  (in place, 6 cols -> 21)
+        derived/<city>/segments_points_0p15m.meta.json
         dem_<city>/_mosaic.vrt                       rebuilt every run
 
 Adds easting/northing (UTM 10N metres -- the frame every plot works in),
@@ -509,7 +587,7 @@ different sags.
 176 streets differ, and never in the other direction: a shorter window only ever
 keeps more dips, because a longer one averages them away. Neither is the right
 answer. 25 m is the baseline the DEM's own accuracy note argues for (see
-derived/<city>/segments_points_0p1m.meta.json -- adjacent deltas are noise); 10 m
+derived/<city>/segments_points_0p15m.meta.json -- adjacent deltas are noise); 10 m
 catches real but shallow ponding that 25 m flattens, at the cost of promoting
 some noise; 5 m keeps more of both again. The selector exists so they can be
 read against each other rather than one being picked blind. The pipeline builds
@@ -556,7 +634,7 @@ Static renders -- optional, none of the above depends on them:
 
     .venv/Scripts/python.exe plot_street_drains.py --all    -> derived/drains/
     .venv/Scripts/python.exe plot_street_profiles.py        -> derived/profiles/
-    .venv/Scripts/python.exe plot_points_map.py --every 100 -> derived/map_points_0p1m_every100.html
+    .venv/Scripts/python.exe plot_points_map.py --every 100 -> derived/map_points_0p15m_every100.html
     .venv/Scripts/python.exe preview_dem.py                 -> derived/dem_*.png
     .venv/Scripts/python.exe map_street_cells.py --street "AIRWAY BL"
 
