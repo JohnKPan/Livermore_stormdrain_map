@@ -70,6 +70,15 @@ usage: run_pipeline.sh [options]
                    and the overview from the existing derived/ parquet
   --jobs N         render N streets at once (default: cores - 2)
   --no-parallel    same as --jobs 1
+  --fold-split     also split a part that doubles back where the carriageways
+                   form a ring with no junction to cut at -- Del Valle Parkway,
+                   Stoneridge Mall Road. Independent of --branch-split; the two
+                   cover different causes of the same symptom.
+  --branch-split   split a street at every junction of three or more segment
+                   ends, so a divided road that CONVERGES -- Stanley Boulevard,
+                   Hopyard Road, Valley Avenue -- gives one page per carriageway
+                   instead of one page walking out and back again. Costs ~12%
+                   more pages, most of them short stubs at the cut junctions.
   -h, --help       this message
 
 environment:
@@ -86,9 +95,12 @@ EOF
 }
 
 render_only=0
+BRANCH=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --render-only) render_only=1 ;;
+        --branch-split) BRANCH+=(--branch-split) ;;
+        --fold-split)   BRANCH+=(--fold-split) ;;
         --no-parallel) JOBS=1 ;;
         --jobs)        JOBS="$2"; shift ;;
         --jobs=*)      JOBS="${1#*=}" ;;
@@ -140,9 +152,21 @@ if [ -n "${PYTHON:-}" ]; then
 elif [ -x .conda/env/python.exe ]; then
     PY=(.conda/env/python.exe)
     GDAL_DATA=$(native_path "$PWD/.conda/env/Library/share/gdal"); export GDAL_DATA
+    # PATH as well, not just GDAL_DATA. An earlier version of this comment said
+    # activation contributed only that variable -- it was checked by diffing
+    # os.environ for GDAL_DATA and PROJ_LIB, and PATH was never compared.
+    # `micromamba run` also prepends six env directories, and Library/bin is
+    # where the DLLs live. Without it a delay-loaded DLL fails with
+    # 0xC06D007F (ERROR_MOD_NOT_FOUND) and the process dies with no traceback:
+    # add_elevation.py never hit one, matplotlib's tick path in preview_dem.py
+    # does immediately.
+    E="$PWD/.conda/env"
+    PATH="$E:$E/Library/mingw-w64/bin:$E/Library/usr/bin:$E/Library/bin:$E/Scripts:$E/bin:$PATH"
+    export PATH
 elif [ -x .conda/env/bin/python ]; then
     PY=(.conda/env/bin/python)
     GDAL_DATA=$(native_path "$PWD/.conda/env/share/gdal"); export GDAL_DATA
+    PATH="$PWD/.conda/env/bin:$PATH"; export PATH
 elif [ -x .venv/Scripts/python.exe ]; then PY=(.venv/Scripts/python.exe)
 elif [ -x .venv/bin/python ];        then PY=(.venv/bin/python)
 else                                      PY=(python)
@@ -235,8 +259,8 @@ fi
 # them, and three processes each recomputed all of it. plot_street_bokeh.py now
 # takes every window in one pass and parallelises across STREETS instead, which
 # scales with cores rather than being stuck at three.
-step "street pages, ${SMOOTHS[*]} m" "${PY[@]}" plot_street_bokeh.py --all \
-    --city "$CITY" --jobs "$JOBS" \
+step "street pages, ${SMOOTHS[*]} m${BRANCH[*]:+, ${BRANCH[*]}}" "${PY[@]}" plot_street_bokeh.py --all \
+    --city "$CITY" --jobs "$JOBS" "${BRANCH[@]}" \
     --smooth "${SMOOTHS[@]}" --outdir "${DIRS[@]}"
 
 # Last, and it must be: it reads the _index.csv that each page build writes.

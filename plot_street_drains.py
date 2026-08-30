@@ -39,7 +39,7 @@ from pyproj import Transformer
 from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import (SMOOTH_M, chain_segments, build_profile,
                                   merge_components, safe_name, sample_step,
-                                  segs_of, split_components)
+                                  segs_of, split_components, split_folded)
 
 # resolved per --city in main(); this is only the default shown in --help
 POINTS = points_path()
@@ -246,7 +246,7 @@ def find_sags(d, z, run, min_prom, min_sep, edge_m=10.0):
     return sorted(kept, key=lambda t: t[0])
 
 
-def street_parts(st):
+def street_parts(st, branch_split=False, fold_split=False):
     """A street's physically connected runs, ready for prepare().
 
     One entry for an ordinary street; more where a divided road gives a
@@ -254,7 +254,8 @@ def street_parts(st):
     town. Chaining across those produces a profile that doubles back or counts
     kilometres of open country as chainage -- see split_components().
     """
-    return merge_components(split_components(segs_of(st)))
+    parts = merge_components(split_components(segs_of(st), branch_split))
+    return split_folded(parts) if fold_split else parts
 
 
 def prepare_geom(st, inlets, args, segs=None):
@@ -270,7 +271,7 @@ def prepare_geom(st, inlets, args, segs=None):
     """
     if segs is None:
         segs = segs_of(st)
-    e, n, z, disc, run, _, origin = chain_segments(segs)
+    e, n, z, disc, run, _, origin, flags = chain_segments(segs)
     d = np.r_[0.0, np.cumsum(np.hypot(np.diff(e), np.diff(n)))]
     near = snap(inlets, e, n, d, args.max_offset)
     if not near.empty:
@@ -278,7 +279,14 @@ def prepare_geom(st, inlets, args, segs=None):
         # sorted by chainage in snap(), so numbers run 1..N from the start end
         # and read left-to-right on the profile as well as along the map
         near = near.assign(num=np.arange(1, len(near) + 1))
-    return dict(e=e, n=n, z=z, run=run, d=d, near=near, origin=origin)
+    # Per point, not per segment: chaining reverses some segments, so the mask
+    # has to be built after it. `flags` is a comma-joined set, so a segment
+    # that is both covered and a tunnel still matches each test.
+    fl = pd.Series(flags).fillna("").astype(str)
+    return dict(e=e, n=n, z=z, run=run, d=d, near=near, origin=origin,
+                flags=flags,
+                is_bridge=fl.str.contains("is_bridge").to_numpy(),
+                is_tunnel=fl.str.contains("is_tunnel").to_numpy())
 
 
 def prepare_smooth(geom, args, smooth_m=None):
@@ -340,8 +348,13 @@ def prepare_smooth(geom, args, smooth_m=None):
                        near_asset=str(nb.AssetID))
         unserved.append(rec)
 
-    return dict(e=e, n=n, z=z, run=run, d=d, smooth=smooth, near=near,
-                sags=sags, marked=marked, unserved=unserved, origin=origin)
+    # {**geom, ...}: everything prepare_geom() computed carries through, so a
+    # key added there (is_bridge, is_tunnel) reaches the renderer without having
+    # to be threaded through here as well.
+    return {**geom,
+            "e": e, "n": n, "z": z, "run": run, "d": d, "smooth": smooth,
+            "near": near, "sags": sags, "marked": marked,
+            "unserved": unserved, "origin": origin}
 
 
 def prepare(st, inlets, args, segs=None):
@@ -646,6 +659,10 @@ def main():
     ap.add_argument("--street", default="A ST")
     ap.add_argument("--all", action="store_true", help="every street with drains")
     ap.add_argument("--min-drains", type=int, default=1)
+    ap.add_argument("--fold-split", action="store_true",
+                    help="also split a part that doubles back on itself where the carriageways form a ring with no junction to cut at (Del Valle Parkway, Stoneridge Mall Road); implies nothing about --branch-split, which handles the converging case")
+    ap.add_argument("--branch-split", action="store_true",
+                    help="split a street at any junction of three or more segment ends, so converging carriageways reach merge_components() as separate components (see split_components)")
     ap.add_argument("--max-offset", type=float, default=30.0,
                     help="max centerline distance for an inlet to belong (m)")
     ap.add_argument("--no-datum-shift", dest="datum_shift", action="store_false")
@@ -735,7 +752,8 @@ def main():
         for nm in sorted(df.display_name.dropna().unique()):
             sub = df[df.display_name == nm]
             if any(prepare(sub, inlets, args, segs=sg)["unserved"]
-                   for sg in street_parts(sub)):
+                   for sg in street_parts(sub, args.branch_split,
+                                          args.fold_split)):
                 names.append(nm)
         print(f"{len(names)} streets hold at least one unserved sag")
     elif args.all:
@@ -772,7 +790,7 @@ def main():
         if st.empty:
             print(f"No points for {name!r}")
             continue
-        parts = street_parts(st)
+        parts = street_parts(st, args.branch_split, args.fold_split)
         for pi, segs in enumerate(parts, 1):
             label = name if len(parts) == 1 else (
                 "%s %d of %d" % (name, pi, len(parts)))

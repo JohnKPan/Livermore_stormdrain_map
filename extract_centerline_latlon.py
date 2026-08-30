@@ -1,7 +1,7 @@
 """Extract lat/long for Livermore street centerline segments at a chosen resolution.
 
-Input : streets/Street_Centerline_-_Public.geojson (EPSG:4326, LineString), as
-        written by fetch_livermore_street_centerlines.py. Override with --src.
+Input : streets/overture/<city>.geojson (EPSG:4326, LineString), as written by
+        fetch_overture_streets.py. Override with --src.
 
 Default run writes three files to derived/:
     segments_endpoints.csv    - 1 row per centerline feature
@@ -37,10 +37,14 @@ import json
 import math
 import os
 
-# One source of truth for where the centerline lands: the script that writes it.
-from fetch_livermore_street_centerlines import DEFAULT_OUT as SRC
-
 OUTDIR = "derived"
+# Where fetch_overture_streets.py writes, one file per city slug. The --src
+# default is derived from --city rather than fixed, so `--city pleasanton` reads
+# Pleasanton's centerline instead of silently resampling Livermore's. It used to
+# default to streets/Street_Centerline_-_Public.geojson, the deprecated portal
+# export, which was wrong for every city but one and wrong for that one too once
+# the pipeline moved to Overture.
+STREETS_DIR = "streets/overture"
 R = 6371008.8  # mean earth radius, m
 
 # The city is the unit of work. Every derived file lands under derived/<city>/,
@@ -67,13 +71,19 @@ SPACING = 0.1
 #
 # The portal's StreetName/StreetType/PrefixDir/SuffixDir/GlobalID are dropped.
 # They were written to the endpoints and vertices files and read by nothing.
-ATTRS = ["OBJECTID", "display_name", "road_class", "subclass"]
+ATTRS = ["OBJECTID", "display_name", "road_class", "subclass", "road_flags"]
 SLIM_ATTRS = ["OBJECTID", "display_name"]
 
+# `road_flags` is Overture's road_flags, flattened by fetch_overture_streets.py
+# to the set present anywhere on the segment: is_bridge, is_tunnel, is_covered,
+# is_under_construction. It is carried as the raw string rather than a boolean
+# so a tunnel stays distinguishable from a bridge downstream. The portal
+# centerline has no equivalent, so it comes out blank there -- see attrs_of.
 PORTAL_ATTRS = {"display_name": "FullStreetName",
                 "road_class": "FunctionalClass", "subclass": "RoadType"}
 OVERTURE_ATTRS = {"display_name": "display_name",
-                  "road_class": "class", "subclass": "subclass"}
+                  "road_class": "class", "subclass": "subclass",
+                  "road_flags": "flags"}
 
 
 def dist_m(a, b):
@@ -134,7 +144,14 @@ def attrs_of(props, schema, seq):
     """
     m = PORTAL_ATTRS if schema == "portal" else OVERTURE_ATTRS
     oid = props.get("OBJECTID") if schema == "portal" else seq
-    return [oid] + [props.get(m[k]) for k in ATTRS[1:]]
+    # m.get(k), not m[k]: an attribute one schema carries and the other does
+    # not comes out blank rather than raising.
+    return [oid] + [props.get(m[k]) if k in m else None for k in ATTRS[1:]]
+
+
+def src_path(city=DEFAULT_CITY):
+    """The centerline GeoJSON for a city, as fetch_overture_streets.py names it."""
+    return os.path.join(STREETS_DIR, f"{city}.geojson")
 
 
 def city_dir(city=DEFAULT_CITY):
@@ -161,8 +178,9 @@ def vertices_path(city=DEFAULT_CITY):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src", default=SRC,
-                    help=f"input centerline GeoJSON (default {SRC})")
+    ap.add_argument("--src", default=None,
+                    help=f"input centerline GeoJSON "
+                         f"(default {STREETS_DIR}/<city>.geojson)")
     ap.add_argument("--city", default=DEFAULT_CITY,
                     help=f"city slug; outputs land in derived/<city>/ "
                          f"(default {DEFAULT_CITY})")
@@ -182,11 +200,12 @@ def main():
         raise SystemExit("--no-csv only makes sense with --parquet")
 
     here = os.path.dirname(os.path.abspath(__file__))
-    src = os.path.join(here, args.src)
+    src = os.path.join(here, args.src or src_path(args.city))
     if not os.path.exists(src):
         raise SystemExit(
             f"no centerline GeoJSON at {src}\n"
-            "run fetch_livermore_street_centerlines.py first, or pass --src")
+            "run fetch_overture_streets.py --cities <city> --roads-only "
+            "first, or pass --src")
     with open(src, encoding="utf-8-sig") as fh:
         features = json.load(fh)["features"]
 

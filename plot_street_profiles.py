@@ -114,7 +114,7 @@ def path_origin(segs):
     return cand[cand[:, 1].argmax()], "N"
 
 
-def split_components(segs):
+def split_components(segs, branch_split=False):
     """Group a street's segments into physically connected runs, largest first.
 
     A street is not always one path, and chain_segments() assumes it is. Two
@@ -134,8 +134,22 @@ def split_components(segs):
 
     Splitting first means each run gets its own profile, which is also the
     honest unit for drainage: two carriageways drain to their own gutters.
+
+    Neither case covers a divided road that CONVERGES. Stanley Boulevard's two
+    carriageways meet at a real Y where the median ends, so the street is one
+    connected component -- and the alongside test in merge_components(), the
+    only code that recognises a carriageway pair, only ever compares SEPARATE
+    components, so it never sees them. chain_segments() then walks 6.1 km east
+    up one carriageway and 6.1 km back down the other: 12,346 m of path across
+    a 534 m span, the second half of it running backwards.
+
+    branch_split=True refuses to union through a node where three or more
+    segment ends meet. A branch is exactly where a single path cannot carry on,
+    so cutting there hands merge_components() the pieces as separate components
+    and lets it decide: carriageways run alongside and stay apart, a stub that
+    merely touches rejoins.
     """
-    _, _, node = endpoint_nodes(segs)
+    _, deg, node = endpoint_nodes(segs)
     parent = list(range(len(segs)))
 
     def find(a):
@@ -147,6 +161,8 @@ def split_components(segs):
     first_at = {}
     for i in range(len(segs)):
         for end in (2 * i, 2 * i + 1):
+            if branch_split and deg[node[end]] > 2:
+                continue
             j = first_at.setdefault(node[end], i)
             ra, rb = find(i), find(j)
             if ra != rb:
@@ -287,13 +303,30 @@ def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP,
     street interrupted by a park, a freeway or a bridge is still one street.
     See _stroke_continuous(); `stroke_gap=gap` disables the angular test.
 
+    The alongside test is a VETO, and a veto has to survive transitivity. Plain
+    union-find does not give that: where A and C are a carriageway pair and some
+    third piece B passes the test against both, A-B and B-C each union and A-C
+    is fused without ever being asked. Hopyard Road lost its carriageway split
+    exactly that way. So the pairwise pass only COLLECTS verdicts, and the union
+    pass refuses any join that would put a vetoed pair in one group.
+
+    Only alongside vetoes. Too far apart, or not collinear, is no opinion: those
+    two really can turn out to be one road once an intermediate piece supplies
+    the missing middle, and blocking that would strand every street whose parts
+    are only connected through a third.
+
+    Joins are applied closest-first so that when a veto does force a choice, the
+    most confident merge is the one that survives. With no veto in play the
+    order is irrelevant -- union-find yields the same grouping either way.
+
     Returns the same shape as split_components(), largest first.
     """
     stroke_gap = max(stroke_gap, gap)
     if len(comps) < 2:
         return comps
     pts = [_samples(cs) for cs in comps]
-    parent = list(range(len(comps)))
+    n = len(comps)
+    parent = list(range(n))
 
     def find(a):
         while parent[a] != a:
@@ -301,8 +334,9 @@ def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP,
             a = parent[a]
         return a
 
-    for i in range(len(comps)):
-        for j in range(i + 1, len(comps)):
+    joins, veto = [], [set() for _ in range(n)]
+    for i in range(n):
+        for j in range(i + 1, n):
             d = np.hypot(pts[i][:, 0][:, None] - pts[j][:, 0][None, :],
                          pts[i][:, 1][:, None] - pts[j][:, 1][None, :])
             near = float(d.min())
@@ -311,39 +345,62 @@ def merge_components(comps, gap=MERGE_GAP_M, overlap=MERGE_OVERLAP,
             alongside = max((d.min(axis=1) < MERGE_NEAR_M).mean(),
                             (d.min(axis=0) < MERGE_NEAR_M).mean())
             if alongside >= overlap:
-                continue                      # a carriageway pair, or a loop's arms
+                veto[i].add(j)                # a carriageway pair, or a loop's arms
+                veto[j].add(i)
+                continue
             # Close enough to be one road, or far apart but pointing straight at
             # each other. The angular test is only consulted beyond `gap`: under
             # it the pieces are already an intersection apart, and asking for
             # collinearity there would split streets that merely bend.
             if near > gap and not _stroke_continuous(comps[i], comps[j]):
                 continue
-            ra, rb = find(i), find(j)
-            if ra != rb:
-                parent[ra] = rb
+            joins.append((near, i, j))
+
+    members = {i: {i} for i in range(n)}
+    for _, i, j in sorted(joins):
+        ra, rb = find(i), find(j)
+        if ra == rb:
+            continue
+        if any(veto[x] & members[rb] for x in members[ra]):
+            continue                          # would fuse a pair already refused
+        parent[ra] = rb
+        members[rb] |= members.pop(ra)
 
     groups = {}
-    for i in range(len(comps)):
+    for i in range(n):
         groups.setdefault(find(i), []).extend(comps[i])
     return sorted(groups.values(), key=lambda g: -sum(len(x[1]) for x in g))
 
 
 def segs_of(st, key="OBJECTID"):
-    """A street's points, grouped into the per-segment arrays chaining wants."""
+    """A street's points, grouped into the per-segment arrays chaining wants.
+
+    The 6th element is Overture's road_flags -- is_bridge, is_tunnel and so on
+    -- carried per point rather than per segment so it survives chaining, which
+    reorders segments and reverses some of them. A corpus built before the flag
+    was extracted has no such column and gets blanks.
+    """
     segs = []
+    has_flags = "road_flags" in st.columns
     for oid, sg in st.groupby(key, sort=True):
         sg = sg.sort_values("dist_along_m")
+        flags = (sg["road_flags"].astype(object).to_numpy() if has_flags
+                 else np.full(len(sg), None, dtype=object))
         segs.append((oid, sg.easting.to_numpy(), sg.northing.to_numpy(),
-                     sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy()))
+                     sg.elev_m.to_numpy(), sg.elev_disc_cm.to_numpy(), flags))
     return segs
 
 
-def chain_segments(segs):
-    """Greedily order segments into one path, starting at one end of the street.
+def chain_order(segs):
+    """The order and orientation chain_segments() walks a component in.
 
-    segs: list of (oid, e, n, z, disc) arrays, each already ordered along its
-    segment. Returns the concatenated arrays, the gap preceding each, and the
-    compass label of the end the path starts from -- see path_origin.
+    Returns (order, flips, gaps, origin): segment indices in walking order,
+    whether each is reversed to meet the one before it, the hop preceding each,
+    and the compass label of the end the walk starts from -- see path_origin.
+
+    Split out of chain_segments() so split_folded() can map a point index on the
+    chained path back to the segment it came from, which is what lets it cut a
+    fold at a segment boundary rather than mid-segment.
     """
     start, origin = path_origin(segs)
 
@@ -351,7 +408,7 @@ def chain_segments(segs):
     # Seed with whichever endpoint of any segment is closest to that end.
     best, best_d, best_flip = None, np.inf, False
     for i in remaining:
-        _, e, n, _, _ = segs[i]
+        e, n = segs[i][1], segs[i][2]
         for flip, (px, py) in ((False, (e[0], n[0])), (True, (e[-1], n[-1]))):
             d = np.hypot(px - start[0], py - start[1])
             if d < best_d:
@@ -359,13 +416,13 @@ def chain_segments(segs):
 
     order, flips, gaps = [best], [best_flip], [0.0]
     remaining.remove(best)
-    _, e, n, _, _ = segs[best]
+    e, n = segs[best][1], segs[best][2]
     cur = (e[0], n[0]) if best_flip else (e[-1], n[-1])
 
     while remaining:
         pick, pick_d, pick_flip = None, np.inf, False
         for i in remaining:
-            _, e, n, _, _ = segs[i]
+            e, n = segs[i][1], segs[i][2]
             d0 = np.hypot(e[0] - cur[0], n[0] - cur[1])
             d1 = np.hypot(e[-1] - cur[0], n[-1] - cur[1])
             if d0 < pick_d:
@@ -376,24 +433,152 @@ def chain_segments(segs):
         flips.append(pick_flip)
         gaps.append(pick_d)
         remaining.remove(pick)
-        _, e, n, _, _ = segs[pick]
+        e, n = segs[pick][1], segs[pick][2]
         cur = (e[0], n[0]) if pick_flip else (e[-1], n[-1])
 
-    E, N, Z, D, RUN = [], [], [], [], []
+    return order, flips, gaps, origin
+
+
+def chain_segments(segs):
+    """Greedily order segments into one path, starting at one end of the street.
+
+    segs: list of (oid, e, n, z, disc, road_flags) arrays, each already ordered
+    along its segment. Returns the concatenated arrays, the gap preceding each,
+    and the compass label of the end the path starts from -- see path_origin.
+    """
+    order, flips, gaps, origin = chain_order(segs)
+
+    E, N, Z, D, RUN, F = [], [], [], [], [], []
     run = 0
     for k, (i, flip, gap) in enumerate(zip(order, flips, gaps)):
-        _, e, n, z, disc = segs[i]
+        seg = segs[i]
+        _, e, n, z, disc = seg[:5]
+        flags = seg[5] if len(seg) > 5 else np.full(len(e), None, dtype=object)
         if flip:
             e, n, z, disc = e[::-1], n[::-1], z[::-1], disc[::-1]
+            flags = flags[::-1]
         if k and gap > GAP_BREAK_M:
             run += 1
         E.append(e)
         N.append(n)
         Z.append(z)
         D.append(disc)
+        F.append(flags)
         RUN.append(np.full(len(e), run))
     return (np.concatenate(E), np.concatenate(N), np.concatenate(Z),
-            np.concatenate(D), np.concatenate(RUN), gaps, origin)
+            np.concatenate(D), np.concatenate(RUN), gaps, origin,
+            np.concatenate(F))
+
+
+# --- a fold with no junction to cut at ----------------------------------------
+# split_components() cuts where the segment graph BRANCHES, which handles a
+# divided road that converges: Stanley Boulevard's carriageways meet at a
+# degree-4 node where the median ends. It cannot touch a divided road that
+# closes into a RING. Del Valle Parkway's two carriageways are joined end to end
+# by U-turns, so every node is degree 1 or 2 and the street is one unbroken
+# chain -- topologically correct, and chain_segments() duly walks it out 1,044 m
+# and back 1,026 m: 2,070 m of chainage across a 931 m extent, finishing 16 m
+# from where it started.
+#
+# The test that settles it already exists. Cut the chain at the turnaround and
+# ask merge_components' alongside question about the two halves: Del Valle
+# scores 1.00. Nothing ever handed it the halves, because there was no second
+# component to compare against.
+FOLD_RATIO = 1.5          # path along its own axis, over that axis's range
+FOLD_MIN_M = 100.0        # each half must be this long to be worth its own page
+# Higher than MERGE_OVERLAP, deliberately. 0.25 alongside is enough to REFUSE
+# joining two components -- that is the conservative direction, and a wrong
+# refusal costs one extra page. Here we would BREAK APART something the topology
+# says is a single road, so the bar has to be higher. Pleasanton's cul-de-sac
+# bulbs sit at 0.33-0.69 (Carbondale, Melodia, Tonopah, Saginaw, Osborne
+# Circle): the two sides of a small turning circle fall within MERGE_NEAR_M of
+# each other without being carriageways at all. The real rings score 1.00 --
+# Del Valle Parkway, Stoneridge Mall Road, Greige Circle, Lerida Court.
+FOLD_OVERLAP = 0.75
+FOLD_MAX_DEPTH = 3        # a street may fold twice; do not recurse forever
+
+
+def _principal(e, n):
+    """Each point's position along the component's own long axis, in metres."""
+    p = np.column_stack([e - e.mean(), n - n.mean()])
+    q = p[::max(1, len(p) // 4000)]
+    _, _, vt = np.linalg.svd(q - q.mean(axis=0), full_matrices=False)
+    return p @ vt[0]
+
+
+def fold_ratio(e, n):
+    """1.0 for a path that never reverses; 2.0 for one that goes out and back.
+
+    Total variation along the principal axis over that axis's range, so it is
+    independent of how much the street bends -- a curving road that keeps going
+    still scores 1. A closed loop scores 2 as surely as a folded carriageway
+    pair does, which is why the alongside test below has to make the call.
+    """
+    if len(e) < 3:
+        return 1.0
+    t = _principal(e, n)
+    rng = float(np.ptp(t))
+    if rng < 1e-6:
+        return 1.0
+    return float(np.abs(np.diff(t)).sum() / rng)
+
+
+def _alongside(a, b):
+    pa, pb = _samples(a), _samples(b)
+    d = np.hypot(pa[:, 0][:, None] - pb[:, 0][None, :],
+                 pa[:, 1][:, None] - pb[:, 1][None, :])
+    return max(float((d.min(axis=1) < MERGE_NEAR_M).mean()),
+               float((d.min(axis=0) < MERGE_NEAR_M).mean()))
+
+
+def _comp_len(c):
+    return sum(float(np.sum(np.hypot(np.diff(s[1]), np.diff(s[2])))) for s in c)
+
+
+def _split_folded(comp, ratio, overlap, min_len, depth):
+    if depth <= 0 or len(comp) < 2:
+        return [comp]
+    order, flips, _, _ = chain_order(comp)
+    e = np.concatenate([comp[i][1][::-1] if f else comp[i][1]
+                        for i, f in zip(order, flips)])
+    n = np.concatenate([comp[i][2][::-1] if f else comp[i][2]
+                        for i, f in zip(order, flips)])
+    if fold_ratio(e, n) <= ratio:
+        return [comp]
+    t = _principal(e, n)
+    k = int(np.argmax(np.abs(t - t[0])))          # the turnaround
+    # Cut at the SEGMENT boundary that contains it. A part is a set of whole
+    # segments everywhere downstream -- segs_of() groups on OBJECTID and
+    # chain_segments() flips segments entire -- so a mid-segment cut would
+    # produce a part no other function could describe.
+    cuts = np.cumsum([len(comp[i][1]) for i in order])
+    b = int(np.searchsorted(cuts, k, side="right")) + 1
+    if b >= len(order):
+        return [comp]
+    A = [comp[i] for i in order[:b]]
+    B = [comp[i] for i in order[b:]]
+    if _comp_len(A) < min_len or _comp_len(B) < min_len:
+        return [comp]
+    if _alongside(A, B) < overlap:
+        return [comp]                             # a genuine loop, not a pair
+    return (_split_folded(A, ratio, overlap, min_len, depth - 1)
+            + _split_folded(B, ratio, overlap, min_len, depth - 1))
+
+
+def split_folded(comps, ratio=FOLD_RATIO, overlap=FOLD_OVERLAP,
+                 min_len=FOLD_MIN_M, depth=FOLD_MAX_DEPTH):
+    """Split any part that doubles back along its own carriageway pair.
+
+    Runs AFTER merge_components, and on parts rather than components: the fold
+    only exists once the segments have been chained into a path, so there is
+    nothing to measure until then.
+
+    Returns the same shape it was given, largest first.
+    """
+    out = []
+    for c in comps:
+        out.extend(_split_folded(c, ratio, overlap, min_len, depth))
+    return sorted(out, key=lambda g: -sum(len(x[1]) for x in g))
 
 
 def sample_step(d, run):
@@ -428,6 +613,10 @@ def build_profile(e, n, z, run, smooth_m=SMOOTH_M):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--fold-split", action="store_true",
+                    help="also split a part that doubles back on itself where the carriageways form a ring with no junction to cut at (Del Valle Parkway, Stoneridge Mall Road); implies nothing about --branch-split, which handles the converging case")
+    ap.add_argument("--branch-split", action="store_true",
+                    help="split a street at any junction of three or more segment ends, so converging carriageways reach merge_components() as separate components (see split_components)")
     ap.add_argument("--min-length", type=float, default=0.0,
                     help="skip streets shorter than this (m)")
     ap.add_argument("--street", default=None, help="render a single street name")
@@ -460,7 +649,10 @@ def main():
     # groupby drops a NaN key, which is what should happen: a nameless
     # segment has no street to be a page of. See plot_street_bokeh.py.
     for name, grp in df.groupby("display_name", sort=True):
-        comps = merge_components(split_components(segs_of(grp)))
+        comps = merge_components(split_components(segs_of(grp),
+                                                  args.branch_split))
+        if args.fold_split:
+            comps = split_folded(comps)
         for part, segs in enumerate(comps, 1):
             # A street that splits is drawn once per run, and says so:
             # "FIRST ST (2 of 4)" is four real pieces of road, not one
@@ -471,7 +663,7 @@ def main():
             # breaks, rather than resolving to a different road.
             label = name if len(comps) == 1 else (
                 "%s %d of %d" % (name, part, len(comps)))
-            e, n, z, disc, run, gaps, origin = chain_segments(segs)
+            e, n, z, disc, run, gaps, origin, _flags = chain_segments(segs)
             far = OPPOSITE[origin]
             d, smooth = build_profile(e, n, z, run, args.smooth)
             step = sample_step(d, run)

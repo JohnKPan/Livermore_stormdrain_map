@@ -121,7 +121,7 @@ def _render_street(job):
     inlets, args = _WORKER["inlets"], _WORKER["args"]
     st = _WORKER["by_name"][nm]
     out_rows, skipped, failed, msgs = [], 0, 0, []
-    parts = street_parts(st)
+    parts = street_parts(st, args.branch_split, args.fold_split)
     for pi, segs in enumerate(parts, 1):
         entry = plan.get(pi)
         if entry is None:               # part count changed under us: skip
@@ -152,7 +152,7 @@ def _render_street(job):
     return out_rows, skipped, failed, msgs
 
 
-def plan_names(by_name, names):
+def plan_names(by_name, names, branch_split=False, fold_split=False):
     """label and filename for every (street, part), assigned in one serial pass.
 
     This is the shared state a parallel render cannot have. It costs one
@@ -164,7 +164,7 @@ def plan_names(by_name, names):
         st = by_name.get(nm)
         if st is None or st.empty:
             continue
-        n = len(street_parts(st))
+        n = len(street_parts(st, branch_split, fold_split))
         per = {}
         for pi in range(1, n + 1):
             label = nm if n == 1 else ("%s %d of %d" % (nm, pi, n))
@@ -204,8 +204,16 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # because the inlet snapping indexes them with near.path_idx.
     k = draw_stride(d, p["run"], args.draw_spacing)
     p["drawn"] = k
+    # Bridge and tunnel stretches, drawn as their own line over the profile.
+    # NaN outside the stretch: Bokeh breaks a line at NaN, so one glyph draws
+    # every bridge on the street as separate spans without needing one glyph
+    # each. A deck is exactly where a profile's "ground" is not ground, so it is
+    # worth seeing before reading a sag off it.
+    zb = np.where(p.get("is_bridge", np.zeros(len(z), bool)), z, np.nan)
+    zt = np.where(p.get("is_tunnel", np.zeros(len(z), bool)), z, np.nan)
     src = ColumnDataSource(dict(d=d[k], z=z[k], sm=sm[k], mx=mx[k], my=my[k],
-                                lon=lon[k], lat=lat[k]))
+                                lon=lon[k], lat=lat[k],
+                                zb=zb[k], zt=zt[k]))
     cur = ColumnDataSource(dict(d=[d[0]], z=[z[0]], mx=[mx[0]], my=[my[0]]))
 
     # ---------------- profile ----------------
@@ -231,6 +239,20 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                         f"({len(near)} inlets within {args.max_offset:g} m, "
                         f"{smooth_m:g} m smoothing)")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
+    n_bridge = int(np.count_nonzero(np.isfinite(zb)))
+    n_tunnel = int(np.count_nonzero(np.isfinite(zt)))
+    if n_bridge:
+        prof.line("d", "zb", source=src, line_color="#7b3294", line_width=5,
+                  line_alpha=0.55,
+                  legend_label=f"bridge ({n_bridge*SPACING:,.0f} m)")
+    if n_tunnel:
+        prof.line("d", "zt", source=src, line_color="#1b7837", line_width=5,
+                  line_alpha=0.55,
+                  legend_label=f"tunnel ({n_tunnel*SPACING:,.0f} m)")
+    if n_bridge or n_tunnel:
+        prof.legend.location = "top_left"
+        prof.legend.background_fill_alpha = 0.75
+        prof.legend.label_text_font_size = "9pt"
     line_sm = prof.line("d", "sm", source=src, line_color="#33475b",
                         line_width=2)
     prof.scatter("d", "z", source=cur, size=11, marker="circle",
@@ -546,6 +568,10 @@ def main():
     # screen pixel, but the raw samples stay inspectable in the page, which is
     # what this project wants. Pass a spacing in metres to thin the DRAWN line;
     # sags, inlets and the rolling mean are computed on every point regardless.
+    ap.add_argument("--fold-split", action="store_true",
+                    help="also split a part that doubles back on itself where the carriageways form a ring with no junction to cut at (Del Valle Parkway, Stoneridge Mall Road); implies nothing about --branch-split, which handles the converging case")
+    ap.add_argument("--branch-split", action="store_true",
+                    help="split a street at any junction of three or more segment ends, so converging carriageways reach merge_components() as separate components (see split_components)")
     ap.add_argument("--min-drains", type=int, default=1, metavar="N",
                     help="skip pages with fewer than N inlets (default 1). "
                          "43%% of Pleasanton's pages carried no inlet at all "
@@ -647,7 +673,7 @@ def main():
 
     # Names first, serially: the filename counter cannot be shared across
     # processes. Then render, one street per task, every window from one pass.
-    plan = plan_names(by_name, names)
+    plan = plan_names(by_name, names, args.branch_split, args.fold_split)
     jobs = [(nm, plan[nm]) for nm in names if nm in plan]
     rows_by_smooth = {sm: [] for sm in args.smooth}
     failed = skipped = 0

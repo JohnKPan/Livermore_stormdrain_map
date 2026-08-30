@@ -22,7 +22,7 @@ Adds, in place, to derived/segments_points_<spacing>.{parquet,csv}:
     elev_disc_cm         |bilinear - cell|; large values flag a discontinuity
                          such as a curb, wall, or bridge edge
     bearing_deg          local heading, for generating curb offsets later
-    road_class/subclass  joined from the segment attributes
+    road_class/subclass/road_flags  joined from the segment attributes
 
 The DEM
 -------
@@ -90,7 +90,7 @@ HALO = 2
 DERIVED_COLS = ["easting", "northing", "dem_x", "dem_y", "cell_e", "cell_n",
                 "cell_center_dist_m", "same_cell_as_prev", "bearing_deg",
                 "elev_m", "elev_cell_m", "elev_disc_cm", "dem_tile", "dem_res",
-                "road_class", "subclass"]
+                "road_class", "subclass", "road_flags"]
 
 
 def local_bearing(oid, e, n):
@@ -586,7 +586,8 @@ def main():
           + (f"   ({missing:,} outside the DEM)" if missing else ""))
 
     attrs = pd.read_csv(os.path.join(here, endpoints_path(args.city)),
-                        usecols=["OBJECTID", "road_class", "subclass"])
+                        usecols=["OBJECTID", "road_class", "subclass",
+                                 "road_flags"])
     df = df.merge(attrs, on="OBJECTID", how="left")
 
     df = df[base_cols + DERIVED_COLS]
