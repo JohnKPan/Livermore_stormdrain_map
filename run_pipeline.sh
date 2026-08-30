@@ -1,21 +1,26 @@
 #!/usr/bin/env bash
 #
-# Rebuild the Livermore stormdrain study end to end.
+# Rebuild one city's stormdrain study end to end -- --city picks which.
 #
 # This is the command list from readme.txt, in order, with one difference: the
 # page build renders every smoothing window in a single pass and spreads the
 # streets across cores, rather than running one process per window.
 #
-# Everything is reproducible from the three fetches, so a full run needs a
-# network connection and pulls ~6 GB of 1 ft DEM tiles (plus ~1.5 GB of staged
-# fragments -- see fetch_usgs_lidar.py). --render-only skips everything already
-# derived and rebuilds just the deliverable.
+# Everything is reproducible from the four fetches, so a full run needs a
+# network connection and pulls the city's 1 ft DEM tiles -- 8 GB for Livermore,
+# 12 GB for Pleasanton, plus ~1.5 GB of staged fragments (see
+# fetch_usgs_lidar.py). --render-only skips everything already derived and
+# rebuilds just the deliverable.
+#
+# A full run is ~12 min per city on 18 cores once the DEM is cached: fetches
+# under a minute each, resampling ~45s, elevation join ~100s, and the three page
+# corpora together ~9 min, which is the whole cost.
 
 set -euo pipefail
 
 cd "$(dirname "$0")"
 
-# Three page corpora. All read the SAME 0.1 m point corpus and differ only in
+# Three page corpora. All read the SAME 0.15 m point corpus and differ only in
 # the rolling-mean window, so they are named for that window -- the spacing is a
 # property of the whole pipeline now (SPACING in extract_centerline_latlon.py),
 # not of an individual build.
@@ -33,8 +38,9 @@ OPENS_AT=10
 # The city is the unit of work. Everything below derives from it, so a second
 # city collides with nothing and "region-wide" is a loop over the slugs in
 # city_geojson/_index.csv. One at a time is the practical mode regardless:
-# dem_livermore/ alone is 8 GB of 1 ft tiles, so a region-wide run means
-# fetching, processing and deleting a city before starting the next.
+# dem_livermore/ is 8 GB of 1 ft tiles and dem_pleasanton/ is 12 GB, so a
+# region-wide run means fetching, processing and deleting a city before
+# starting the next.
 CITY="${CITY:-livermore}"
 # The USGS OPR collect covering the AOI. It varies by county, and a single
 # hardcoded default is a trap: --city san_jose against Livermore's Alameda
@@ -116,7 +122,7 @@ DIRS=("Stormdrain_map/$CITY/streets_25m"
       "Stormdrain_map/$CITY/streets_10m"
       "Stormdrain_map/$CITY/streets_5m")
 # Must track SPACING in extract_centerline_latlon.py, which names this file.
-POINTS="derived/$CITY/segments_points_0p1m.parquet"
+POINTS="derived/$CITY/segments_points_0p15m.parquet"
 DEM_DIR="dem_$CITY"
 OVERVIEW="Stormdrain_map/$CITY/index.html"
 
@@ -243,7 +249,7 @@ if [ "$render_only" -eq 0 ]; then
         --aoi-file "$AOI" \
         --project "$DEM_PROJECT" --out "./$DEM_DIR" \
         --manifest "${CITY}_tiles.csv"
-    # --no-csv: at 0.1 m the intermediate CSV is ~600 MB and nothing reads it.
+    # --no-csv: at 0.15 m the intermediate CSV is ~470 MB and nothing reads it.
     step "centerline resampling" "${PY[@]}" extract_centerline_latlon.py --slim \
         --parquet --no-csv --city "$CITY" --src "$SRC"
     step "elevation join"        "${PY[@]}" add_elevation.py --no-csv \

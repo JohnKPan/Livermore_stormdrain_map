@@ -6,22 +6,29 @@ Input : streets/overture/<city>.geojson (EPSG:4326, LineString), as written by
 Default run writes three files to derived/:
     segments_endpoints.csv    - 1 row per centerline feature
     segments_vertices.csv     - 1 row per shape vertex (native resolution)
-    segments_points_0p1m.csv  - 1 row per point resampled every 0.1 m
+    segments_points_0p15m.csv - 1 row per point resampled every 0.15 m
 
 The resample interval is in the filename, so corpora at different spacings sit
 side by side rather than overwriting each other. points_path() is the one place
 that name is built; every consumer imports it rather than hardcoding a path.
 
-Spacing is 0.1 m to suit the 1 ft (0.3048 m) OPR DEM the elevations come from.
-That is ~3x finer than the DEM grid, so neighbouring samples are correlated --
-it oversamples deliberately, to place points precisely along the centerline
+Spacing is 0.15 m to suit the 1 ft (0.3048 m) OPR DEM the elevations come from.
+That is ~2x finer than the DEM grid, so neighbouring samples are still correlated
+-- it oversamples deliberately, to place points precisely along the centerline
 rather than to extract detail the DEM does not hold.
 
-At 0.1 m this writes ~6.7 M points, which is a ~600 MB CSV. The pipeline runs
---slim --parquet --no-csv, which streams that CSV, converts it, and removes it.
+It was 0.1 m, which oversampled ~3x: measured on Pleasanton, 62.9% of points at
+0.1 m shared a DEM cell with the point before them and so carried no new
+elevation at all. 0.15 m keeps the oversampling that matters -- a sample still
+lands more often than once per cell -- for two thirds of the points, two thirds
+of the parquet, and two thirds of the per-point work in the page build, which is
+the bulk of a run. Detail is not lost until the spacing passes 0.3048 m.
+
+At 0.15 m this writes ~8.5 M points for Pleasanton, a ~470 MB CSV. The pipeline
+runs --slim --parquet --no-csv, which streams that CSV, converts it, removes it.
 
 Usage:
-    python extract_centerline_latlon.py                   # endpoints + vertices + 0.1 m
+    python extract_centerline_latlon.py                   # endpoints + vertices + 0.15 m
     python extract_centerline_latlon.py --slim --parquet --no-csv   # the pipeline
     python extract_centerline_latlon.py --spacing 1       # coarser resample
     python extract_centerline_latlon.py --points-only
@@ -55,7 +62,9 @@ DEFAULT_CITY = "livermore"
 
 # Default resample interval, metres. Matched to the 1 ft OPR DEM -- see the
 # module docstring. Consumers import this so the whole pipeline moves together.
-SPACING = 0.1
+# run_pipeline.sh is the one place that does NOT import it: it names the parquet
+# in shell, and that literal has to be changed in step with this.
+SPACING = 0.15
 
 # One normalised column set, whatever the source. The portal centerline and an
 # Overture city file carry the same facts under different names:
@@ -117,7 +126,7 @@ def interpolate(coords, cum, target):
 
 
 def label(spacing):
-    """Filename suffix: 10m, 1m, 0p5m, 0p1m."""
+    """Filename suffix: 10m, 1m, 0p5m, 0p15m, 0p1m."""
     s = f"{spacing:g}".replace(".", "p")
     return f"{s}m"
 
@@ -194,7 +203,7 @@ def main():
                     help="skip the endpoints and vertices files")
     ap.add_argument("--no-csv", action="store_true",
                     help="delete the points CSV once --parquet has converted it; "
-                         "at 0.1 m spacing that CSV is ~600 MB and nothing reads it")
+                         "at 0.15 m spacing that CSV is ~470 MB and nothing reads it")
     args = ap.parse_args()
     if args.no_csv and not args.parquet:
         raise SystemExit("--no-csv only makes sense with --parquet")

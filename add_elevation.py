@@ -11,8 +11,10 @@ Adds, in place, to derived/segments_points_<spacing>.{parquet,csv}:
                          identifies a cell independently of which tile it is in
     cell_center_dist_m   how far the point sits from that cell's center, metres
     same_cell_as_prev    True when the previous point on the segment shares the
-                         cell -- at 0.1 m spacing on a 0.3 m grid this is the
-                         common case, and those pairs carry no new elevation
+                         cell -- at 0.15 m spacing on a 0.3 m grid this is still
+                         common, and those pairs carry no new elevation. It ran
+                         62.9% at the old 0.1 m spacing, which is what argued
+                         for coarsening it
     dem_tile             source tile
     dem_res              that tile's native resolution in METRES -- comparable
                          across projections, and above mosaic_res_m wherever a
@@ -634,7 +636,7 @@ def main():
             "relative_vertical_measured": "~1.2-2 cm RMS locally, measured on straight paved segments (1 m product)",
             "horizontal_registration_measured": "centerline vs road crown: mean offset -0.06 m, std 1.13 m",
             "gradient_guidance": ("compute grades over >=25 m baselines; adjacent samples are "
-                                  "noise-dominated, and at 0.1 m spacing on a 0.3 m grid "
+                                  "noise-dominated, and at 0.15 m spacing on a 0.3 m grid "
                                   "neighbouring samples are correlated as well"),
         },
         "columns": {
