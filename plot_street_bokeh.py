@@ -211,9 +211,18 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # worth seeing before reading a sag off it.
     zb = np.where(p.get("is_bridge", np.zeros(len(z), bool)), z, np.nan)
     zt = np.where(p.get("is_tunnel", np.zeros(len(z), bool)), z, np.nan)
+    # The same masks in map space, so the plan view marks a deck too. A bridge
+    # is worth seeing on BOTH panels: on the profile it says the ground is not
+    # ground, and on the map it says which crossing that is.
+    mxb = np.where(np.isfinite(zb), mx, np.nan)
+    myb = np.where(np.isfinite(zb), my, np.nan)
+    mxt = np.where(np.isfinite(zt), mx, np.nan)
+    myt = np.where(np.isfinite(zt), my, np.nan)
     src = ColumnDataSource(dict(d=d[k], z=z[k], sm=sm[k], mx=mx[k], my=my[k],
                                 lon=lon[k], lat=lat[k],
-                                zb=zb[k], zt=zt[k]))
+                                zb=zb[k], zt=zt[k],
+                                mxb=mxb[k], myb=myb[k],
+                                mxt=mxt[k], myt=myt[k]))
     cur = ColumnDataSource(dict(d=[d[0]], z=[z[0]], mx=[mx[0]], my=[my[0]]))
 
     # ---------------- profile ----------------
@@ -280,6 +289,14 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # Gray Canvas is key-free and plays the same muted-backdrop role.
     mp.add_tile(xyz.Esri.WorldGrayCanvas)
     mp.line("mx", "my", source=src, line_color="#12263a", line_width=2)
+    # Same colours as the profile overlay, drawn over the centerline. NaN
+    # outside the stretch breaks the line, so one glyph covers every span.
+    if n_bridge:
+        mp.line("mxb", "myb", source=src, line_color="#7b3294", line_width=6,
+                line_alpha=0.7)
+    if n_tunnel:
+        mp.line("mxt", "myt", source=src, line_color="#1b7837", line_width=6,
+                line_alpha=0.7)
     # Fat transparent line as the hover target. A scatter target fails here:
     # at 3 m spacing the markers are sub-pixel on screen, so one hover lands on
     # a dozen of them and the tooltip becomes a stack of near-identical rows.

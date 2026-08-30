@@ -1,6 +1,6 @@
 """City-wide index map over the per-street pages from plot_street_bokeh.py.
 
-Draws every Livermore centerline on one Esri Gray Canvas map, coloured by functional
+Draws every centerline of one city on an Esri Gray Canvas map, coloured by functional
 class or by the street's sag count -- a radio button on the page switches
 between the two, and --color-by picks which one it opens on. Tapping a street
 -- or picking one from the search box -- loads that street's existing
@@ -33,6 +33,7 @@ Usage:
 """
 
 import argparse
+import csv
 import os
 
 import numpy as np
@@ -65,10 +66,28 @@ MAP_W, MAP_H = 1240, 700
 FRAME_W, FRAME_H = 1240, 1320
 HIT_W = 12                # invisible fat line under each class, for hit testing
 
-TITLE = ("Livermore street centerline — tap a street to load its profile and "
-         "drainage map below")
-TITLE_SAG = ("Livermore streets by sag count — tap a street to load its "
-             "profile and drainage map below")
+# Set from --city in main(). They were hardcoded to Livermore, so every
+# Pleasanton page was captioned "Livermore street centerline".
+TITLE = ""
+TITLE_SAG = ""
+NAME = ""
+
+
+def city_name(here, slug):
+    """A city's display name, from the boundary index that already carries it.
+
+    san_jose -> "San Jose", which slug.title() would render "San_Jose". Falls
+    back to the slug if the index is missing or does not list it.
+    """
+    path = os.path.join(here, "city_geojson", "_index.csv")
+    try:
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                if row.get("slug") == slug:
+                    return row.get("name") or slug
+    except OSError:
+        pass
+    return slug.replace("_", " ").title()
 
 # Arterials and freeways read as the skeleton of the city; the Local mesh is
 # the background it sits on. Ramps stay thin so interchanges do not blob.
@@ -195,6 +214,15 @@ def main():
                          "and switchable on the page itself")
     args = ap.parse_args()
     sag_first = args.color_by == "sags"
+
+    # Captions name the city being drawn. Module globals rather than threaded
+    # arguments because the figure builders below already read them by name.
+    global TITLE, TITLE_SAG, NAME
+    NAME = city_name(os.path.dirname(os.path.abspath(__file__)), args.city)
+    TITLE = (f"{NAME} street centerline — tap a street to load its profile "
+             f"and drainage map below")
+    TITLE_SAG = (f"{NAME} streets by sag count — tap a street to load its "
+                 f"profile and drainage map below")
 
     # Primary first: it is the one the page opens on, and the one whose inlet
     # counts and lengths are used -- neither depends on the smoothing window.
@@ -568,7 +596,7 @@ def main():
     body.append(frame)
     doc.add_root(column(*body))
     doc.js_on_event(DocumentReady, ready)
-    output_file(out, title="Livermore stormdrain — street index", mode="cdn")
+    output_file(out, title=f"{NAME} stormdrain — street index", mode="cdn")
     save(doc)
     n_seg = sum(len(s.data["xs"]) for s in srcs)
     print(f"{n_seg:,} segments over {len(names):,} pages -> {out}  "
