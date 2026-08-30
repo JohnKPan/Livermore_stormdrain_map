@@ -24,15 +24,27 @@ the wrong city:
 Slugs are lowercase, matching city_geojson/. `--city Pleasanton` fails on the
 AOI lookup; `--city pleasanton` works.
 
-That script is the list below, in order, with the three page builds run at the
-same time -- they are independent, so the render step costs one build instead of
-three. --no-parallel puts them back to back. It picks the conda env if .conda/
-exists, then the venv, then whatever is on PATH.
+That script is the list below, in order, with one difference: the page build is
+ONE process covering every smoothing window, spread across cores. The windows
+share a pass over each street -- chaining, the chainage axis and the inlet snap
+do not depend on the window -- so three processes were recomputing all of it.
+--jobs sets the width, defaulting to cores - 2; --no-parallel means --jobs 1.
+It picks the conda env if .conda/ exists, then the venv, then whatever is on PATH.
 
-Measured on Pleasanton (2,995 streets, 8,526 segments), full rebuild 51m 45s:
-boundaries and centerline under a minute, inlets 17s, DEM tiles 11m, resampling
-1m, elevation join 1m 36s, three page corpora together 37m, overview 5s. The DEM
-download and the page builds are the whole cost; everything else is noise.
+Measured on Pleasanton twice, same machine:
+
+                        2026-08-27   2026-08-29
+    centerline                50s          44s
+    inlets                    17s         122s   (Livermore retry backoff)
+    DEM tiles                669s           5s   (cached, not comparable)
+    resampling                57s          43s
+    elevation join            96s         100s
+    street pages           2,211s         425s
+    overview                   5s           4s
+    TOTAL                 51m 45s      12m 26s
+
+The page step did less work as well as less per page: --min-drains 1 skipped
+4,989 part-builds carrying no inlet. Per page it is 0.74s -> 0.11s.
 
 The steps themselves, should you want to run them by hand:
 
@@ -63,17 +75,17 @@ The first four pull every external input; the rest derive everything else from
 them. Nothing has to be downloaded by hand. Sections below document each step,
 then the optional static renders.
 
-The three plot_street_bokeh.py runs differ only in the elevation smoothing
-window and where they write. All three corpora are kept, and the overview's
-selector switches between them, opening at 10 m -- see section 5.
+--smooth takes several windows and --outdir one directory each. All three
+corpora are kept, and the overview's selector switches between them, opening at
+10 m -- see section 5.
 
 (Plain `python fetch_inlets.py --all` works too if the venv is activated -- the
 explicit interpreter path just avoids depending on that.)
 
 Order matters in exactly two places: add_elevation.py needs the parquet that
 extract_centerline_latlon.py writes, and plot_city_overview.py needs the
-_index.csv that EACH plot_street_bokeh.py --all run writes -- one per smoothing
-window, all three before the overview.
+_index.csv the page build writes -- one per smoothing window, all three before
+the overview.
 
 All four fetches are safe to re-run. Boundaries, centerline and inlets overwrite
 their outputs; fetch_usgs_lidar.py skips tiles already fully downloaded, resumes
@@ -96,8 +108,15 @@ Livermore's own portal layer (Street_Centerline_-_Public, 4,867 features) was
 the baseline the Overture corpus was checked against -- same OBJECTID set, zero
 differing property values, coordinates identical to the last decimal. It is no
 longer a pipeline step: one fetch that works everywhere beat two that disagree
-about which city they serve. fetch_livermore_street_centerlines.py is still in
-the tree for that comparison, and nothing calls it.
+about which city they serve. fetch_livermore_street_centerlines.py is
+DEPRECATED: kept for that comparison, called by nothing, and imported by
+nothing since extract_centerline_latlon.py took over the SRC path it exported.
+It is also the only schema with no road_flags, so a corpus built from it cannot
+mark bridges (section 5).
+
+fetch_livermore_inlets.py is DEPRECATED the same way -- `fetch_inlets.py
+livermore` fetches the same layer with domain decoding, retry backoff and a
+`source` column.
 
 
 1. Storm drain inlets

@@ -1,4 +1,13 @@
-"""Fetch all storm drain inlets from Livermore's public ArcGIS FeatureServer.
+"""DEPRECATED -- use `python fetch_inlets.py livermore` instead.
+
+Superseded in full. fetch_inlets.py fetches the same layer with the same
+canonical field names, and adds what this script never had: coded-domain
+decoding, an OID high-water-mark fallback for servers that ignore resultOffset,
+retry with backoff for the resets this host throws under load, and a `source`
+column so several cities can share one file. Nothing in the pipeline calls this
+any more; it is kept only so the original single-city fetch stays readable.
+
+Fetch all storm drain inlets from Livermore's public ArcGIS FeatureServer.
 
 Layer 2 = Inlet (active). Outputs lat/lon in WGS84 to match the street
 centerline data already in derived/.

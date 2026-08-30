@@ -28,7 +28,11 @@ import urllib.request
 # The script that writes the centerline owns its path; importing it keeps the
 # two from drifting apart -- they already did once, when the file moved into
 # streets/ and this bbox lookup kept pointing at the old location.
-from fetch_livermore_street_centerlines import DEFAULT_OUT as SRC_GEOJSON
+from extract_centerline_latlon import DEFAULT_CITY, src_path
+
+# The default city's centerline, only as the --centerline default;
+# --bbox skips it entirely and any GeoJSON works via --centerline.
+SRC_GEOJSON = src_path(DEFAULT_CITY)
 
 TNM_API = "https://tnmaccess.nationalmap.gov/api/v1/products"
 DATASET = "Digital Elevation Model (DEM) 1 meter"
@@ -168,7 +172,7 @@ def main():
         if not os.path.exists(src):
             raise SystemExit(
                 f"no centerline GeoJSON at {src}\n"
-                "run fetch_livermore_street_centerlines.py first, or pass"
+                "run fetch_overture_streets.py first, or pass"
                 " --centerline / --bbox")
         bbox = data_bbox(src, args.buffer)
     print("bbox  : " + ", ".join(f"{v:.6f}" for v in bbox))

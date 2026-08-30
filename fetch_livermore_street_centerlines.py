@@ -1,4 +1,17 @@
-"""Fetch the Livermore street centerline from the city's public ArcGIS service.
+"""DEPRECATED -- use `python fetch_overture_streets.py --cities <city>
+--roads-only` instead.
+
+One source that works for all 101 cities beat two that disagree about which
+city they serve. This layer was the baseline the Overture corpus was checked
+against -- same OBJECTID set, zero differing property values, coordinates
+identical to the last decimal -- and it is kept for that comparison alone.
+
+It is also the ONLY schema with no road_flags, so a corpus built from it cannot
+mark bridges or tunnels on a profile. See extract_centerline_latlon.py, which
+now owns the SRC path constant this script used to export, so nothing imports
+from here.
+
+Fetch the Livermore street centerline from the city's public ArcGIS service.
 
 Layer 1 of Street_Centerline_-_Public, written as GeoJSON in WGS84 -- the input
 extract_centerline_latlon.py reads. Discovered from the open data portal:

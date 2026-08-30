@@ -1,7 +1,7 @@
 # Livermore stormdrain pipeline dependencies.
 #
-# The fetch scripts need none of this -- fetch_inlets.py, fetch_dem.py and
-# fetch_livermore_street_centerlines.py are pure stdlib (json/csv/math/urllib), as is
+# The fetch scripts need none of this -- fetch_inlets.py and fetch_dem.py are
+# pure stdlib (json/csv/math/urllib), as is
 # the core of extract_centerline_latlon.py (pandas only for --parquet). So the
 # data can be pulled on a bare interpreter; the stack below is for everything
 # that reads it.
