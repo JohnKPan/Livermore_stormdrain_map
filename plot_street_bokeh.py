@@ -585,10 +585,15 @@ def main():
     # screen pixel, but the raw samples stay inspectable in the page, which is
     # what this project wants. Pass a spacing in metres to thin the DRAWN line;
     # sags, inlets and the rolling mean are computed on every point regardless.
-    ap.add_argument("--fold-split", action="store_true",
-                    help="also split a part that doubles back on itself where the carriageways form a ring with no junction to cut at (Del Valle Parkway, Stoneridge Mall Road); implies nothing about --branch-split, which handles the converging case")
-    ap.add_argument("--branch-split", action="store_true",
-                    help="split a street at any junction of three or more segment ends, so converging carriageways reach merge_components() as separate components (see split_components)")
+    # Both ON by default. They were opt-in while they were new, but every city
+    # ever built here used them, so the default reproduced a shape nobody
+    # wanted: a divided road chained into one profile that walks out and comes
+    # back, with half its chainage running backwards. Negative flags rather
+    # than a silent flip, so the escape hatch stays and --help shows it.
+    ap.add_argument("--no-fold-split", dest="fold_split", action="store_false",
+                    help="do NOT split a part that doubles back on itself where the carriageways form a ring with no junction to cut at (Del Valle Parkway, Stoneridge Mall Road); independent of --no-branch-split, which covers the converging case")
+    ap.add_argument("--no-branch-split", dest="branch_split", action="store_false",
+                    help="do NOT split a street at junctions of three or more segment ends; converging carriageways then never reach merge_components() as separate components and stay merged (see split_components)")
     ap.add_argument("--min-drains", type=int, default=1, metavar="N",
                     help="skip pages with fewer than N inlets (default 1). "
                          "43%% of Pleasanton's pages carried no inlet at all "
