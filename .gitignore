@@ -46,7 +46,9 @@ livermore_download.log
 # Same, per city: run_pipeline.sh --city <slug> writes dem_<slug>/ and
 # <slug>_tiles.csv. Pleasanton alone is 12 GB over 414 tiles.
 dem_*/
-*_tiles.csv
+# *_tiles*.csv, not *_tiles.csv: a city needing two collects writes one
+# manifest each, as <slug>_tiles_<project>.csv (see DEM_PROJECTS).
+*_tiles*.csv
 *_download.log
 
 # conda-forge environment. Only needed to mosaic collects that sit in DIFFERENT

@@ -27,11 +27,27 @@ not.
 
 Everything runs from the project root. One command runs the lot:
 
-    bash run_pipeline.sh --city livermore                 full rebuild
-    bash run_pipeline.sh --city livermore --render-only   rebuild pages only
+    python run_pipeline.py --city livermore                 full rebuild
+    python run_pipeline.py --city livermore --render-only   rebuild pages only
 
-It is a bash script, so on Windows run it from Git Bash -- `bash run_pipeline.sh`
-rather than PowerShell or cmd. --city defaults to livermore; it is spelled out
+Use the PYTHON one. run_pipeline.sh is the original and still works, but only
+from Git Bash, and picking the wrong shell fails in ways that look like anything
+but a shell problem. On this machine PowerShell resolves `bash` to WSL, not Git
+Bash; WSL then runs the script under Linux, correctly selects
+.conda/env/python.exe (drvfs marks every .exe executable), and launches that
+Windows interpreter through interop -- but WSL has no cygpath, so GDAL_DATA gets
+exported as /mnt/d/... and the Windows process cannot read it. The error that
+surfaces is "GDAL_DATA is not defined", which sends you looking at GDAL.
+
+run_pipeline.py has no shell in the loop and is stdlib-only, so it starts under
+ANY interpreter -- including the wrong one on PATH -- and then runs every step
+with .conda/env/python.exe. It works from PowerShell, cmd or Git Bash unchanged,
+and its paths are native by construction, so there is no cygpath step left to
+get wrong. Verified against run_pipeline.sh on Hayward: identical file names,
+zero differences across 8,904 index rows and 13 computed columns, and pages
+identical once Bokeh's per-run UUID and model-id counter are normalised.
+
+--city defaults to livermore; it is spelled out
 above because everything derives from it, and getting it wrong silently builds
 the wrong city:
 
@@ -58,36 +74,42 @@ Everything it decides for you, and how to override it:
     DEM collect     per-city registry    DEM_PROJECT= in the env wins; unknown
                                          cities derive one from the AOI, finest
                                          resolution, ties broken by coverage
-    splitting       OFF                  --branch-split, --fold-split
+    splitting       branch + fold ON     --no-branch-split, --no-fold-split
     scope           full rebuild         --render-only
 
 Everything else is derived from CITY and changes with it -- derived/<city>/,
 dem_<city>/, Stormdrain_map/<city>/, city_geojson/<city>.geojson -- so the one
 setting worth being deliberate about is --city.
 
-Two of those defaults are worth a second look before a real build. The DEM
-registry only knows livermore, pleasanton and san_jose; any other city derives
-its collect from the AOI, and that derivation is checked against the AOI before
-the download starts but is still a guess. And the splitting flags are OFF, so a
-default run reproduces the divided-road folding they exist to fix -- the
-published builds were both made WITH them.
+One of those defaults is worth a second look before a real build: the DEM
+registry knows livermore, pleasanton, fremont, hayward and san_jose, and any
+other city derives its collect from the AOI. That derivation is checked against
+the AOI before the download starts, but it is still a guess.
 
-Two optional flags change how a street is cut into pages. Both address the same
-symptom -- a divided road chained into one profile that walks out and comes back,
-so half its chainage runs backwards -- from different causes, and both are off by
-default:
+Two flags change how a street is cut into pages, and both are ON. They address
+the same symptom -- a divided road chained into one profile that walks out and
+comes back, so half its chainage runs backwards -- from different causes:
 
-  --branch-split  cut at any junction of three or more segment ends. Handles a
-                  divided road that CONVERGES: Stanley Boulevard's carriageways
-                  meet at a Y where the median ends, so the street is one
-                  connected component and the carriageway test in
-                  merge_components() -- which only ever compares separate
-                  components -- never sees it. Costs ~12% more pages, most of
-                  them short stubs at the junctions it cuts.
-  --fold-split    cut a part that doubles back where the carriageways form a
-                  RING with no junction to cut at. Del Valle Parkway's are
-                  joined end to end by U-turns, so every node is degree 2 and
-                  --branch-split cannot reach it. Costs ~12 pages on Pleasanton.
+  --no-branch-split  turns off cutting at junctions of three or more segment
+                  ends. That cut is what handles a divided road which
+                  CONVERGES: Stanley Boulevard's carriageways meet at a Y where
+                  the median ends, so the street is one connected component and
+                  the carriageway test in merge_components() -- which only ever
+                  compares separate components -- never sees it. The cut costs
+                  ~12% more pages, most of them short stubs at the junctions.
+  --no-fold-split turns off cutting a part that doubles back where the
+                  carriageways form a RING with no junction to cut at. Del
+                  Valle Parkway's are joined end to end by U-turns, so every
+                  node is degree 2 and the branch cut cannot reach it. ~12 pages
+                  on Pleasanton.
+
+They were opt-in while they were new. Every city built here used them, so the
+old default reproduced exactly the bug they exist to fix, and it is now
+inverted: negative flags rather than a silent flip, so the escape hatch stays
+and --help shows it. The library defaults moved with the CLI --
+split_components(branch_split=True), street_parts(branch_split=True,
+fold_split=True) -- so a direct caller gets the same geometry as a command line
+rather than quietly getting the old shape.
 
 Together on Pleasanton they take the path length sitting inside a folded part
 from 447 km to 144 km, for 1,688 pages to 1,900. What remains folded is mostly
@@ -109,7 +131,8 @@ Measured on Pleasanton, same machine, 18 jobs:
 Read those as a history, not a controlled comparison -- each column changed more
 than one thing. The middle one introduced the single multi-window page build
 (--min-drains 1 also skipped 4,989 part-builds carrying no inlet; per page it
-went 0.74s -> 0.11s). The right one turned on --branch-split and --fold-split,
+went 0.74s -> 0.11s). The right one turned on branch and fold splitting (opt-in flags then,
+on by default now),
 which took the corpus from 1,688 to 1,900 pages, AS WELL AS coarsening the
 spacing -- so its page step is not slower than 425s because of the spacing.
 
@@ -130,24 +153,24 @@ corpora stay what they claim to be at any spacing.
 
 The steps themselves, should you want to run them by hand:
 
-    .venv/Scripts/python.exe fetch_city_boundaries.py --buffer-miles 2
-    .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
-    .venv/Scripts/python.exe fetch_inlets.py --all
-    .venv/Scripts/python.exe fetch_usgs_lidar.py \
+    .conda/env/python.exe fetch_city_boundaries.py --buffer-miles 2
+    .conda/env/python.exe fetch_overture_streets.py --cities livermore --roads-only
+    .conda/env/python.exe fetch_inlets.py --all
+    .conda/env/python.exe fetch_usgs_lidar.py \
         --aoi-file city_geojson/livermore.geojson \
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet --no-csv \
+    .conda/env/python.exe extract_centerline_latlon.py --slim --parquet --no-csv \
         --city livermore
-    .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
+    .conda/env/python.exe add_elevation.py --no-csv --city livermore \
         --dem-dir dem_livermore
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
-        --jobs 18 --branch-split --fold-split \
+    .conda/env/python.exe plot_street_bokeh.py --all --city livermore \
+        --jobs 18 \
         --smooth 25 10 5 \
         --outdir Stormdrain_map/livermore/streets_25m \
                  Stormdrain_map/livermore/streets_10m \
                  Stormdrain_map/livermore/streets_5m
-    .venv/Scripts/python.exe plot_city_overview.py --city livermore \
+    .conda/env/python.exe plot_city_overview.py --city livermore \
         --pages Stormdrain_map/livermore/streets_25m --label "25 m" \
         --pages-alt Stormdrain_map/livermore/streets_10m --alt-label "10 m" \
         --pages-alt Stormdrain_map/livermore/streets_5m --alt-label "5 m" \
@@ -179,7 +202,7 @@ writes all 101 cities at once.
 0. Street centerline
 --------------------
 
-    .venv/Scripts/python.exe fetch_overture_streets.py --cities livermore --roads-only
+    .conda/env/python.exe fetch_overture_streets.py --cities livermore --roads-only
 
 Source: Overture Maps transportation theme. One source for all 101 cities,
         selected by --cities against city_geojson/.
@@ -225,7 +248,7 @@ livermore` fetches the same layer with domain decoding, retry backoff and a
 1. Storm drain inlets
 ---------------------
 
-    .venv/Scripts/python.exe fetch_inlets.py --all
+    .conda/env/python.exe fetch_inlets.py --all
 
 Source: one vetted ArcGIS layer per city, see fetch_inlets.py --list.
         livermore   gisweb.cityoflivermore.net  ...StormStructures/FeatureServer/2
@@ -261,7 +284,7 @@ sources sit on one datum. Pass --no-datum-shift to see raw values.
 2. Lidar DEM tiles
 ------------------
 
-    .venv/Scripts/python.exe fetch_usgs_lidar.py \
+    .conda/env/python.exe fetch_usgs_lidar.py \
         --aoi-file city_geojson/livermore.geojson \
         --project CA_AlamedaCounty_2021_B21 --out ./dem_livermore \
         --manifest livermore_tiles.csv
@@ -287,7 +310,7 @@ expect of two derivatives of the same collect.
 
 --aoi-file takes the bbox from the buffered city polygon, which is the same AOI
 the plotters clip inlets to, so the DEM cannot end up narrower than the streets
-it has to cover. Reading it needs geopandas -- see requirements.txt.
+it has to cover. Reading it needs geopandas -- see environment.yml.
 
 There is also a named --aoi livermore preset, no longer used by the pipeline. It
 was widened on 2026-08-25 from (-121.82, 37.63, -121.68, 37.73) to
@@ -355,7 +378,7 @@ reproject and neither can gdalbuildvrt, so that path uses gdal.Warp, and GDAL
 has no Windows wheel on PyPI at any version. See environment.yml:
 
     .conda/micromamba.exe create -y -p .conda/env -f environment.yml
-    bash run_pipeline.sh --city livermore    # picks the env up automatically
+    python run_pipeline.py --city livermore  # picks the env up automatically
 
 Everything else still runs in the uv venv exactly as before -- the same-CRS VRT
 is written by rasterio alone and is byte-for-byte what it always was. Only a
@@ -397,7 +420,7 @@ back to 100% valid.
 3. Centerline resampling
 ------------------------
 
-    .venv/Scripts/python.exe extract_centerline_latlon.py --slim --parquet \
+    .conda/env/python.exe extract_centerline_latlon.py --slim --parquet \
         --no-csv --city livermore --src streets/overture/livermore.geojson
 
 Source: streets/overture/<city>.geojson (step 0; --src overrides)
@@ -459,7 +482,7 @@ source changed since, so it is not a like-for-like row.)
 4. Elevation join
 -----------------
 
-    .venv/Scripts/python.exe add_elevation.py --no-csv --city livermore \
+    .conda/env/python.exe add_elevation.py --no-csv --city livermore \
         --dem-dir dem_livermore
 
 Reads : derived/<city>/segments_points_0p15m.parquet, dem_<city>/*.tif,
@@ -517,7 +540,7 @@ than the grid's own noise floor. So the threshold did not need rescaling.
 
 The deliverable -- interactive, one page per street plus a city-wide picker:
 
-    .venv/Scripts/python.exe plot_street_bokeh.py --all --city livermore \
+    .conda/env/python.exe plot_street_bokeh.py --all --city livermore \
         --smooth 25 --outdir Stormdrain_map/livermore/streets_25m
 
     (and again at --smooth 10 and --smooth 5, then plot_city_overview.py --city
@@ -673,11 +696,11 @@ paths and therefore their profiles.)
 
 Static renders -- optional, none of the above depends on them:
 
-    .venv/Scripts/python.exe plot_street_drains.py --all    -> derived/drains/
-    .venv/Scripts/python.exe plot_street_profiles.py        -> derived/profiles/
-    .venv/Scripts/python.exe plot_points_map.py --every 100 -> derived/map_points_0p15m_every100.html
-    .venv/Scripts/python.exe preview_dem.py                 -> derived/dem_*.png
-    .venv/Scripts/python.exe map_street_cells.py --street "AIRWAY BL"
+    .conda/env/python.exe plot_street_drains.py --all    -> derived/drains/
+    .conda/env/python.exe plot_street_profiles.py        -> derived/profiles/
+    .conda/env/python.exe plot_points_map.py --every 100 -> derived/map_points_0p15m_every100.html
+    .conda/env/python.exe preview_dem.py                 -> derived/dem_*.png
+    .conda/env/python.exe map_street_cells.py --street "AIRWAY BL"
 
 plot_street_drains.py --all is the PNG twin of the interactive pages -- same
 analysis, same numbers, ~580 MB of images. --unserved-only narrows it to the

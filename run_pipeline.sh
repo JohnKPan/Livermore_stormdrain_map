@@ -1,5 +1,36 @@
 #!/usr/bin/env bash
 #
+# DEPRECATED -- use `python run_pipeline.py` instead.
+#
+# Superseded in full: run_pipeline.py runs the same steps in the same order with
+# the same defaults, and was checked against this script on Hayward -- identical
+# file names across all three corpora, zero differences over 8,904 index rows
+# and 13 computed columns, and pages identical once Bokeh's per-run UUID and
+# model-id counter are normalised.
+#
+# What it fixes is the launcher, not the pipeline. This is a bash script, so it
+# needs a bash, and on Windows choosing one is a trap:
+#
+#   - PowerShell resolves `bash` to WSL, not Git Bash. WSL then runs this under
+#     Linux, correctly selects .conda/env/python.exe (drvfs marks every .exe
+#     executable) and launches that Windows interpreter through interop -- but
+#     WSL has no cygpath, so native_path() leaves GDAL_DATA as /mnt/d/..., which
+#     the Windows process cannot read. It reports "GDAL_DATA is not defined",
+#     which sends you looking at GDAL rather than at the shell.
+#   - Editing this file while it is running corrupts the run in progress. Bash
+#     reads a script incrementally, so an edit shifts the byte offset of what it
+#     has not read yet and it resumes mid-token. That happened here: a live
+#     build died on `allelises: command not found`, a fragment of the word
+#     "parallelises" in a comment.
+#
+# run_pipeline.py has no shell in the loop, is stdlib-only so it starts under any
+# interpreter and then runs every step with .conda/env/python.exe, and takes its
+# paths from pathlib so they are native by construction -- no cygpath step left
+# to get wrong. It works from PowerShell, cmd or Git Bash unchanged.
+#
+# Kept because it is the original and still works from Git Bash. Nothing
+# documents it any more; readme.txt points at run_pipeline.py throughout.
+#
 # Rebuild one city's stormdrain study end to end -- --city picks which.
 #
 # This is the command list from readme.txt, in order, with one difference: the
@@ -57,6 +88,14 @@ CITY="${CITY:-livermore}"
 declare -A DEM_PROJECTS=(
     [livermore]=CA_AlamedaCounty_2021_B21
     [pleasanton]=CA_AlamedaCounty_2021_B21
+    # Fremont and Hayward are Alameda County too, so the same 2021 collect
+    # should cover them. Registering it skips deriving one from the AOI, which
+    # is a second round-trip to the TNM API -- and that API has been answering
+    # 504 about two times in three. The "verify DEM collect" step still checks
+    # this against the AOI before anything downloads, so a wrong guess here
+    # fails loudly rather than fetching the wrong county.
+    [fremont]=CA_AlamedaCounty_2021_B21
+    [hayward]=CA_AlamedaCounty_2021_B21
     [san_jose]=CA_SantaClaraCounty_2020_A20
 )
 DEM_PROJECT="${DEM_PROJECT:-}"
@@ -155,33 +194,63 @@ native_path() {
 }
 if [ -n "${PYTHON:-}" ]; then
     read -r -a PY <<< "$PYTHON"
-elif [ -x .conda/env/python.exe ]; then
-    PY=(.conda/env/python.exe)
-    GDAL_DATA=$(native_path "$PWD/.conda/env/Library/share/gdal"); export GDAL_DATA
-    # PATH as well, not just GDAL_DATA. An earlier version of this comment said
-    # activation contributed only that variable -- it was checked by diffing
-    # os.environ for GDAL_DATA and PROJ_LIB, and PATH was never compared.
-    # `micromamba run` also prepends six env directories, and Library/bin is
-    # where the DLLs live. Without it a delay-loaded DLL fails with
-    # 0xC06D007F (ERROR_MOD_NOT_FOUND) and the process dies with no traceback:
-    # add_elevation.py never hit one, matplotlib's tick path in preview_dem.py
-    # does immediately.
-    E="$PWD/.conda/env"
-    PATH="$E:$E/Library/mingw-w64/bin:$E/Library/usr/bin:$E/Library/bin:$E/Scripts:$E/bin:$PATH"
-    export PATH
-elif [ -x .conda/env/bin/python ]; then
-    PY=(.conda/env/bin/python)
-    GDAL_DATA=$(native_path "$PWD/.conda/env/share/gdal"); export GDAL_DATA
-    PATH="$PWD/.conda/env/bin:$PATH"; export PATH
-elif [ -x .venv/Scripts/python.exe ]; then PY=(.venv/Scripts/python.exe)
-elif [ -x .venv/bin/python ];        then PY=(.venv/bin/python)
-else                                      PY=(python)
+elif [ -x .conda/env/python.exe ];   then PY=(.conda/env/python.exe)
+elif [ -x .conda/env/bin/python ];   then PY=(.conda/env/bin/python)
+else
+    # No silent fallback to `python`. On this machine bare `python` has resolved
+    # to an unrelated venv, and under WSL to a Linux interpreter with no geo
+    # stack at all -- both of which fail much later, as a missing GDAL rather
+    # than a missing environment. Say it here instead.
+    echo "run_pipeline.sh: no .conda/env found." >&2
+    echo "  create it:  .conda/micromamba.exe create -y -p .conda/env -f environment.yml" >&2
+    echo "  and run this from Git Bash, not WSL or PowerShell." >&2
+    exit 1
 fi
+
+# The conda env's variables, set whenever that env EXISTS rather than only when
+# it happened to be the interpreter chosen above. Those are separate questions,
+# and tying them together meant PYTHON=... silently disabled the environment as
+# well as the interpreter -- pointing PYTHON at the conda python itself was
+# enough to lose GDAL_DATA and PATH, which is a trap with no visible cause.
+#
+# PATH matters more than GDAL_DATA. `micromamba run` prepends six env
+# directories, and Library/bin is where the DLLs live. Without it a delay-loaded
+# DLL fails with 0xC06D007F (ERROR_MOD_NOT_FOUND) and the process dies with no
+# traceback and no output: add_elevation.py never hit one, but preview_dem.py's
+# matplotlib tick path does immediately, and so does numpy.linalg's LAPACK.
+#
+# GDAL_DATA is the quieter one. Missing, pyogrio warns at import ("Could not
+# detect GDAL data files") and GDAL cannot find header.dxf or gdalvrt.xsd. Most
+# of that is cosmetic -- gdalvrt.xsd only validates VRT XML -- but it is noise
+# on every step and it is the first thing suspected when something later breaks.
+if [ -d .conda/env ]; then
+    E="$PWD/.conda/env"
+    if [ -d "$E/Library/share/gdal" ]; then          # Windows layout
+        GDAL_DATA=$(native_path "$E/Library/share/gdal"); export GDAL_DATA
+        PATH="$E:$E/Library/mingw-w64/bin:$E/Library/usr/bin:$E/Library/bin:$E/Scripts:$E/bin:$PATH"
+        export PATH
+    elif [ -d "$E/share/gdal" ]; then                # POSIX layout
+        GDAL_DATA=$(native_path "$E/share/gdal"); export GDAL_DATA
+        PATH="$E/bin:$PATH"; export PATH
+    fi
+fi
+
 # An `if`, not an && chain: under `set -e` the chain's status is the failed test
 # when the directory does exist, which is the normal case.
 if [ -n "${GDAL_DATA:-}" ] && [ ! -d "$GDAL_DATA" ]; then
     echo "run_pipeline.sh: warning, GDAL_DATA=$GDAL_DATA does not exist" >&2
 fi
+# Say so up front rather than leaving it to a pyogrio warning buried in a step's
+# output. A Hayward run was seen warning "GDAL_DATA is not defined" mid-download
+# with PYTHON unset and the block above apparently taken -- never reproduced, so
+# this reports the fact at the top of the run where it cannot be missed.
+if [ -d .conda/env ] && [ -z "${GDAL_DATA:-}" ]; then
+    echo "run_pipeline.sh: warning, .conda/env exists but GDAL_DATA is unset;" \
+         "expected $PWD/.conda/env/Library/share/gdal" >&2
+fi
+
+echo "run_pipeline.sh is DEPRECATED -- use: python run_pipeline.py --city $CITY" >&2
+echo "  (it works from PowerShell, cmd or Git Bash; this script needs Git Bash)" >&2
 
 start=$SECONDS
 step() {
