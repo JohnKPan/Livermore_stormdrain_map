@@ -66,6 +66,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import rasterio
+from pyproj import CRS as PyprojCRS
 from pyproj import Transformer
 from rasterio.windows import Window
 
@@ -144,7 +145,55 @@ class Mosaic:
 
     @property
     def mixed_crs(self):
-        return len({s.crs for s in self.sources}) > 1
+        # Horizontal only -- a compound CRS and its 2D twin are the same
+        # projection and must not trigger a warp. See horizontal_crs().
+        return len({crs_key(s.crs) for s in self.sources}) > 1
+
+
+def horizontal_crs(crs):
+    """A CRS with any vertical component stripped, for comparing projections.
+
+    3DEP collects declare the SAME projection differently. CA_AlamedaCounty_
+    2021_B21 ships COMPD_CS["NAD83(2011) / California zone 3 (ftUS) + NAVD88
+    height (ftUS) ..."]; CA_SantaClaraCounty_2020_A20 ships a bare EPSG:6420.
+    Horizontally they are identical -- same datum, same zone, same US survey
+    foot, same 1.0 ft grid -- but as objects they are unequal, so grouping on
+    the raw CRS split them into "MIXED PROJECTIONS" and warped one onto the
+    other.
+
+    That warp is not free and there was nothing to reproject. On Fremont,
+    adding the 533 Santa Clara tiles the city genuinely needs took unsampled
+    points from 1,729,318 to 2,000,456 and whole uncovered streets from 454 to
+    587 -- the second collect made coverage WORSE, because the reprojection lost
+    more at the edges than the new tiles added. Comparing horizontally keeps
+    both on the plain same-CRS VRT path, which is exact.
+
+    Falls back to the CRS unchanged if pyproj cannot read it, so an unusual
+    projection is grouped as before rather than silently merged.
+    """
+    try:
+        c = PyprojCRS.from_user_input(crs)
+        if c.is_compound and c.sub_crs_list:
+            return rasterio.crs.CRS.from_wkt(c.sub_crs_list[0].to_wkt())
+    except Exception:                        # noqa: BLE001 -- unusual CRS
+        pass
+    return crs
+
+
+def crs_key(crs):
+    """A hashable identity for a CRS's horizontal part.
+
+    Not the CRS object itself. rasterio's CRS breaks the hash/eq contract: two
+    built from different WKT strings can compare == and still hash differently,
+    so len({crs_a, crs_b}) is 2 for CRSs that are equal. That silently defeated
+    the first version of this check -- horizontal_crs() was correct, the set
+    around it was not, and the mosaic went on warping tiles onto themselves.
+
+    EPSG code where there is one, WKT otherwise. Both of Fremont's collects
+    reduce to 6420 (NAD83(2011) / California zone 3, ftUS).
+    """
+    h = horizontal_crs(crs)
+    return h.to_epsg() or h.to_wkt()
 
 
 def res_metres(crs, res):
@@ -237,7 +286,9 @@ def build_vrt(files, path, resolution="highest", resampling="bilinear",
         nodata = ds.nodata
         dtype = ds.dtypes[0]
 
-    if len({s.crs for s in sources}) > 1:
+    # Horizontal only: a compound CRS and its 2D twin are the same
+    # projection and must take the plain path. See horizontal_crs().
+    if len({crs_key(s.crs) for s in sources}) > 1:
         return _build_warped(sources, path, crs, tres, tres_m, resampling,
                              nodata, dtype)
     return _build_plain(sources, path, crs, tres, tres_m, resampling, nodata, dtype)
@@ -336,7 +387,8 @@ def _build_warped(sources, path, crs, tres, tres_m, resampling, nodata, dtype):
     stem = os.path.splitext(path)[0]
     groups = {}
     for src in sources:                      # sources arrive coarsest-first
-        groups.setdefault((src.crs.to_wkt(), round(src.res_m, 9)), []).append(src)
+        key = (crs_key(src.crs), round(src.res_m, 9))
+        groups.setdefault(key, []).append(src)
 
     parts = []
     for i, ((_wkt, res_m), group) in enumerate(groups.items()):

@@ -371,36 +371,77 @@ def merge_fragments(groups, paths, out_dir, verbose=True) -> tuple[int, int]:
                 os.path.getmtime(f) for f in frags):
             continue
 
+        # Fragments are CLIPPED to their delivery block, so they generally do
+        # NOT share a size or an origin: w6120n2040 arrived as 897x441 from one
+        # block and 3000x3000 from the other. An earlier version of this
+        # required (transform, width, height, dtype) to match exactly and
+        # skipped anything else -- which meant the merge only ever worked when
+        # both blocks happened to ship the WHOLE tile, and silently dropped the
+        # genuinely-split ones it exists for. Fremont lost 3 tiles that way,
+        # and with them every elevation under Union City: 36 streets with no
+        # profile at all.
+        #
+        # So: composite onto the union of the fragment extents instead. What
+        # must agree is the pixel GRID -- same resolution, and origins an
+        # integer number of pixels apart -- not the framing.
         with rasterio.open(frags[0]) as src:
             profile = src.profile.copy()
-            grid = (src.transform, src.width, src.height, src.dtypes[0])
             nodata = src.nodata
+            dtype = src.dtypes[0]
+            tr0 = src.transform
             tags = src.tags()
             overviews = src.overviews(1)
             struct = src.tags(ns="IMAGE_STRUCTURE")
             block = src.block_shapes[0] if src.is_tiled else None
-            out = src.read(1)
-        filled = valid_mask(out, nodata)
 
-        ok, worst = True, 0.0
-        for f in frags[1:]:
+        metas, ok = [], True
+        for f in frags:
             with rasterio.open(f) as src:
-                if (src.transform, src.width, src.height, src.dtypes[0]) != grid:
-                    print(f"  SKIP {name}: fragments are not on a common grid",
-                          file=sys.stderr)
+                t = src.transform
+                aligned = (round(t.a, 9) == round(tr0.a, 9)
+                           and round(t.e, 9) == round(tr0.e, 9)
+                           and abs(((t.c - tr0.c) / t.a) % 1.0) < 1e-6
+                           and abs(((t.f - tr0.f) / t.e) % 1.0) < 1e-6)
+                if not aligned or src.dtypes[0] != dtype:
+                    print(f"  SKIP {name}: fragments are not on a common pixel "
+                          f"grid (res or phase differs)", file=sys.stderr)
                     ok = False
                     break
-                arr = src.read(1)
-            valid = valid_mask(arr, nodata)
-            seam = valid & filled
-            if seam.any():
-                worst = max(worst, float(np.abs(arr[seam] - out[seam]).max()))
-            take = valid & ~filled
-            out[take] = arr[take]
-            filled |= valid
+                metas.append((f, t, src.width, src.height, src.bounds))
         if not ok:
             skipped += 1
             continue
+
+        # Union extent, on that shared grid.
+        left = min(m[4].left for m in metas)
+        right = max(m[4].right for m in metas)
+        top = max(m[4].top for m in metas)
+        bottom = min(m[4].bottom for m in metas)
+        width = int(round((right - left) / tr0.a))
+        height = int(round((top - bottom) / -tr0.e))
+        transform = rasterio.Affine(tr0.a, tr0.b, left, tr0.d, tr0.e, top)
+
+        fill = nodata if nodata is not None else 0
+        out = np.full((height, width), fill, dtype=dtype)
+        filled = np.zeros((height, width), dtype=bool)
+
+        worst = 0.0
+        for f, t, w, h, b in metas:
+            with rasterio.open(f) as src:
+                arr = src.read(1)
+            col = int(round((b.left - left) / tr0.a))
+            row = int(round((top - b.top) / -tr0.e))
+            sl = (slice(row, row + h), slice(col, col + w))
+            valid = valid_mask(arr, nodata)
+            seam = valid & filled[sl]
+            if seam.any():
+                worst = max(worst, float(np.abs(arr[seam] - out[sl][seam]).max()))
+            take = valid & ~filled[sl]
+            win = out[sl]
+            win[take] = arr[take]
+            out[sl] = win
+            filled[sl] |= valid
+        profile.update(width=width, height=height, transform=transform)
         if worst > 0:
             print(f"  !! {name}: fragments disagree by up to {worst:g} in the "
                   "overlap -- kept the first; inspect before trusting it",
@@ -691,6 +732,24 @@ def main(argv=None):
         merged, unmerged = merge_fragments(groups, paths, args.out)
         print(f"Merged={merged} already-current={len(groups) - merged - unmerged} "
               f"unmerged={unmerged}")
+
+    # Say plainly which expected tiles are not there. A merge that yields
+    # nothing used to be invisible: the download summary said failed=0 and the
+    # tile simply never appeared, so the gap only surfaced much later as points
+    # with no elevation. Fremont lost 3 tiles this way and with them every
+    # profile under Union City.
+    absent = sorted({t.filename for t in tiles}
+                    - set(os.listdir(args.out) if os.path.isdir(args.out) else []))
+    if absent:
+        print("", file=sys.stderr)
+        print(f"!! {len(absent)} expected tile(s) are NOT on disk in "
+              f"{args.out}:", file=sys.stderr)
+        for n in absent[:10]:
+            print(f"     {n}", file=sys.stderr)
+        if len(absent) > 10:
+            print(f"     ... and {len(absent) - 10} more", file=sys.stderr)
+        print("   Anything sampled there will come back with no elevation.",
+              file=sys.stderr)
         if args.prune_fragments and not unmerged and not fail:
             for t in tiles:
                 if t.filename in groups and os.path.exists(paths[t.url]):
