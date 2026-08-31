@@ -124,6 +124,79 @@ CITIES = {
                   "Depth": "DEPTH", "OperationalStatus": "STATUS"},
         "out": "storm_inlets_pleasanton",
     },
+    "fremont": {
+        "label": "Fremont",
+        # ArcGIS Online hosted, public, no token. The item (351af28e, owner
+        # fenvserv) carries no description and NODE_TYPE has no coded-value
+        # domain, so the codes look undocumented -- but the layer ships its own
+        # dictionary in GISO_LABEL, one readable name per code.
+        "url": ("https://services2.arcgis.com/AVso4yDITKsybTJg/arcgis/rest"
+                "/services/COF_Storm_Structs/FeatureServer/0"),
+        # 30,524 structures of 27 kinds; these five are the inlets, 15,192 of
+        # them -- CI Curb inlet 10,152, DI Drainage inlet 2,587, CB Catch basin
+        # 2,159, INL Inlet 148, FI Field inlet 145. Everything else is network
+        # or hydrography: MH Manhole 9,339, UNK Unknown 1,541, END End of main,
+        # AD Area drain, ST Stream, OUTL Outlet, CH Channel, J Junction, CV
+        # Culvert, CR Creek, JB Junction box, OUTF Outfall, DH Ditch, HW
+        # Headwall, LK Lake, LG Lagoon, RP RipRap. Two look like inlets and are
+        # not: GB is "Grade break" and INF is "Inflow", both pipe-network nodes.
+        "where": "NODE_TYPE IN ('CI','DI','CB','INL','FI')",
+        "fields": ["OBJECTID", "STORMN_KEY", "NODE_TYPE", "GISO_LABEL",
+                   "RIM_ELEV", "TC_ELEV", "ELEV_LOPIP", "ELEV_BTM", "BOX_DEPTH",
+                   "OWNER", "F_CITY", "COMMENTS", "SRC", "SRC_DATE"],
+        # ELEVATIONS ARE EFFECTIVELY ABSENT, and the survey CSV hides it: it
+        # reports RIM_ELEV/TC_ELEV/ELEV_LOPIP as 30,524 populated because it
+        # counts non-null, and the columns are ZERO-FILLED. Measured over the
+        # 15,192 inlets: RIM_ELEV is non-zero on 31, TC_ELEV on 565, ELEV_LOPIP
+        # on none at all. They are mapped anyway rather than dropped -- the
+        # plotters already gate on GRATE_MIN_FT/GRATE_MAX_FT (300-900 ft), so a
+        # zero falls outside and becomes NaN, which draws no marker. If Fremont
+        # ever populates them the mapping is already right.
+        #
+        # So this city is location-only: it snaps to profiles and drives sag and
+        # unserved-sag analysis off the DEM exactly like the others, but its
+        # pages carry no grate or invert marks.
+        #
+        # GISO_LABEL, not NODE_TYPE, for TypeDescription: the point of that
+        # column is to be comparable across cities, and "Catch basin" beats
+        # "CB". The raw code goes to SubType. No OperationalStatus or
+        # YearInstalled analogue; both come out blank.
+        "canon": {"AssetID": "STORMN_KEY", "TypeDescription": "GISO_LABEL",
+                  "SubType": "NODE_TYPE", "TopOfGrate": "RIM_ELEV",
+                  "InvertElevation1": "ELEV_LOPIP", "Depth": "BOX_DEPTH"},
+        "out": "storm_inlets_fremont",
+    },
+    "hayward": {
+        "label": "Hayward",
+        # ArcGIS Online hosted, public, no token. The only city here whose layer
+        # is ALREADY just inlets -- 4,567 of them, no manholes or network nodes
+        # mixed in -- so it needs no `where` at all.
+        "url": ("https://services1.arcgis.com/WTXhkvI9mSg0lzhr/arcgis/rest"
+                "/services/COH_Storm_Drain_Inlets/FeatureServer/0"),
+        "fields": ["FID", "ID", "InletType", "Grate_Cond", "No_Dumpi_1",
+                   "Comments"],
+        # Seven fields in the whole layer, and NO elevation columns exist at
+        # all -- not zero-filled like Fremont's, simply absent. So TopOfGrate,
+        # InvertElevation1 and Depth stay unmapped and come out blank, which is
+        # the honest rendering: nothing here could be mistaken for a measurement.
+        # Location-only, like Fremont.
+        #
+        # Comments is misnamed and is really the install year: all 4,567 values
+        # are years, 9 distinct (1955 x2,668, 1960 x554, 1972 x332, 2000 x301,
+        # 1957, 1956, 1958, 2015, 1975), none of them anything else. It maps to
+        # YearInstalled, which no other city outside Livermore fills.
+        #
+        # Grate_Cond is deliberately NOT mapped to OperationalStatus. It is a
+        # condition grade -- F 1,898 / G 1,491 / P 1,175 Fair, Good, Poor, plus
+        # two strays -- and OperationalStatus is about whether an asset is in
+        # service. Livermore fills the latter; folding a condition into it would
+        # quietly corrupt the one thing the canonical columns exist for, which
+        # is comparing like with like across cities. It passes through as a
+        # native column instead, preserved and correctly named.
+        "canon": {"AssetID": "ID", "TypeDescription": "InletType",
+                  "YearInstalled": "Comments"},
+        "out": "storm_inlets_hayward",
+    },
 }
 
 # geo.sanjoseca.gov throttles bursts by dropping the TLS handshake rather than
@@ -287,6 +360,16 @@ def build_rows(feats, city, cfg, natives, domains):
     Coded values are decoded only on the canonical columns -- those exist to be
     comparable across cities, so "Curb Inlet" beats "RH". Native columns are
     passed through exactly as served.
+
+    Canonical strings are also whitespace-stripped, and only canonical ones.
+    Hayward publishes InletType as both "COMBO" (4,070 rows) and "COMBO " with a
+    trailing space (28), plus "GRATE"/"GRATE " -- 35 rows that would read as
+    separate categories in any legend or groupby. The server's own groupBy hides
+    it, reporting the clean values, so it only shows up once the rows are in
+    hand. Extras keep the "exactly as served" contract above; a padded native
+    value is the publisher's business, but a padded CANONICAL one defeats the
+    cross-city comparison those columns exist for. A value that is only
+    whitespace becomes None rather than "".
     """
     canon = cfg["canon"]
     consumed = set(canon.values())
@@ -303,6 +386,8 @@ def build_rows(feats, city, cfg, natives, domains):
             codes = domains.get(native) if native else None
             if codes and v is not None:
                 v = codes.get(str(v), v)
+            if isinstance(v, str):
+                v = v.strip() or None
             row[name] = v
         for f in extras:
             row[f] = a.get(f)
