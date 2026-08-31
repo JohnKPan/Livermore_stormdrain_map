@@ -328,8 +328,25 @@ def _build_plain(sources, path, crs, tres, tres_m, resampling, nodata, dtype):
         s.ysize = max(1, int(round(srch * s.res / tres)))
         rel = os.path.relpath(s.path, vrt_dir).replace(os.sep, "/")
         rs = f' resampling="{resampling}"' if (s.xsize != srcw or s.ysize != srch) else ""
+        # ComplexSource, not SimpleSource, whenever there is a NoData value.
+        # GDAL honours the <NODATA> element ONLY in a ComplexSource; in a
+        # SimpleSource it is parsed and ignored, so a later source's NoData
+        # overwrites an earlier source's real data.
+        #
+        # That is not academic. Sources composite later-over-earlier with ties
+        # broken by filename, so CA_SantaClaraCounty sorts after
+        # CA_AlamedaCounty. Where the two collects overlap at the county line,
+        # Santa Clara's NoData was landing on top of perfectly good Alameda
+        # elevations: Miwok Court reads 205.71 ft in the Alameda tile, -999999
+        # in the Santa Clara one, and the mosaic returned -999999. Five Fremont
+        # streets rendered with no profile for that reason alone, and every one
+        # of them had valid data sitting in a tile already on disk.
+        #
+        # Verified on the two tiles concerned: SimpleSource -> -999999,
+        # ComplexSource -> 205.71.
+        tag = "ComplexSource" if nodata is not None else "SimpleSource"
         out += [
-            f"    <SimpleSource{rs}>",
+            f"    <{tag}{rs}>",
             f'      <SourceFilename relativeToVRT="1">{sx.escape(rel)}</SourceFilename>',
             "      <SourceBand>1</SourceBand>",
             f'      <SourceProperties RasterXSize="{srcw}" RasterYSize="{srch}" '
@@ -338,9 +355,10 @@ def _build_plain(sources, path, crs, tres, tres_m, resampling, nodata, dtype):
             f'      <SrcRect xOff="0" yOff="0" xSize="{srcw}" ySize="{srch}"/>',
             f'      <DstRect xOff="{s.xoff}" yOff="{s.yoff}" '
             f'xSize="{s.xsize}" ySize="{s.ysize}"/>',
-            f"      <NODATA>{nodata}</NODATA>",
-            "    </SimpleSource>",
+            f"      <NODATA>{nodata}</NODATA>" if nodata is not None else None,
+            f"    </{tag}>",
         ]
+        out = [ln for ln in out if ln is not None]
     out += ["  </VRTRasterBand>", "</VRTDataset>", ""]
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(out))
