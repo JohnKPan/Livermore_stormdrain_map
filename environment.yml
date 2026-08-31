@@ -1,10 +1,17 @@
-# conda-forge environment for the Bay Area-wide DEM work.
+# The environment. There is only this one.
 #
-# The uv venv (.venv/, requirements.txt) is still the primary environment and is
-# enough for everything except one thing: mosaicking lidar collects that sit in
-# DIFFERENT projections. A VRT cannot reproject, and rasterio ships no
-# multi-source warp, so that needs GDAL's own gdal.Warp -- and GDAL has no
-# Windows wheels on PyPI at any version. conda-forge is the way to get it.
+# It used to be the second of two: a uv venv (.venv/, requirements.txt) was
+# primary, and this existed solely to add GDAL for one job -- mosaicking lidar
+# collects that sit in DIFFERENT projections. A VRT cannot reproject, rasterio
+# ships no multi-source warp, so that needs GDAL's own gdal.Warp, and GDAL has
+# no Windows wheels on PyPI at any version.
+#
+# Keeping both was a liability rather than a fallback. This env is a strict
+# SUPERSET -- it has every package the venv had, plus osgeo -- so the venv could
+# do nothing this cannot, while two interpreters on one Windows box (three, with
+# the system python, four with WSL's) turned "which python am I running?" into
+# the most common failure in the project. A GDAL_DATA error that took a long
+# session to trace was ultimately an interpreter question, not a GDAL one.
 #
 # The point of using conda-forge for BOTH gdal and rasterio is that they then
 # link the SAME libgdal. Installing the `gdal` bindings alongside a wheel-built
@@ -18,8 +25,10 @@
 #     .conda/micromamba.exe create -y -p .conda/env -f environment.yml
 #     .conda/micromamba.exe run -p .conda/env python add_elevation.py
 #
-# run_pipeline.sh picks this env up automatically when .conda/env exists.
-# Delete .conda/ to undo all of it; the uv venv is untouched either way.
+# run_pipeline.sh (and run_pipeline.py) pick this env up automatically when
+# .conda/env exists, and fail loudly when it does not -- there is no fallback to
+# whatever `python` happens to be on PATH, because that is exactly how the wrong
+# interpreter used to get selected in silence.
 
 name: stormdrain
 channels:
@@ -32,7 +41,9 @@ dependencies:
   # Same libgdal as gdal, above.
   - rasterio>=1.4
   - pyproj>=3.7
-  # Everything else matches requirements.txt.
+  # Everything the scripts import. Checked against a scan of every `import`
+  # in *.py: bokeh contextily geopandas matplotlib numpy osgeo pandas plotly
+  # pyarrow pyproj rasterio shapely xyzservices -- all present below.
   - pandas>=2.2
   - pyarrow>=17
   - numpy>=2.0
