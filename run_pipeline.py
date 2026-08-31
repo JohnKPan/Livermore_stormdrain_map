@@ -190,7 +190,19 @@ def main():
                          "carriageways form a RING with no junction to cut at "
                          "(Del Valle Parkway). Independent of --no-branch-split; "
                          "the two cover different causes of the same symptom")
+    ap.add_argument("--list-cities", action="store_true",
+                    help="print the registered city slugs, one per line, and "
+                         "exit. run_all_cities.bat reads this rather than "
+                         "keeping its own copy of the list, so adding a city "
+                         "to DEM_PROJECTS is enough to include it")
     args = ap.parse_args()
+
+    if args.list_cities:
+        # Registry order, not sorted: it groups by collect, which is the order
+        # a region-wide run wants anyway (same tiles stay warm in the OS cache).
+        for slug in DEM_PROJECTS:
+            print(slug)
+        return
 
     city = args.city
     jobs = 1 if args.no_parallel else args.jobs
