@@ -3,10 +3,15 @@
 Top panel : DEM elevation along the street (W -> E, or N -> S for a street that
             runs mostly north-south), with every storm inlet
             within --max-offset of the centerline placed at its chainage.
-            Inlets with a surveyed TopOfGrate are drawn at that elevation, with
-            a stem down to InvertElevation1 showing pipe depth. Inlets without
-            survey elevations are drawn hollow on the DEM profile -- position
-            known, elevation unknown.
+            Inlets with a surveyed TopOfGrate that agrees with the DEM are
+            drawn filled at that elevation, with a stem down to
+            InvertElevation1 showing pipe depth. Where the survey is missing or
+            disagrees with the DEM by more than GRATE_TOL_M, the inlet is drawn
+            HOLLOW at the DEM elevation instead -- position known, elevation
+            taken from the lidar rather than measured. grate_src says which,
+            and the sidecar counts them apart. No stem is drawn for those: the
+            invert is surveyed and the grate is not, so the gap between them is
+            not a pipe depth.
 Bottom    : plan view in lat/lon (GPS), centerline points and inlets by type.
 
 DATUM: the inlet table stores elevations in FEET on what is almost certainly
@@ -14,6 +19,17 @@ NGVD29, while the DEM is metres NAVD88. Comparing 4,469 clean inlets against
 the DEM gives a median offset of -0.794 m (std 0.400), matching the ~+0.8 m
 NGVD29->NAVD88 shift for this area. That offset is applied by default so the
 two sources are on one datum; use --no-datum-shift to see the raw values.
+
+Re-measured since across all five cities, the shift holds: raw medians of -2.63
+(Livermore), -2.66 (Fremont), -2.81 (Pleasanton) and -2.16 ft (San Jose). Four
+publishers sharing no lineage landing within 0.65 ft is the evidence for the
+NGVD29 diagnosis. It is one constant for every city though, calibrated on
+Livermore, so it over-corrects San Jose -- 70% of the corpus -- by 0.45 ft.
+
+WHICH GRATES ARE TRUSTED: a published grate elevation is accepted when it falls
+within GRATE_TOL_M of the DEM beneath it, not inside an absolute elevation
+window. See that constant for why, and gate_to_dem() for where it happens.
+Inverts are ungated -- they are below ground, so the DEM cannot judge them.
 
 Usage:
     python plot_street_drains.py --street "A ST"
@@ -60,7 +76,22 @@ DATUM_SHIFT_M = 0.794          # measured NGVD29 -> NAVD88 offset, see module do
 # contextily's default is "contextily-<random hex>", which is blocked outright.
 TILE_UA = ("PengWeather-Stormdrain-Study/1.0 "
            "(Livermore CA storm drain research; contextily)")
-GRATE_MIN_FT, GRATE_MAX_FT = 300.0, 900.0   # Livermore spans roughly 390-790 ft
+# A published grate elevation is kept when it lands within this far of the lidar
+# DEM at the same point, after the datum shift. This replaces an absolute
+# 300-900 ft window, which was Livermore's own elevation span: measured over the
+# whole corpus it admitted 14,473 of the 39,093 published readings and threw away
+# 22,226 valid ones -- every San Jose inlet below 300 ft (that city reaches the
+# bay, and 24,438 of its 27,284 readings sit under the old floor), all 31 of
+# Fremont's, and 33 on Pleasanton's Foothill Rd that miss 300 ft by a few feet.
+#
+# 20 ft rather than something tighter: San Jose carries a right tail peaking near
+# +7 ft whose cause is not established -- the DEM is not at fault, since the lidar
+# agrees with San Jose's own DEMELEV equally well inside and outside that tail --
+# and inlets on bridge decks legitimately stand several feet above bare earth.
+# 20 ft keeps that population while still rejecting sentinels (441,049 ft),
+# placeholders (99.47 ft repeated on ground of 1.2 ft), lost decimal points and
+# mis-joined attribute blocks. See --grate-tol-m; 0 disables the check.
+GRATE_TOL_M = 6.096            # 20 ft
 
 # Standardised chart scales. Vertical is fixed so 0.20 m (the sag threshold)
 # always renders ~10 px while the 2 cm DEM noise stays sub-pixel. Horizontal is
@@ -135,9 +166,16 @@ def load_inlets(path, shift, aoi=None):
             raise SystemExit(
                 f"no inlets fall inside the AOI. The corpus covers "
                 f"{', '.join(srcs)} -- is this the right city?")
-    g = d.TopOfGrate.where((d.TopOfGrate >= GRATE_MIN_FT) & (d.TopOfGrate <= GRATE_MAX_FT))
-    iv = d.InvertElevation1.where((d.InvertElevation1 >= GRATE_MIN_FT - 50)
-                                  & (d.InvertElevation1 <= GRATE_MAX_FT))
+    # No absolute window: a grate is judged against the DEM beneath it, and that
+    # cannot happen until the inlet is snapped to a profile -- gate_to_dem() does
+    # it in prepare_geom(). Only the zeros go here, because several publishers
+    # zero-fill a column they do not populate (Fremont on 15,160 of 15,192 rows)
+    # and 0 ft is an absence, not a reading.
+    g = pd.to_numeric(d.TopOfGrate, errors="coerce").replace(0.0, np.nan)
+    # Inverts are deliberately ungated. They sit below ground by construction, so
+    # the DEM cannot say whether one is right, and no absolute window fits five
+    # cities at once. Every non-zero value is carried through as published.
+    iv = pd.to_numeric(d.InvertElevation1, errors="coerce").replace(0.0, np.nan)
     d["grate_m"] = g * FT_TO_M + shift
     d["invert_m"] = iv * FT_TO_M + shift
     d["type"] = d.TypeDescription.fillna("Unknown")
@@ -201,6 +239,46 @@ def snap(inlets, e, n, dist, max_offset):
     sub["chainage"] = dist[idx]
     sub["path_idx"] = idx
     return sub[sub.offset_m <= max_offset].sort_values("chainage")
+
+
+def gate_to_dem(near, tol_m):
+    """Settle each inlet's grate elevation, and record where the number came from.
+
+    Runs after the snap, because it needs dem_m. Only the grate is touched: an
+    invert is below ground by construction, so the surface says nothing about
+    whether it is plausible.
+
+    Three columns come out, and downstream code must read the right one:
+
+        grate_survey_m  the PUBLISHED value, metres, datum-shifted. NaN when the
+                        city published none. Never overwritten, so a rejected
+                        reading is still inspectable and a rerun at another
+                        --grate-tol-m does not need the corpus reloaded.
+        grate_m         what to PLOT. The survey when it is present and within
+                        tol_m of the DEM, otherwise the DEM elevation under the
+                        inlet. This is the only column that is always populated.
+        grate_src       "survey", "dem", or "none" -- which of the two the value
+                        in grate_m actually is.
+
+    Substituting the DEM keeps every inlet at a defensible height rather than
+    dropping it to a bare marker, but it means grate_m is no longer evidence of a
+    survey. Nothing may present grate_m as a measurement without checking
+    grate_src: markers are drawn hollow for "dem", the hover and the tap panel
+    name the source, and the JSON sidecar counts the two separately.
+
+    tol_m <= 0 disables the check, so every published value is kept as "survey".
+    """
+    if near.empty or "grate_m" not in near:
+        return near
+    survey = near.grate_m
+    dem = near.dem_m
+    bad = (survey - dem).abs() > tol_m if tol_m > 0 else pd.Series(
+        False, index=near.index)
+    use_survey = survey.notna() & ~bad
+    src = np.where(use_survey, "survey", np.where(dem.notna(), "dem", "none"))
+    return near.assign(grate_survey_m=survey,
+                       grate_m=survey.where(use_survey, dem),
+                       grate_src=src)
 
 
 def find_sags(d, z, run, min_prom, min_sep, edge_m=10.0):
@@ -276,6 +354,9 @@ def prepare_geom(st, inlets, args, segs=None):
     near = snap(inlets, e, n, d, args.max_offset)
     if not near.empty:
         near = near.assign(dem_m=z[near.path_idx.to_numpy()])
+        # the DEM is known only now, so this is the first point the published
+        # grate elevations can be checked against it
+        near = gate_to_dem(near, getattr(args, "grate_tol_m", GRATE_TOL_M))
         # sorted by chainage in snap(), so numbers run 1..N from the start end
         # and read left-to-right on the profile as well as along the map
         near = near.assign(num=np.arange(1, len(near) + 1))
@@ -328,7 +409,8 @@ def prepare_smooth(geom, args, smooth_m=None):
                                prominence=float(prom), lon=float(row.lon),
                                lat=float(row.lat),
                                elev=float(row.grate_m) if pd.notna(row.grate_m)
-                               else float(row.dem_m)))
+                               else float(row.dem_m),
+                               elev_src=str(getattr(row, "grate_src", "dem"))))
             continue
 
         # No qualifying inlet. Record the sag anyway, with whichever inlet on
@@ -448,8 +530,12 @@ def render(street, st, prep, args, outdir, used):
 
     for t, g in near.groupby("type"):
         sty = STYLE.get(t, DEFAULT_STYLE)
-        surveyed = g.dropna(subset=["grate_m"])
-        unsurveyed = g[g.grate_m.isna()]
+        # Split on where the number came from, not on whether one exists:
+        # gate_to_dem() now fills every grate_m, so isna() would call the DEM
+        # substitutes surveyed and draw them as solid measurements.
+        src = g.grate_src if "grate_src" in g else pd.Series("survey", index=g.index)
+        surveyed = g[src == "survey"].dropna(subset=["grate_m"])
+        unsurveyed = g[(src != "survey") & g.grate_m.notna()]
         if not surveyed.empty:
             # stem from grate down to pipe invert
             for _, row in surveyed.dropna(subset=["invert_m"]).iterrows():
@@ -464,9 +550,12 @@ def render(street, st, prep, args, outdir, used):
                         ms=9, mew=1.6, ls="none", zorder=5,
                         label=f"{t} — invert ({len(iv)})")
         if not unsurveyed.empty:
-            ax.plot(unsurveyed.chainage, unsurveyed.dem_m, sty["marker"],
+            # dem_m and grate_m are the same number for these; plotting
+            # grate_m keeps the marker consistent with what the sidecar reports.
+            ax.plot(unsurveyed.chainage, unsurveyed.grate_m, sty["marker"],
                     mfc="none", mec=sty["color"], mew=1.3, ms=7, ls="none",
-                    zorder=4, label=f"{t} — no survey elev ({len(unsurveyed)})")
+                    zorder=4,
+                    label=f"{t} — DEM elev, no survey ({len(unsurveyed)})")
 
     if not near.empty and len(near) <= args.max_labels:
         for _, row in near.iterrows():
@@ -514,6 +603,9 @@ def render(street, st, prep, args, outdir, used):
     ax.set_ylabel("elevation (m, NAVD88)")
     shift_note = (f"grate/invert shifted {DATUM_SHIFT_M:+.3f} m to NAVD88"
                   if args.datum_shift else "raw inlet elevations, NO datum shift")
+    _tol = getattr(args, "grate_tol_m", GRATE_TOL_M)
+    shift_note += (f"  |  grate within {_tol:g} m of DEM, else the DEM"
+                   if _tol > 0 else "  |  grate ungated")
     scale_note = (f"{h_mpp:g} m/px H  |  {v_mpp:.3f} m/px V  |  "
                   f"{h_mpp/v_mpp:.0f}x vertical exaggeration"
                   + ("   [V COMPRESSED]" if v_mpp > args.v_mpp*1.001 else ""))
@@ -671,6 +763,10 @@ def main():
     ap.add_argument("--max-offset", type=float, default=30.0,
                     help="max centerline distance for an inlet to belong (m)")
     ap.add_argument("--no-datum-shift", dest="datum_shift", action="store_false")
+    ap.add_argument("--grate-tol-m", type=float, default=GRATE_TOL_M,
+                    help="reject a published grate elevation further than this "
+                         f"from the DEM beneath it (default {GRATE_TOL_M:g} m "
+                         "= 20 ft); 0 keeps every value")
     ap.add_argument("--basemap", default="osm",
                     help="tile source. Default 'osm' (OpenStreetMap). The "
                          "CartoDB styles -- Voyager, Positron, DarkMatter -- "
@@ -818,7 +914,13 @@ def main():
                 "file": os.path.basename(out),
                 "n_points": sum(len(x[1]) for x in segs),
                 "n_inlets": len(near),
-                "n_grate_elev": int(near.grate_m.notna().sum()) if len(near) else 0,
+                # n_grate_elev counts SURVEYED grates only. The rest are
+                # carrying the DEM elevation, counted separately -- reporting
+                # the total here would overstate how much survey data exists.
+                "n_grate_elev": int((near.grate_src == "survey").sum())
+                if len(near) else 0,
+                "n_grate_from_dem": int((near.grate_src == "dem").sum())
+                if len(near) else 0,
                 "n_invert_elev": int(near.invert_m.notna().sum()) if len(near) else 0,
                 "median_offset_m": round(float(near.offset_m.median()), 1) if len(near) else None})
         if args.all and i % 100 == 0:
@@ -836,7 +938,8 @@ def main():
             if not near.empty:
                 for t, g in near.groupby("type"):
                     print(f"    {t:<14} {len(g):3d}  "
-                          f"({g.grate_m.notna().sum()} with grate elev, "
+                          f"({int((g.grate_src == 'survey').sum())} surveyed "
+                          f"grate, {int((g.grate_src == 'dem').sum())} from DEM, "
                           f"{g.invert_m.notna().sum()} with invert)")
                 print(f"  offset from centerline: median {near.offset_m.median():.1f} m, "
                       f"max {near.offset_m.max():.1f} m")

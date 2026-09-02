@@ -40,6 +40,7 @@ from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
 from plot_street_drains import (AOI_DIR, DATUM_SHIFT_M, DEFAULT_STYLE,
+                                GRATE_TOL_M,
                                 INLETS as INLETS_ALL, INLETS_LEGACY, STYLE,
                                 street_parts, load_aoi, load_inlets, prepare,
                                 prepare_geom, prepare_smooth,
@@ -246,18 +247,20 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                   # below differ between them -- see prepare().
                   title=f"{street} — elevation profile "
                         f"({len(near)} inlets within {args.max_offset:g} m, "
-                        f"{smooth_m:g} m smoothing)")
+                        f"{smooth_m:g} m smoothing, grate "
+                        + (f"within {args.grate_tol_m:g} m of DEM else the DEM"
+                           if args.grate_tol_m > 0 else "ungated") + ")")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     n_bridge = int(np.count_nonzero(np.isfinite(zb)))
     n_tunnel = int(np.count_nonzero(np.isfinite(zt)))
     if n_bridge:
         prof.line("d", "zb", source=src, line_color="#7b3294", line_width=5,
                   line_alpha=0.55,
-                  legend_label=f"bridge ({n_bridge*SPACING:,.0f} m)")
+                  legend_label=f"bridge ({n_bridge*args.spacing:,.0f} m)")
     if n_tunnel:
         prof.line("d", "zt", source=src, line_color="#1b7837", line_width=5,
                   line_alpha=0.55,
-                  legend_label=f"tunnel ({n_tunnel*SPACING:,.0f} m)")
+                  legend_label=f"tunnel ({n_tunnel*args.spacing:,.0f} m)")
     if n_bridge or n_tunnel:
         prof.legend.location = "top_left"
         prof.legend.background_fill_alpha = 0.75
@@ -321,10 +324,18 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
         for t, g in near.groupby("type"):
             sty = STYLE.get(t, DEFAULT_STYLE)
             m = near.type.to_numpy() == t
+            # gate_to_dem() already substituted the DEM where the survey was
+            # missing or rejected, so grate_m is populated; dem_m stays as the
+            # last-resort fallback for an inlet that somehow snapped without one.
             gy = np.where(np.isfinite(g.grate_m.to_numpy()),
                           g.grate_m.to_numpy(), g.dem_m.to_numpy())
+            gsrc = (g.grate_src.to_numpy() if "grate_src" in g
+                    else np.array(["survey"] * len(g)))
             isrc = ColumnDataSource(dict(
                 ch=g.chainage.to_numpy(), gy=gy,
+                gsrc=gsrc,
+                gsurv=(g.grate_survey_m.to_numpy() if "grate_survey_m" in g
+                       else np.full(len(g), np.nan)),
                 mx=ix[m], my=iy[m], num=g.num.to_numpy(),
                 asset=g.AssetID.astype(str).to_numpy(),
                 iv=g.invert_m.to_numpy(),
@@ -350,8 +361,13 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             tap_map.append(r2)
             # lat/lon here is the inlet's own surveyed position, not the
             # centerline point it snapped to -- they differ by @off metres.
+            # "grate" must never read as a measurement without saying so:
+            # @gsrc is "survey" or "dem", and the surveyed value is shown
+            # alongside when it exists but was rejected by the tolerance.
             tips = [("inlet", "#@num  @asset"), ("type", "@typ"),
-                    ("chainage", "@ch{0.0} m"), ("grate", "@gy{0.00} m"),
+                    ("chainage", "@ch{0.0} m"),
+                    ("grate", "@gy{0.00} m  (@gsrc)"),
+                    ("survey said", "@gsurv{0.00} m"),
                     ("invert", "@iv{0.00} m"), ("offset", "@off{0.0} m"),
                     ("lat, lon", "@lat{0.000000}, @lon{0.000000}")]
             # Inlet markers sit on the profile line, so this hover and the
@@ -521,8 +537,14 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             pick.text =
                 "<b>inlet #" + D.num[i] + "</b> &middot; " + D.asset[i]
               + " &middot; " + D.typ[i] + " &middot; " + D.ch[i].toFixed(1)
-              + " m along &middot; grate " + D.gy[i].toFixed(2)
-              + " m &middot; invert " + iv + " &middot; " + D.off[i].toFixed(1)
+              + " m along &middot; grate " + D.gy[i].toFixed(2) + " m "
+              + (D.gsrc[i] === "survey"
+                 ? "<span style='color:#2e7d32'>(surveyed)</span>"
+                 : "<span style='color:#c0392b'>(from DEM, not surveyed"
+                   + (isFinite(D.gsurv[i])
+                      ? "; survey said " + D.gsurv[i].toFixed(2) + " m" : "")
+                   + ")</span>")
+              + " &middot; invert " + iv + " &middot; " + D.off[i].toFixed(1)
               + " m off centerline<br>" + la.toFixed(6) + ", " + lo.toFixed(6)
               + " &nbsp;&rarr;&nbsp; <a href='" + url + "' target='_blank'"
               + " rel='noopener'>open Street View</a>"
@@ -611,6 +633,17 @@ def main():
                          "0 = keep all points (default)")
     ap.add_argument("--city", default=DEFAULT_CITY,
                     help="city slug; reads derived/<city>/ and city_geojson/<city>.geojson")
+    # Which point corpus to render, NOT a resampling instruction: the file
+    # has to exist already, from extract_centerline_latlon.py --spacing and
+    # add_elevation.py --spacing at the same value. Every other plotter took
+    # this argument; this one read the module constant, so a corpus built at
+    # anything but 0.15 m could be produced but never drawn. The rolling mean
+    # does not need it -- build_profile() measures the step from the data --
+    # but the bridge and tunnel lengths do, being point counts times spacing.
+    ap.add_argument("--spacing", type=float, default=SPACING, metavar="M",
+                    help=f"which point corpus to render, in metres "
+                         f"(default {SPACING:g}); the matching parquet must "
+                         f"already be built")
     ap.add_argument("--inlets", default=None,
                     help=f"inlet CSV (default {INLETS_ALL}, or {INLETS_LEGACY})")
     ap.add_argument("--aoi", default=None,
@@ -634,6 +667,10 @@ def main():
     ap.add_argument("--pad-min-m", type=float, default=60.0)
     ap.add_argument("--pad-frac", type=float, default=0.6)
     ap.add_argument("--no-datum-shift", dest="datum_shift", action="store_false")
+    ap.add_argument("--grate-tol-m", type=float, default=GRATE_TOL_M,
+                    help="reject a published grate elevation further than this "
+                         f"from the DEM beneath it (default {GRATE_TOL_M:g} m "
+                         "= 20 ft); 0 keeps every value")
     # Maps Embed API key. Without one the pages behave as before: a link out to
     # Street View rather than a panel beside the map. The key is baked into
     # every page it generates, so restrict it to the Maps Embed API in the
@@ -661,7 +698,8 @@ def main():
     tr = Transformer.from_crs("EPSG:4326", "EPSG:26910", always_xy=True)
     inlets["x"], inlets["y"] = tr.transform(inlets.lon.values, inlets.lat.values)
 
-    df = pd.read_parquet(os.path.join(here, points_path(SPACING, "parquet", args.city)))
+    df = pd.read_parquet(os.path.join(here,
+                         points_path(args.spacing, "parquet", args.city)))
 # Segments with no display_name get no page: a page is identified by its
 # street, and Overture leaves 8% of the kept network nameless -- unnamed stubs,
 # alleys and junction connectors that no amount of fetching will name. They stay

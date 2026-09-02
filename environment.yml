@@ -44,6 +44,27 @@ dependencies:
   # Everything the scripts import. Checked against a scan of every `import`
   # in *.py: bokeh contextily geopandas matplotlib numpy osgeo pandas plotly
   # pyarrow pyproj rasterio shapely xyzservices -- all present below.
+  # BLAS: OpenBLAS, explicitly, NOT the conda-forge default of MKL.
+  #
+  # With MKL, every BLAS and most LAPACK calls die on this machine with a native
+  # Windows fault, 0xC06D007F -- ERROR_PROC_NOT_FOUND from the MSVC delay-load
+  # helper. mkl 2026.1.0's mkl_intel_thread.3.dll wants a symbol that the
+  # llvm-openmp build of libiomp5md.dll does not export, and conda-forge pairs
+  # exactly those two by default. It is not a corrupted install: a clean create
+  # from this file reproduced it precisely.
+  #
+  # The blast radius is wide and the symptom does not name BLAS. np.dot, svd and
+  # inv crash while eigvals survives, so it surfaces far from the cause --
+  # matplotlib dies in savefig (Affine2D composition is an np.dot on 3x3
+  # matrices) and plot_street_profiles dies in fold_ratio (np.linalg.svd),
+  # neither of which looks like a linear algebra problem from the traceback.
+  #
+  # MKL_THREADING_LAYER=SEQUENTIAL or =TBB also fix it, but both need the
+  # variable set in every shell that ever runs this project. Pinning the BLAS
+  # implementation fixes it once, here, for anyone who builds from this file.
+  # Revisit when mkl/llvm-openmp are compatible again; nothing here is
+  # BLAS-bound, so OpenBLAS costs this project nothing.
+  - libblas=*=*openblas
   - pandas>=2.2
   - pyarrow>=17
   - numpy>=2.0

@@ -40,11 +40,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 
-# Three page corpora. All read the SAME 0.15 m point corpus and differ only in
-# the rolling-mean window, so they are named for that window -- the spacing is a
-# property of the whole pipeline (SPACING in extract_centerline_latlon.py), not
-# of an individual build.
+# Three page corpora by default. All read the SAME point corpus and differ only
+# in the rolling-mean window, so they are named for that window and not for the
+# spacing -- which is --spacing, and belongs to the corpus rather than to any
+# one set of pages. --smooth overrides this; a single window is a third of the
+# deliverable, which is the cheapest size cut available.
 SMOOTHS = [25, 10, 5]
+# Default resample interval, and it must track SPACING in
+# extract_centerline_latlon.py -- that module names the corpus file, this
+# one has to predict the name to check the file is there. Nothing imports
+# it: this file is stdlib only so that it can run under the wrong
+# interpreter and still select the right one.
+SPACING = 0.15
 # Which window the overview OPENS on. Not the same as listing it first: the
 # selector keeps the order above, which reads as a scale, while the page can
 # open on any of them. Must be one of SMOOTHS, or the overview opens on a
@@ -83,6 +90,16 @@ DEM_PROJECTS = {
     "fremont": ["CA_AlamedaCounty_2021_B21", "CA_SantaClaraCounty_2020_A20"],
     "san_jose": ["CA_SantaClaraCounty_2020_A20"],
 }
+
+
+def label(spacing):
+    """Filename suffix for a spacing: 0.15 -> 0p15m.
+
+    A copy of extract_centerline_latlon.label(), for the same reason
+    SPACING is copied above. Four lines, and the format is frozen by every
+    parquet already on disk.
+    """
+    return ("%g" % spacing).replace(".", "p") + "m"
 
 
 def interpreter():
@@ -190,6 +207,33 @@ def main():
                          "carriageways form a RING with no junction to cut at "
                          "(Del Valle Parkway). Independent of --no-branch-split; "
                          "the two cover different causes of the same symptom")
+    ap.add_argument("--spacing", type=float, default=SPACING, metavar="M",
+                    help="resample interval in metres (default "
+                         + repr(SPACING) + "). Names the corpus file and is "
+                         "passed to every step that reads it. Coarser is "
+                         "much smaller but not proportionally so: a page "
+                         "costs about 33 KB of fixed scaffolding plus about "
+                         "46 B per point, which puts a 0.3 m build at three "
+                         "fifths of a 0.15 m one rather than half")
+    ap.add_argument("--smooth", type=int, nargs="+", default=SMOOTHS,
+                    metavar="M",
+                    help="rolling-mean window(s) in metres, one page corpus "
+                         "each (default " + " ".join(str(x) for x in SMOOTHS)
+                         + "). The bluntest size lever there is: the three "
+                         "corpora are within 1 KB of each other per page, so "
+                         "one window instead of three is a third of the "
+                         "deliverable")
+    ap.add_argument("--site", default=None, metavar="NAME",
+                    help="write under Stormdrain_map/<NAME>/ instead of "
+                         "Stormdrain_map/<city>/, for building a variant "
+                         "beside a city rather than over the top of it")
+    ap.add_argument("--skip-fetch", action="store_true",
+                    help="skip the boundary, street, inlet and DEM fetches "
+                         "but still resample and re-join elevations. What to "
+                         "use when the sources are already on disk and only "
+                         "--spacing changed: --render-only would skip the "
+                         "resample too, leaving no corpus at the new spacing "
+                         "to draw from")
     ap.add_argument("--list-cities", action="store_true",
                     help="print the registered city slugs, one per line, and "
                          "exit. run_all_cities.bat reads this rather than "
@@ -217,15 +261,21 @@ def main():
     print("interpreter: %s" % py)
     print("GDAL_DATA  : %s" % env.get("GDAL_DATA", "UNSET"))
 
-    dirs = [Path("Stormdrain_map") / city / ("streets_%dm" % s) for s in SMOOTHS]
-    # Must track SPACING in extract_centerline_latlon.py, which names this file.
-    points = Path("derived") / city / "segments_points_0p15m.parquet"
+    smooths = args.smooth
+    spacing = args.spacing
+    # --site keeps a variant off the city it varies: a 0.3 m San Jose and
+    # the 0.15 m one differ in no path but this, and the second would
+    # otherwise be written straight over the first.
+    site = Path("Stormdrain_map") / (args.site or city)
+    dirs = [site / ("streets_%dm" % s) for s in smooths]
+    points = (Path("derived") / city
+              / ("segments_points_%s.parquet" % label(spacing)))
     dem_dir = Path("dem_%s" % city)
-    overview = Path("Stormdrain_map") / city / "index.html"
+    overview = site / "index.html"
     aoi = Path("city_geojson") / ("%s.geojson" % city)
     start = time.time()
 
-    if not args.render_only:
+    if not (args.render_only or args.skip_fetch):
         # The AOI everything downstream is cut against: the Overture split, the
         # DEM bbox, and the clip the plotters apply to the inlet corpus.
         # Buffered two miles, which is the margin the DEM needs for streets on
@@ -289,12 +339,17 @@ def main():
             step("lidar DEM tiles" + suffix, py, env, "fetch_usgs_lidar.py",
                  "--aoi-file", aoi, "--project", proj,
                  "--out", "./%s" % dem_dir, "--manifest", manifest)
+    # Outside the fetch block, because --skip-fetch reruns exactly these two.
+    # They are also the only steps --spacing changes the output OF rather
+    # than the input to: everything above is spacing-blind.
+    if not args.render_only:
         # --no-csv: at 0.15 m the intermediate CSV is ~470 MB and nothing reads it.
         step("centerline resampling", py, env, "extract_centerline_latlon.py",
              "--slim", "--parquet", "--no-csv", "--city", city,
+             "--spacing", spacing,
              "--src", "streets/overture/%s.geojson" % city)
         step("elevation join", py, env, "add_elevation.py", "--no-csv",
-             "--city", city, "--dem-dir", dem_dir)
+             "--city", city, "--spacing", spacing, "--dem-dir", dem_dir)
     elif not (ROOT / points).is_file():
         sys.exit("run_pipeline.py: --render-only needs %s, which is not there.\n"
                  "Run without --render-only once to build it." % points)
@@ -302,18 +357,24 @@ def main():
     # One build, not one per window. The three corpora differ ONLY in the
     # rolling mean: chaining, the chainage axis and the inlet snap are identical
     # across them, and three processes each recomputed all of it.
-    label = "street pages, %s m" % " ".join(str(s) for s in SMOOTHS)
-    label += ", " + (" ".join(branch) if branch else "branch+fold split")
-    step(label, py, env, "plot_street_bokeh.py", "--all", "--city", city,
-         "--jobs", jobs, *branch, "--smooth", *SMOOTHS, "--outdir", *dirs)
+    what = "street pages, %s m smoothing at %g m spacing" % (
+        " ".join(str(s) for s in smooths), spacing)
+    what += ", " + (" ".join(branch) if branch else "branch+fold split")
+    step(what, py, env, "plot_street_bokeh.py", "--all", "--city", city,
+         "--jobs", jobs, *branch, "--spacing", spacing,
+         "--smooth", *smooths, "--outdir", *dirs)
 
     # Last, and it must be: it reads the _index.csv that each page build writes.
     # The first corpus is --pages; every other one is a repeated --pages-alt,
     # which grows the selector from a toggle into an N-way switch.
-    ovw = ["--pages", dirs[0], "--label", "%d m" % SMOOTHS[0]]
-    for d, s in zip(dirs[1:], SMOOTHS[1:]):
+    ovw = ["--pages", dirs[0], "--label", "%d m" % smooths[0]]
+    for d, s in zip(dirs[1:], smooths[1:]):
         ovw += ["--pages-alt", d, "--alt-label", "%d m" % s]
-    ovw += ["--opens-at", "%d m" % OPENS_AT, "--city", city, "--out", overview]
+    # OPENS_AT can name a window that was never built -- --smooth 10 alone
+    # leaves a 25 m selector pointing at empty air. Fall back to the first
+    # corpus, which by definition exists.
+    opens = OPENS_AT if OPENS_AT in smooths else smooths[0]
+    ovw += ["--opens-at", "%d m" % opens, "--city", city, "--out", overview]
     step("city overview", py, env, "plot_city_overview.py", *ovw)
 
     el = round(time.time() - start)

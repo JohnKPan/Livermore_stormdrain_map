@@ -149,9 +149,15 @@ CITIES = {
         # counts non-null, and the columns are ZERO-FILLED. Measured over the
         # 15,192 inlets: RIM_ELEV is non-zero on 31, TC_ELEV on 565, ELEV_LOPIP
         # on none at all. They are mapped anyway rather than dropped -- the
-        # plotters already gate on GRATE_MIN_FT/GRATE_MAX_FT (300-900 ft), so a
-        # zero falls outside and becomes NaN, which draws no marker. If Fremont
-        # ever populates them the mapping is already right.
+        # load_inlets() drops zeros outright and the plotters then gate a grate
+        # against the DEM beneath it, so a zero draws no marker either way. If
+        # Fremont ever populates them the mapping is already right.
+        #
+        # The 31 RIM_ELEV and 565 TC_ELEV values that ARE non-zero turn out to be
+        # real: against the lidar they sit -0.05 and +1.06 ft from bare earth
+        # (medians, datum-shifted), the second being about right for a top of
+        # curb. The old absolute 300-900 ft plotter gate discarded all of them,
+        # Fremont being a bayside city; the DEM-relative gate keeps them.
         #
         # So this city is location-only: it snaps to profiles and drives sag and
         # unserved-sag analysis off the DEM exactly like the others, but its
