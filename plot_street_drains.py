@@ -105,15 +105,117 @@ MAP_LADDER = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
 MAP_W_MIN_PX, MAP_W_MAX_PX = 420.0, 1200.0
 MAP_H_MIN_PX, MAP_H_MAX_PX = 320.0, 1000.0
 
+# The six original keys are Livermore's TypeDescription values verbatim, which
+# is why they matched nothing else: 21% of Pleasanton, 0.5% of San Jose, 0.2% of
+# Fremont and 0% of Hayward, so four cities rendered entirely in DEFAULT_STYLE
+# grey. Fremont's "Curb inlet" missed "Curb Inlet" on one capital letter.
+# canonical_type() below folds the five vocabularies onto these keys; the
+# original six are unchanged so Livermore's pages look exactly as they did.
 STYLE = {
-    "Curb Inlet":    dict(marker="o", color="#2e86c1"),
-    "Grated Inlet":  dict(marker="s", color="#e08e45"),
-    "Slotted Drain": dict(marker="D", color="#7b3294"),
-    "Trench Drain":  dict(marker="P", color="#1a9850"),
-    "Standard":      dict(marker="^", color="#c9a227"),
-    "Unknown":       dict(marker="X", color="#888888"),
+    "Curb Inlet":        dict(marker="o", color="#2e86c1"),
+    "Grated Inlet":      dict(marker="s", color="#e08e45"),
+    # "+" (thin cross), not "D": the diamond has to go to Catch Basin, which
+    # has 3,567 inlets to Slotted Drain's 1. See the collision note below.
+    "Slotted Drain":     dict(marker="+", color="#7b3294"),
+    "Trench Drain":      dict(marker="P", color="#1a9850"),
+    "Standard":          dict(marker="^", color="#c9a227"),
+    "Unknown":           dict(marker="X", color="#888888"),
+    # Added for the other four cities. Each is a form the publishers name
+    # themselves; none is an equivalence invented here.
+    #
+    # Twelve types, but matplotlib and Bokeh only agree on ten markers
+    # (o s D ^ v P X * h +), so two have to double up. Each shares with a type
+    # that exists ONLY in Livermore and only as a handful of inlets -- Trench
+    # Drain 1, Standard 2 -- while its partner is common.
+    #
+    # "City-disjoint" is NOT enough to make a pair safe, which is why Slotted
+    # Drain moved off the diamond: an AOI is buffered two miles, so a city's
+    # pages carry its neighbours' inlets too (Livermore's 2,074 pages hold
+    # 2,511 Pleasanton inlets beside its own 6,987). Slotted Drain and Catch
+    # Basin share no city and still landed on one page together. Scanning all
+    # 2,074 rendered pages is what found it, and is the check to repeat if a
+    # marker is ever reassigned -- reasoning about which cities publish what
+    # will miss this class of collision every time.
+    #
+    # The two remaining pairs are 3 Livermore inlets of exposure and appear on
+    # no page in that scan. Colour stays unique across all twelve regardless,
+    # and both members are named in the legend, so a shared marker degrades to
+    # a colour lookup rather than an ambiguity.
+    "Combination Inlet": dict(marker="*", color="#1b4f72"),
+    "Hooded Inlet":      dict(marker="h", color="#8e44ad"),
+    "Catch Basin":       dict(marker="D", color="#16a085"),
+    "Drop Inlet":        dict(marker="P", color="#c0392b"),
+    "Area Drain":        dict(marker="^", color="#27ae60"),
+    "Inlet (generic)":   dict(marker="v", color="#5d6d7e"),
 }
-DEFAULT_STYLE = dict(marker="v", color="#555555")
+# Unmapped is unknown, so it should look like it rather than like a 13th type.
+DEFAULT_STYLE = STYLE["Unknown"]
+
+# Matched against the normalised description, IN ORDER -- first hit wins, so the
+# specific terms come before the generic ones. "field inlet/ grate" is a field
+# drain, not a grate, and "di/galv grate" is a drop inlet; both fall out of the
+# ordering rather than needing their own entries.
+_TYPE_RULES = [
+    ("hood",             "Hooded Inlet"),       # San Jose's 31,868, its own form
+    ("combo",            "Combination Inlet"),  # Hayward's 4,099
+    ("curb",             "Curb Inlet"),
+    ("catch basin",      "Catch Basin"),
+    ("slot",             "Slotted Drain"),
+    ("trench",           "Trench Drain"),
+    ("area drain",       "Area Drain"),
+    ("field",            "Area Drain"),
+    ("gutter drain",     "Area Drain"),
+    ("continuous drain", "Area Drain"),
+    ("overflow drain",   "Area Drain"),
+    ("drop inlet",       "Drop Inlet"),
+    ("sddi",             "Drop Inlet"),
+    ("grate",            "Grated Inlet"),
+    ("rack",             "Grated Inlet"),
+    ("standard",         "Standard"),
+    ("drainage inlet",   "Inlet (generic)"),
+    ("riser",            "Inlet (generic)"),
+]
+# Whole-string matches, for codes too short or too odd for a substring rule.
+# "di" as a substring would swallow "drain", "sediment" and "debris".
+_TYPE_EXACT = {
+    "di": "Drop Inlet", "cb": "Catch Basin", "ci": "Curb Inlet",
+    "inl": "Inlet (generic)", "inlet": "Inlet (generic)",
+    "fi": "Area Drain", "gol": "Inlet (generic)",
+    "": "Unknown", "other": "Unknown", "unknown": "Unknown",
+}
+
+
+def _norm_type(desc):
+    """Lowercase, strip punctuation to spaces, collapse runs. 'Curb inlet,W/SCREEN' -> 'curb inlet w screen'."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(desc).lower())).strip()
+
+
+def canonical_type(desc):
+    """One of STYLE's keys, for any of the five cities' vocabularies.
+
+    Publishers agree on nothing here -- 53 distinct strings in Pleasanton alone,
+    and Fremont differs from Livermore only in capitalisation. Anything that
+    does not match a rule stays "Unknown" rather than being forced into the
+    nearest bucket: a wrong type on a legend is worse than an honest grey X.
+    """
+    if desc is None or (isinstance(desc, float) and desc != desc):
+        return "Unknown"
+    n = _norm_type(desc)
+    if n in _TYPE_EXACT:
+        return _TYPE_EXACT[n]
+    for needle, name in _TYPE_RULES:
+        if needle in n:
+            return name
+    # Bare codes as WHOLE WORDS, last, so spelled-out terms above win. As a
+    # substring "di" would swallow drain, sediment and debris, which is why
+    # this is a token test and why it runs after the rules rather than with
+    # _TYPE_EXACT: it also catches "overflow di" and the "overfow di" typo.
+    toks = n.split()
+    for code, name in (("di", "Drop Inlet"), ("cb", "Catch Basin"),
+                       ("ci", "Curb Inlet")):
+        if code in toks:
+            return name
+    return "Unknown"
 
 
 def load_aoi(path):
@@ -178,7 +280,16 @@ def load_inlets(path, shift, aoi=None):
     iv = pd.to_numeric(d.InvertElevation1, errors="coerce").replace(0.0, np.nan)
     d["grate_m"] = g * FT_TO_M + shift
     d["invert_m"] = iv * FT_TO_M + shift
-    d["type"] = d.TypeDescription.fillna("Unknown")
+    # Two columns, deliberately. "type" is the canonical class and is what
+    # STYLE, the groupbys and the legends key on -- five publishers spell the
+    # same thing 100 ways ('Curb inlet', 'CURB INLET', 'CB-CURB OPENING'), and
+    # keying the styling on raw text left four of the five cities rendering
+    # entirely as DEFAULT_STYLE. "type_raw" keeps the publisher's own wording,
+    # because canonicalising is lossy ('DROP INLET,W/SCREEN' -> 'Drop Inlet'
+    # drops the screen) and the hover should still be able to show what the
+    # city actually wrote.
+    d["type_raw"] = d.TypeDescription.fillna("").astype(str).str.strip()
+    d["type"] = d.TypeDescription.map(canonical_type)
     return d
 
 
@@ -937,7 +1048,7 @@ def main():
                   f"{args.max_offset:g} m")
             if not near.empty:
                 for t, g in near.groupby("type"):
-                    print(f"    {t:<14} {len(g):3d}  "
+                    print(f"    {t:<18} {len(g):3d}  "
                           f"({int((g.grate_src == 'survey').sum())} surveyed "
                           f"grate, {int((g.grate_src == 'dem').sum())} from DEM, "
                           f"{g.invert_m.notna().sum()} with invert)")

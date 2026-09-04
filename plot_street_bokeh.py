@@ -331,9 +331,20 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                           g.grate_m.to_numpy(), g.dem_m.to_numpy())
             gsrc = (g.grate_src.to_numpy() if "grate_src" in g
                     else np.array(["survey"] * len(g)))
+            # Colour carries PROVENANCE, shape carries type -- the marker glyph
+            # is already the type, so fill is free to say something else, and
+            # what it says is whether the height is measured or inferred.
+            # Surveyed keeps the type colour it has always had; DEM-derived goes
+            # hollow, the same convention plot_street_drains.py uses, so the two
+            # renderers cannot disagree about what a hollow marker means. The
+            # ring stays the type colour, so a hollow marker is still typed.
+            surveyed = gsrc == "survey"
+            fcol = np.where(surveyed, sty["color"], "#ffffff")
+            lcol = np.where(surveyed, "#ffffff", sty["color"])
+            lw = np.where(surveyed, 1.0, 2.0)
             isrc = ColumnDataSource(dict(
                 ch=g.chainage.to_numpy(), gy=gy,
-                gsrc=gsrc,
+                gsrc=gsrc, fcol=fcol, lcol=lcol, lw=lw,
                 gsurv=(g.grate_survey_m.to_numpy() if "grate_survey_m" in g
                        else np.full(len(g), np.nan)),
                 mx=ix[m], my=iy[m], num=g.num.to_numpy(),
@@ -343,18 +354,28 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                 lat=g.lat.to_numpy(), lon=g.lon.to_numpy(),
                 hd=g["sv_head"].to_numpy(),
                 lbl=[str(int(v)) for v in g.num.to_numpy()],
-                typ=[t]*int(m.sum())))
+                typ=[t]*int(m.sum()),
+                # The canonical class is constant within the group; the raw
+                # string is not, so it has to come from the rows.
+                typraw=(g.type_raw.fillna("").astype(str).to_numpy()
+                        if "type_raw" in g else np.array([""] * len(g)))))
+            # Must cover every marker STYLE uses: an unmapped one falls back
+            # to a circle silently, which would make two types look identical
+            # here while looking different in the matplotlib pages.
             mk = {"o": "circle", "s": "square", "D": "diamond",
                   "P": "plus", "^": "triangle", "X": "x",
-                  "v": "inverted_triangle"}.get(sty["marker"], "circle")
+                  "v": "inverted_triangle", "*": "star",
+                  "h": "hex", "+": "cross"}.get(sty["marker"], "circle")
             # nonselection_alpha=1: tapping an inlet selects it, and Bokeh's
             # default is to fade everything unselected. Here the tap is only a
             # way to pin details, so the other inlets must stay legible.
-            r1 = prof.scatter("ch", "gy", source=isrc, marker=mk, size=9,
-                              fill_color=sty["color"], line_color="white",
+            r1 = prof.scatter("ch", "gy", source=isrc, marker=mk, size=12,
+                              fill_color="fcol", line_color="lcol",
+                              line_width="lw",
                               nonselection_alpha=1.0, legend_label=t)
-            r2 = mp.scatter("mx", "my", source=isrc, marker=mk, size=11,
-                            fill_color=sty["color"], line_color="white",
+            r2 = mp.scatter("mx", "my", source=isrc, marker=mk, size=14,
+                            fill_color="fcol", line_color="lcol",
+                            line_width="lw",
                             nonselection_alpha=1.0, legend_label=t)
             inlet_srcs.append(isrc)
             tap_prof.append(r1)
@@ -365,6 +386,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             # @gsrc is "survey" or "dem", and the surveyed value is shown
             # alongside when it exists but was rejected by the tolerance.
             tips = [("inlet", "#@num  @asset"), ("type", "@typ"),
+                    ("city calls it", "@typraw"),
                     ("chainage", "@ch{0.0} m"),
                     ("grate", "@gy{0.00} m  (@gsrc)"),
                     ("survey said", "@gsurv{0.00} m"),
@@ -378,8 +400,10 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                                      attachment="right"))
             mp.add_tools(HoverTool(renderers=[r2], tooltips=tips,
                                    attachment="right"))
-            for f, xf, yf, dx, dy in ((prof, "ch", "gy", 0, 9),
-                                      (mp, "mx", "my", 7, 6)):
+            # Offsets track the marker sizes above (12 profile / 14 map): the
+            # number sits clear of the glyph edge, not on top of it.
+            for f, xf, yf, dx, dy in ((prof, "ch", "gy", 0, 11),
+                                      (mp, "mx", "my", 9, 8)):
                 f.add_layout(LabelSet(x=xf, y=yf, text="lbl", source=isrc,
                                       x_offset=dx, y_offset=dy,
                                       text_font_size="8pt",
@@ -534,9 +558,17 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                       + "&map_action=pano&viewpoint=" + la.toFixed(6) + ","
                       + lo.toFixed(6) + "&heading=" + D.hd[i].toFixed(0);
             const iv = isFinite(D.iv[i]) ? D.iv[i].toFixed(2) + " m" : "n/a";
+            // The canonical class folds five cities' vocabularies together, so
+            // show the publisher's own wording alongside it -- but only when it
+            // actually differs, or every Livermore inlet would say the same
+            // thing twice.
+            const raw = (D.typraw && D.typraw[i]) ? D.typraw[i] : "";
+            const typ = (raw && raw !== D.typ[i])
+                        ? D.typ[i] + " <span style='color:#777'>(" + raw + ")</span>"
+                        : D.typ[i];
             pick.text =
                 "<b>inlet #" + D.num[i] + "</b> &middot; " + D.asset[i]
-              + " &middot; " + D.typ[i] + " &middot; " + D.ch[i].toFixed(1)
+              + " &middot; " + typ + " &middot; " + D.ch[i].toFixed(1)
               + " m along &middot; grate " + D.gy[i].toFixed(2) + " m "
               + (D.gsrc[i] === "survey"
                  ? "<span style='color:#2e7d32'>(surveyed)</span>"
