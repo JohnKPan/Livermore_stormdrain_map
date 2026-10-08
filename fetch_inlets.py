@@ -23,7 +23,9 @@ Usage:
 """
 import argparse
 import csv
+import datetime
 import json
+import re
 import ssl
 import time
 import urllib.error
@@ -40,6 +42,124 @@ OUT_DIR = ROOT / "derived"
 CANONICAL = ["AssetID", "TypeDescription", "SubType", "TopOfGrate",
              "InvertElevation1", "Depth", "OperationalStatus", "YearInstalled"]
 
+# The canonical columns holding an elevation rather than a length or a label.
+# They are the only ones a datum offset may touch: Foster City's rims and
+# inverts are 100 ft off, but its depths are depths and are already right.
+ELEVATION_COLS = ("TopOfGrate", "InvertElevation1")
+
+# The datum the corpus is on. Livermore, Pleasanton, San Jose and Fremont all
+# publish NGVD29, so plot_street_drains.py converts the whole file with one
+# constant (DATUM_SHIFT_M = 0.794 m) at load time.
+NGVD29_TO_NAVD88_FT = 2.605          # 0.794 m, plot_street_drains.DATUM_SHIFT_M
+
+# Every city that publishes an elevation names its datum, and the name carries
+# the offset. Values are feet ADDED to a published elevation to put it on the
+# corpus datum -- NOT feet to NAVD88, which is a different number, because the
+# plotter's global shift is still waiting downstream. NGVD29 is therefore 0.0:
+# a city already on the corpus datum needs nothing here.
+#
+# Naming the datum rather than writing a bare offset is the point. An offset of
+# zero and a missing key look identical in a registry and mean opposite things
+# -- "measured, and it matches" against "nobody looked" -- and a city silently
+# mis-shifted by 2.6 ft is invisible to the plotters' 20 ft grate gate. So
+# `datum` is REQUIRED on any city mapping an elevation; see check_registry().
+DATUMS = {
+    "NGVD29":     0.0,
+    "NAVD88":     -NGVD29_TO_NAVD88_FT,
+    "NGVD29+100": -100.0,            # Foster City's local convention
+}
+
+
+def _to_float(v):
+    """A number the publisher stored as text.
+
+    San Ramon writes rim elevations as "486.44" and empty ones as " ", and
+    Richmond files depths as "18". Anything unparseable becomes None rather
+    than a string in a numeric column.
+    """
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if not isinstance(v, str):
+        return None
+    try:
+        return float(v.strip())
+    except ValueError:
+        return None
+
+
+_LEAD_NUM = re.compile(r"^\s*(-?\d+(?:\.\d+)?)")
+
+
+def _lead_float(v):
+    """The number at the front of a packed string.
+
+    Emeryville files an invert as `39.91 12" OUT` -- elevation, pipe size and
+    direction in one text column. Four rows start with a minus sign, which is
+    why the pattern allows one.
+    """
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return v
+    if not isinstance(v, str):
+        return None
+    m = _LEAD_NUM.match(v)
+    return float(m.group(1)) if m else None
+
+
+def _first_line(v):
+    r"""The first line of a multi-line map label.
+
+    Foster City publishes no type column; its only description of what a node
+    is sits at the head of the label it draws on the map, "Curb Inlet\nDI No:
+    4537". The break arrives from the service as the two characters backslash-n
+    rather than a newline, so both spellings are cut.
+    """
+    if not isinstance(v, str):
+        return v
+    head = v.replace("\\n", "\n").split("\n")[0].strip()
+    return head or None
+
+
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+def _year(v):
+    """Calendar year out of an Esri date field (epoch milliseconds).
+
+    Fairfield's InstallDate spans 1977..2007 on 95% of rows, which is the only
+    install date anyone here publishes better than Livermore. Built by adding a
+    timedelta rather than fromtimestamp(), which raises on pre-1970 dates.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        return (_EPOCH + datetime.timedelta(milliseconds=v)).year
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def _inches_to_feet(v):
+    """Richmond's DEPTH/LENGTH/WIDTH are inches. Livermore's Depth is feet."""
+    f = _to_float(v)
+    return None if f is None else round(f / 12.0, 3)
+
+
+def _negate(v):
+    """Cupertino stores depth as a signed offset below the rim, so a 6 ft basin
+    reads -6.0. Negated rather than abs()'d: the nine rows that were already
+    positive come out negative, which shows the publisher's sign error instead
+    of laundering it into a plausible number."""
+    f = _to_float(v)
+    return None if f is None else -f
+
+
+CONVERTERS = {"float": _to_float, "lead_float": _lead_float,
+              "first_line": _first_line, "year": _year,
+              "inches_to_feet": _inches_to_feet, "negate": _negate}
+
 # --------------------------------------------------------------------------
 # City registry.
 #
@@ -48,10 +168,27 @@ CANONICAL = ["AssetID", "TypeDescription", "SubType", "TopOfGrate",
 #           layer carries 54 columns and the original script deliberately took
 #           15 of them. --all-fields overrides.
 #   canon   canonical name -> native field. Anything unmapped comes out blank.
+#   where   optional predicate, for a publisher whose "inlet" layer is really a
+#           mixed structures layer
+#   convert optional {native field: CONVERTERS key}, for a column that has to be
+#           read before it means anything -- a number stored as text, a year
+#           inside a date, an elevation at the front of a packed string. Applied
+#           to canonical columns only; a native column rides along as served.
+#   sentinels optional numbers this city writes to mean "no reading" (-999 and
+#           friends). Dropped to blank on every canonical numeric.
+#   datum   the vertical datum the city publishes on, a key of DATUMS. Required
+#           of every city mapping an elevation, and applied to elevations only,
+#           never to depths. Each was measured against USGS 3DEP bare earth over
+#           2,000 grates sampled the length of the layer's OID range -- the
+#           numbers in the comments below are that measurement.
 #   out     default output stem under derived/
 #
 # Endpoints and field names come from bay_area_stormdrain_sources.csv; re-run
-# survey_bay_area_sources.py if a service moves.
+# survey_bay_area_sources.py if a service moves. Population figures in the
+# comments below are counted over the whole layer, non-null AND non-zero, and
+# elevation columns were checked against USGS 3DEP bare earth (30 points per
+# city, NAVD88 ft) -- a name proves nothing here, as Los Gatos publishes a
+# column called TopOfGrate that is zero on 2,416 of its 2,422 inlets.
 # --------------------------------------------------------------------------
 CITIES = {
     "livermore": {
@@ -69,6 +206,9 @@ CITIES = {
                   "InvertElevation1": "InvertElevation1", "Depth": "Depth",
                   "OperationalStatus": "OperationalStatus",
                   "YearInstalled": "YearInstalled"},
+        # Measured NGVD29: median -2.428 ft from 3DEP bare earth over 2,000
+        # of its 4,486 grates, 78.8% of them within a foot of that datum.
+        "datum": "NGVD29",
         # Legacy name: the readme's seven commands and both plot scripts point
         # at derived/storm_inlets.csv. Other cities get a suffixed file.
         "out": "storm_inlets",
@@ -88,6 +228,10 @@ CITIES = {
         "canon": {"AssetID": "FACILITYID", "TypeDescription": "INLETTYPE",
                   "TopOfGrate": "RIMELEV", "InvertElevation1": "INVERTELEV",
                   "YearInstalled": "INSTALLYEAR"},
+        # Measured NGVD29: median -2.342 ft over 2,000 of its 27,284 grates,
+        # 69.3% within a foot. The widest spread of the twelve (IQR 1.20), which
+        # is the bridge-deck and right-tail population the 20 ft gate keeps.
+        "datum": "NGVD29",
         "out": "storm_inlets_san_jose",
         # Esri's Hub keeps a cached extract of this layer, reachable when the
         # origin is not. See --via-hub; it is a mirror, not a replica.
@@ -122,6 +266,9 @@ CITIES = {
         "canon": {"AssetID": "CODE", "TypeDescription": "SP_FUNC",
                   "TopOfGrate": "RIM_ELEV", "InvertElevation1": "INV_OUT",
                   "Depth": "DEPTH", "OperationalStatus": "STATUS"},
+        # Measured NGVD29: median -2.744 ft over 2,000 of its 7,292 grates,
+        # 73.3% within a foot.
+        "datum": "NGVD29",
         "out": "storm_inlets_pleasanton",
     },
     "fremont": {
@@ -170,6 +317,10 @@ CITIES = {
         "canon": {"AssetID": "STORMN_KEY", "TypeDescription": "GISO_LABEL",
                   "SubType": "NODE_TYPE", "TopOfGrate": "RIM_ELEV",
                   "InvertElevation1": "ELEV_LOPIP", "Depth": "BOX_DEPTH"},
+        # Measured NGVD29 on the only 31 grates it has: median -2.064 ft, 21 of
+        # 31 within a foot. Thin, but it agrees with its neighbours and the
+        # column is nearly empty anyway.
+        "datum": "NGVD29",
         "out": "storm_inlets_fremont",
     },
     "hayward": {
@@ -202,6 +353,256 @@ CITIES = {
         "canon": {"AssetID": "ID", "TypeDescription": "InletType",
                   "YearInstalled": "Comments"},
         "out": "storm_inlets_hayward",
+    },
+    "richmond": {
+        "label": "Richmond",
+        # ArcGIS Online hosted, public, no token; layer 162 of a wide service.
+        "url": ("https://services6.arcgis.com/il6vO1TutlF580Ku/arcgis/rest"
+                "/services/Storm_Collection_Device/FeatureServer/162"),
+        # 4,777 collection devices and every one of them is an inlet, so no
+        # filter: SUBTYPE is 2 Curb Inlet 1,828, 0 Catch Basin 1,522, 1 Drop
+        # Inlet 1,122, 5 Partial Pipe Culvert 302, 6 Other Culvert 2, 4
+        # Potential 1. Not a manhole in the layer.
+        "fields": ["OBJECTID", "ASSET_ID", "FACILITYID", "SUBTYPE",
+                   "LIFE_CYCLE_STATUS", "RIM_ELEV", "DEM_ELEV_FT", "DEPTH",
+                   "LENGTH", "WIDTH", "MATERIAL", "CONDITION", "OWNERSHIP",
+                   "INSTALL_YEAR", "CONFIDENCE", "DRAIN_BASIN_NM", "NOTES"],
+        # THE BEST GRATE DATA OF THE 34 SOURCES SURVEYED. RIM_ELEV is populated
+        # on 4,654 of 4,777 (97.4%) and sits +0.317 ft from 3DEP bare earth
+        # (median over 2,000 grates, IQR 0.28, MAD 0.13) -- NAVD88 already, and
+        # on 94.5% of points individually, the cleanest agreement of the twelve.
+        # Naming that datum is what makes the entry undo the corpus shift rather
+        # than leave the rims 2.6 ft high.
+        #
+        # DEM_ELEV_FT is on every row and is sampled off a DEM: San Jose's
+        # DEMELEV again, and it rides along natively for the same reason.
+        #
+        # DEPTH, LENGTH and WIDTH are numbers stored as text ("18", "142") and
+        # they are inches, not feet -- the median device is 36 in deep, and a
+        # foot reading would bury these basins 50 ft down. Only Depth is
+        # canonical, so only it is converted; the other two stay as served.
+        #
+        # INSTALL_YEAR exists and is filled on 4 rows, so YearInstalled stays
+        # blank. CONDITION is a Good/Fair/Bad grade and is NOT
+        # OperationalStatus, per Hayward; LIFE_CYCLE_STATUS is the real one.
+        "convert": {"DEPTH": "inches_to_feet"},
+        "datum": "NAVD88",
+        "canon": {"AssetID": "ASSET_ID", "TypeDescription": "SUBTYPE",
+                  "TopOfGrate": "RIM_ELEV", "Depth": "DEPTH",
+                  "OperationalStatus": "LIFE_CYCLE_STATUS"},
+        "out": "storm_inlets_richmond",
+    },
+    "cupertino": {
+        "label": "Cupertino",
+        # The city's own server, and the one endpoint here under /cupgis/.
+        "url": ("https://gis.cupertino.org/cupgis/rest/services/Public"
+                "/AmazonData/MapServer/45"),
+        # 6,296 structures of 16 kinds; these four are the inlets, 3,493 of them
+        # -- Catch Basin 2,170, Area Drain 720, Drop Inlet 579, BubbleUp 24.
+        # The filter drops Manhole 2,192, Clean Out 266, Outfall 185, Unknown
+        # 77 and a tail of treatment devices. Inlet Culvert (19) and Thru Curb
+        # Drain (3) are left out: both are pipe openings, not street inlets.
+        "where": ("StructureType IN ('Catch Basin','Drop Inlet','Area Drain',"
+                  "'BubbleUp')"),
+        "fields": ["OBJECTID", "AssetID", "LegacyID", "StructureType", "Status",
+                   "RimElev", "Depth", "CoverType", "OwnedBy", "MaintainedBy",
+                   "Location", "AsbuiltDate", "DataSource", "IsCityStandard",
+                   "HasStencil", "hasInspection"],
+        # RimElev is on 2,487 of the 3,493 inlets (71.2%) and is NAVD88, not
+        # NGVD29: median -0.185 ft against 3DEP over 2,000 grates, IQR 0.40, and
+        # 1,727 of those points individually within a foot of NAVD88 against 170
+        # of NGVD29.
+        #
+        # A 30-point check said NGVD29 and was wrong. Those 30 were the first
+        # rows the server returned, which is OID order, which is digitising
+        # order -- and they landed inside the 8.5% minority cluster that really
+        # does sit 2.6 ft low. A city is not a subdivision; the sample has to
+        # walk the whole OID range or it measures a neighbourhood.
+        #
+        # Depth is a SIGNED OFFSET BELOW THE RIM: 2,010 rows negative (3-9 ft
+        # typical), 9 positive, 880 zero. Negated into the canonical column,
+        # which is a positive depth in Livermore's usage. See _negate() for why
+        # those 9 rows are left looking wrong.
+        #
+        # InstallDate is filled on 18 rows. AsbuiltDate is filled on 2,830
+        # (81%) and is tempting, but an as-built is when the drawing was signed,
+        # not when the basin went in, so YearInstalled stays blank and the date
+        # rides along native.
+        "convert": {"Depth": "negate"},
+        "datum": "NAVD88",
+        "canon": {"AssetID": "AssetID", "TypeDescription": "StructureType",
+                  "TopOfGrate": "RimElev", "Depth": "Depth",
+                  "OperationalStatus": "Status"},
+        "out": "storm_inlets_cupertino",
+    },
+    "fairfield": {
+        "label": "Fairfield",
+        # ArcGIS Online hosted view of the city's 811 layer, public, no token.
+        "url": ("https://services1.arcgis.com/A14KNJpxNyBTu19J/arcgis/rest"
+                "/services/StormDrain811_view/FeatureServer/2"),
+        # All 5,922 rows are inlets -- SDCB 5,717, SDDI 152, SDFI 53 -- so no
+        # filter. Solano County, north-east of the other eight cities.
+        "fields": ["OBJECTID", "FacilityID", "InletType", "RimElev",
+                   "InvertElev", "InstallDate", "OwnedBy", "Street",
+                   "CrossStreet", "MapGrid", "AccessMaterial", "GrateSize",
+                   "Condition", "Notes"],
+        # TWO SENTINELS, not one: RimElev is non-zero on 3,726 rows, of which 27
+        # are -999 and 355 are -888. Dropping both leaves 3,344 real readings
+        # (56.5%), measuring -2.230 ft against 3DEP over 2,000 grates
+        # (IQR 0.76, 83.1% of points within a foot of NGVD29).
+        # InvertElev (325 rows, 5.5%) uses the same codes.
+        #
+        # InstallDate is a genuine date field, 1977-11-08 to 2007-01-10, on
+        # 5,636 rows (95%) -- better install coverage than any city here except
+        # Hayward, and Hayward's is a year hidden in a Comments column. Read to
+        # a year, since that is what YearInstalled holds elsewhere.
+        #
+        # Status is empty on every row and Activeflag is 1 on every row, so
+        # OperationalStatus stays blank rather than being filled with a constant.
+        "convert": {"InstallDate": "year"},
+        "sentinels": (-999, -888),
+        "datum": "NGVD29",
+        "canon": {"AssetID": "FacilityID", "TypeDescription": "InletType",
+                  "TopOfGrate": "RimElev", "InvertElevation1": "InvertElev",
+                  "YearInstalled": "InstallDate"},
+        "out": "storm_inlets_fairfield",
+    },
+    "foster_city": {
+        "label": "Foster City",
+        # ArcGIS Online hosted, public, no token.
+        "url": ("https://services.arcgis.com/yq3FgOI44hYHAFVZ/arcgis/rest"
+                "/services/Foster_City_StormNode/FeatureServer/0"),
+        # "StormNode" sounds mixed and is not: all 5,039 rows are inlets, 4,841
+        # curb inlets and 198 street drains. No manholes, so no filter.
+        "fields": ["OBJECTID", "CB_ID", "SHORT", "CURBINLET", "DEPTH", "EL_OUT",
+                   "CALC_DEPTH", "DATE_", "DIA_OUT", "EL_INV1", "DIA_INV1",
+                   "MAINT_RESP", "CONF_DOC", "LOCATION"],
+        # A LOCAL VERTICAL DATUM, AND A COLUMN NAMED FOR THE WRONG QUANTITY.
+        # DEPTH is not a depth, it is the RIM ELEVATION: it tracks 3DEP bare
+        # earth at +97.591 ft (median over 2,000 grates, IQR 0.94) in a city
+        # that is flat and at sea level. That is NGVD29 + 100 ft, the usual
+        # municipal dodge for a place where real elevations are 2-8 ft, and the
+        # round hundred is the right reading of it -- the residual against
+        # NGVD29+100 is +0.196 ft, about where a grate sits relative to bare
+        # earth, and 1,631 of 2,000 points land within a foot of it. Not one
+        # point in 2,000 votes for either of the other two datums.
+        #
+        # The rest follows from that: EL_OUT is the outgoing invert on the same
+        # datum, and CALC_DEPTH is the actual depth -- DEPTH - EL_OUT ==
+        # CALC_DEPTH on all 2,934 rows carrying the three, so it is derived and
+        # it is a length, which is why no datum offset is allowed near it.
+        #
+        # There is no type column at all. SHORT is the two-line map label and
+        # its first line is the only description of what a node is.
+        #
+        # DATE_ is a plain year on 3,713 rows (73.7%), one of which reads 199.
+        #
+        # Nine of the 3,069 rims land outside -5..20 ft once shifted: three
+        # where the publisher put a DEPTH in the depth-named column after all
+        # (10.2, 14.5, 1031.0), and five where rim and invert are the same
+        # number. Left alone -- the plotters' DEM gate rejects all nine, and
+        # patching them here would hide a data-entry pattern worth seeing.
+        "convert": {"SHORT": "first_line"},
+        "datum": "NGVD29+100",
+        "canon": {"AssetID": "CB_ID", "TypeDescription": "SHORT",
+                  "TopOfGrate": "DEPTH", "InvertElevation1": "EL_OUT",
+                  "Depth": "CALC_DEPTH", "YearInstalled": "DATE_"},
+        "out": "storm_inlets_foster_city",
+    },
+    "suisun_city": {
+        "label": "Suisun City",
+        # ArcGIS Online hosted, public, no token. Solano County, next to
+        # Fairfield and sharing a plan set with it in places.
+        "url": ("https://services6.arcgis.com/c3LFtvdbbWzVLXLS/arcgis/rest"
+                "/services/Suisun_City_Storm_Drains/FeatureServer/1"),
+        # 2,040 catch basins, already just inlets.
+        "fields": ["OBJECTID", "Text_", "Elevation", "TCElevation",
+                   "RimElevation", "SourceDoc", "SrcSubdivision", "SrcProject",
+                   "SrcSheet", "Comments", "DateLastRev"],
+        # THREE ELEVATION COLUMNS, and the one named RimElevation is the worst
+        # of them: 161 rows (7.9%). Elevation carries 1,741 (85.3%) at -2.22 ft
+        # from 3DEP, TCElevation 1,307 (64.1%) at -2.44 (IQR 0.38). Both are
+        # NGVD29 and both land within half a foot of grade once shifted;
+        # Elevation wins on coverage and is the rim, so TCElevation and
+        # RimElevation ride along native and can be compared against it.
+        #
+        # Measured NGVD29: median -2.301 ft over all 1,741 of its grates,
+        # IQR 1.13, 69.6% of points within a foot.
+        #
+        # NO ASSET ID EXISTS. The layer has OBJECTID and nothing else that
+        # identifies a basin, so AssetID stays blank -- the only city here with
+        # no identifier at all.
+        #
+        # Text_ is a map label pressed into service as a type: CB 1,812, DI 106,
+        # CB_4 41, then FI, JB and two rows whose "type" is a number (one of
+        # them, "29.42", is that row's own Elevation). It needs normalising
+        # before it can drive a legend.
+        "datum": "NGVD29",
+        "canon": {"TypeDescription": "Text_", "TopOfGrate": "Elevation"},
+        "out": "storm_inlets_suisun_city",
+    },
+    "belmont": {
+        "label": "Belmont",
+        # ArcGIS Online hosted, public, no token. An adopt-a-drain publication
+        # rather than an asset layer, which is why the schema is so thin -- and
+        # why it is surprising that it carries a usable elevation.
+        "url": ("https://services2.arcgis.com/yj9NEYUuOce5iBjA/arcgis/rest"
+                "/services/Adopt_A_Drain/FeatureServer/0"),
+        "fields": ["OBJECTID", "STORMCB_ID", "DXF_LAYER", "Z_alt", "NoGrate",
+                   "NoDump_Mar", "BikeSafe", "SITUS_STRE", "Location", "Owner",
+                   "Adopted"],
+        # Z_alt is on 837 of 1,008 (83.0%) and reads -3.085 ft against 3DEP
+        # over all 837 (IQR 0.74) -- NGVD29, but the loosest fit of the twelve:
+        # the residual is -0.480 ft and 197 points sit more than a foot from any
+        # known datum, so the column runs a little below grade and a little
+        # noisy. The name suggests a spare Z column
+        # and it is in fact the only elevation the layer has; 247 rows sit above
+        # 400 ft, which is right for a city climbing into the hills.
+        #
+        # DXF_LAYER is the CAD layer the points were digitised off and is the
+        # constant "SDCB". It is the only type column, so it is mapped, and like
+        # Pleasanton's SP_FUNC it needs normalising before a legend can use it.
+        #
+        # NoGrate flags 26 openings with no grate at all; kept native.
+        "datum": "NGVD29",
+        "canon": {"AssetID": "STORMCB_ID", "TypeDescription": "DXF_LAYER",
+                  "TopOfGrate": "Z_alt"},
+        "out": "storm_inlets_belmont",
+    },
+    "emeryville": {
+        "label": "Emeryville",
+        # ArcGIS Online hosted, public, no token. Smallest source in the
+        # registry, 457 inlets, and the densest per acre.
+        "url": ("https://services3.arcgis.com/ljOdqLVbHpS7dOJQ/arcgis/rest"
+                "/services/Storm_Inlets_View/FeatureServer/19"),
+        # TWO GENERATIONS OF SCHEMA IN ONE LAYER, and the modern half is empty.
+        # RIMELEV, INVERTELEV, INVERT, HIGHELEV, CVTYPE, CONDITION, ACTIVEFLAG,
+        # OWNEDBY, LOCDESC and INSTALLDATE are the Esri storm-water template and
+        # not one of them has a value. Every reading lives in the legacy CAD
+        # columns underneath: TC, INVERT1..5, CBNO, MHNO.
+        "fields": ["OBJECTID", "FACILITYID", "CBNO", "MHNO", "TC", "TW", "RIM",
+                   "INVERT1", "INVERT2", "INVERT3", "INVERT4", "VCOMMENTS"],
+        # TC is a top of curb, not a top of grate, and it is the best thing
+        # here: 423 of 457 (92.6%) at -2.594 ft from 3DEP across all of them,
+        # IQR 0.35, MAD 0.17. That is NGVD29 to within 0.011 ft -- the closest
+        # any city in this registry sits to its own datum -- and 391 of the 423
+        # points agree individually. RIM, the column that would be the right
+        # one, is filled on a single row.
+        #
+        # INVERT1 packs three facts into text -- `39.91 12" OUT` -- so the
+        # leading number is parsed out. It is the FIRST listed invert, not
+        # necessarily the outgoing one: 318 rows say OUT, 115 say IN, 11 say
+        # neither ("TO MAIN"). Pleasanton could choose INV_OUT over INV_IN
+        # because they were separate columns; here they are one, and INVERT2..4
+        # ride along native so the direction stays inspectable.
+        #
+        # No type column exists in either generation, so TypeDescription is
+        # blank. CBNO and MHNO duplicate each other and the facility id.
+        "convert": {"INVERT1": "lead_float"},
+        "datum": "NGVD29",
+        "canon": {"AssetID": "FACILITYID", "TopOfGrate": "TC",
+                  "InvertElevation1": "INVERT1"},
+        "out": "storm_inlets_emeryville",
     },
 }
 
@@ -360,6 +761,93 @@ def fetch_hub(dataset):
     return feats, domains
 
 
+def check_registry():
+    """Refuse to run on a registry that leaves a datum unstated.
+
+    The failure this prevents is silent by construction: a city on NAVD88 with
+    no `datum` gets shifted 2.605 ft by the plotters' global constant and lands
+    every grate 2.6 ft high, which is well inside the 20 ft window the DEM gate
+    judges a grate by. Cupertino spent a day in exactly that state. A missing
+    key is therefore an error, not a default.
+    """
+    for key, cfg in CITIES.items():
+        elev = [c for c in ELEVATION_COLS if cfg["canon"].get(c)]
+        name = cfg.get("datum")
+        if elev and not name:
+            raise SystemExit(
+                f"{key}: maps {', '.join(elev)} but declares no datum. Measure "
+                f"it against 3DEP and add one of: {', '.join(DATUMS)}")
+        if name and name not in DATUMS:
+            raise SystemExit(f"{key}: unknown datum {name!r}; "
+                             f"known: {', '.join(DATUMS)}")
+        if name and not elev:
+            raise SystemExit(f"{key}: declares datum {name!r} but maps no "
+                             f"elevation for it to apply to")
+
+
+def point(lon, lat):
+    """(lon, lat) as floats, or None when the row carries no usable location.
+
+    Every consumer of this corpus needs the point and nothing else will do: the
+    AOI filter, the snap to a street profile, the DEM sample under the grate.
+    A row without one is not an inlet, it is a record of an inlet, and it has
+    no place in a file that exists to put drains on a map.
+
+    Refused: null, blank, non-numeric, NaN, and exactly (0, 0) -- null island
+    is the other way a service says "no geometry", 380 miles off Ghana.
+
+    Out-of-range raises rather than returning None, because it is a different
+    kind of failure: it means the server ignored outSR=4326 and answered in
+    State Plane feet or Web Mercator metres. That is systematic, it would put
+    every inlet in the wrong hemisphere, and the caller stops the run.
+    """
+    try:
+        lon = float(lon)
+        lat = float(lat)
+    except (TypeError, ValueError):
+        return None
+    if lon != lon or lat != lat:                  # NaN
+        return None
+    if lon == 0 and lat == 0:
+        return None
+    if abs(lon) > 180 or abs(lat) > 90:
+        raise ValueError(f"({lon}, {lat}) is not a longitude/latitude pair")
+    return lon, lat
+
+
+def require_points(rows, city):
+    """Every row that survives this carries coordinates. Drops are named.
+
+    Six of the 34 Bay Area sources publish rows with attributes and no
+    geometry -- Marin County 25, Oakland 2, then one each in Hayward, Suisun
+    City, Burlingame and Emeryville, 31 rows in 93,829. They are dropped rather
+    than written with blank coordinates, and dropped loudly: a silent one would
+    be indistinguishable from an inlet the AOI filter excluded.
+    """
+    kept, dropped = [], []
+    for r in rows:
+        try:
+            pt = point(r.get("lon"), r.get("lat"))
+        except ValueError as e:
+            raise SystemExit(
+                f"{city}: {e}. The service ignored outSR=4326, so these are "
+                f"projected coordinates -- refusing to write them as lon/lat.")
+        if pt is None:
+            dropped.append(r)
+        else:
+            r["lon"], r["lat"] = pt
+            kept.append(r)
+    if dropped:
+        ids = ", ".join(str(r.get("AssetID") or r.get("OBJECTID") or "?")
+                        for r in dropped[:6])
+        print(f"  ! dropped {len(dropped)} row(s) with no location published: "
+              f"{ids}{' ...' if len(dropped) > 6 else ''}")
+    if rows and not kept:
+        raise SystemExit(f"{city}: no row carries a location; refusing to "
+                         f"write a file of {len(rows)} unplaceable inlets")
+    return kept
+
+
 def build_rows(feats, city, cfg, natives, domains):
     """Canonical columns first, then whatever else the city publishes.
 
@@ -376,8 +864,25 @@ def build_rows(feats, city, cfg, natives, domains):
     value is the publisher's business, but a padded CANONICAL one defeats the
     cross-city comparison those columns exist for. A value that is only
     whitespace becomes None rather than "".
+
+    Three more corrections apply to canonical columns only, in this order:
+
+    `convert` first, because the rest cannot judge a value they cannot read --
+    San Ramon's "486.44" is not a number until it is parsed, and Fairfield's
+    -999 hides inside a date-shaped integer nowhere near it.
+
+    `sentinels` next, so a publisher's "no reading" code becomes blank rather
+    than a reading. It has to precede the datum shift: -999 + -100 is -1099,
+    which matches nothing and would sail through as data.
+
+    The datum offset last, and only on ELEVATION_COLS. Zero is left alone rather
+    than shifted -- a zero elevation means "no reading" everywhere in this
+    corpus, and moving it to -100.0 would invent one.
     """
     canon = cfg["canon"]
+    convert = cfg.get("convert") or {}
+    sentinels = set(cfg.get("sentinels") or ())
+    datum = DATUMS[cfg["datum"]] if cfg.get("datum") else 0.0
     consumed = set(canon.values())
     extras = [f for f in natives if f not in consumed]
     cols = ["lon", "lat", "source"] + CANONICAL + extras
@@ -389,22 +894,32 @@ def build_rows(feats, city, cfg, natives, domains):
         for name in CANONICAL:
             native = canon.get(name)
             v = a.get(native) if native else None
+            conv = convert.get(native) if native else None
+            if conv:
+                v = CONVERTERS[conv](v)
             codes = domains.get(native) if native else None
             if codes and v is not None:
                 v = codes.get(str(v), v)
             if isinstance(v, str):
                 v = v.strip() or None
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                if v in sentinels:
+                    v = None
+                elif datum and v != 0 and name in ELEVATION_COLS:
+                    v = round(v + datum, 3)
             row[name] = v
         for f in extras:
             row[f] = a.get(f)
         rows.append(row)
-    return rows, cols
+    return require_points(rows, city), cols
 
 
 def report(rows, cfg):
+    # No "missing geometry" count: require_points() has already guaranteed
+    # every row here has one, and said so on the way past if any went. The
+    # bbox at the end of this function is what proves the coordinates landed
+    # where the city is.
     print(f"\ntotal: {len(rows)}")
-    missing = sum(1 for r in rows if r["lat"] is None or r["lon"] is None)
-    print(f"missing geometry: {missing}")
 
     for col in ("TypeDescription", "OperationalStatus"):
         if not cfg["canon"].get(col):
@@ -422,11 +937,9 @@ def report(rows, cfg):
         print(f"\n{col} (from {native}): {len(vals)} / {len(rows)} populated", end="")
         print(f"   range {min(vals):.1f}..{max(vals):.1f}" if vals else "")
 
-    pts = [(r["lon"], r["lat"]) for r in rows
-           if r["lat"] is not None and r["lon"] is not None]
-    if pts:
-        lons = [p[0] for p in pts]
-        lats = [p[1] for p in pts]
+    if rows:
+        lons = [r["lon"] for r in rows]
+        lats = [r["lat"] for r in rows]
         print(f"\nbbox: lon {min(lons):.5f}..{max(lons):.5f}  "
               f"lat {min(lats):.5f}..{max(lats):.5f}")
 
@@ -436,6 +949,17 @@ def fetch_city(key, cfg, args):
     print(f'{cfg["label"]}: {cfg["url"]}')
     if cfg.get("where"):
         print(f'  filter: {cfg["where"]}')
+    if cfg.get("convert"):
+        print("  convert: " + ", ".join(f"{k} as {v}"
+                                        for k, v in cfg["convert"].items()))
+    if cfg.get("sentinels"):
+        print("  sentinels dropped: "
+              + ", ".join(str(s) for s in cfg["sentinels"]))
+    if cfg.get("datum"):
+        shift = DATUMS[cfg["datum"]]
+        print(f'  datum: {cfg["datum"]}'
+              + (f', elevations shifted {shift:+g} ft onto the corpus datum'
+                 if shift else ' -- the corpus datum, no shift'))
 
     if args.via_hub:
         if not cfg.get("hub"):
@@ -488,7 +1012,9 @@ def write_out(rows, cols, csv_path, want_geojson):
             {"type": "Feature",
              "geometry": {"type": "Point", "coordinates": [r["lon"], r["lat"]]},
              "properties": {k: r.get(k) for k in cols if k not in ("lon", "lat")}}
-            for r in rows if r["lat"] is not None and r["lon"] is not None]}
+            # Every row, unconditionally: require_points() left none without a
+            # coordinate, so a filter here could only ever hide a bug.
+            for r in rows]}
         with open(gj_path, "w", encoding="utf-8") as f:
             json.dump(gj, f)
         print(f"wrote {gj_path}")
@@ -536,7 +1062,10 @@ def reuse_city(existing, key, cfg, all_fields=False):
         # The registry gained a field since the file was written, so the file
         # cannot answer for this city any more.
         return None
-    return [{c: r.get(c, "") for c in cols} for r in rows], cols
+    # Filtered here too, not just on the fetch path: a file written before
+    # require_points existed still holds its blank-coordinate rows, and reuse
+    # is how they would outlive every rebuild.
+    return require_points([{c: r.get(c, "") for c in cols} for r in rows], key), cols
 
 
 def merge(per_city):
@@ -588,6 +1117,7 @@ def main():
                          "for when the publisher's host is refusing connections. "
                          "Cached: record count and schema may lag the live layer")
     args = ap.parse_args()
+    check_registry()
 
     if args.list:
         for key, c in CITIES.items():
@@ -595,6 +1125,9 @@ def main():
             print(f'{key:<12} {c["label"]:<12} {c["url"]}')
             if c.get("where"):
                 print(f'             filter {c["where"]}')
+            if c.get("datum"):
+                print(f'             datum {c["datum"]} '
+                      f'({DATUMS[c["datum"]]:+g} ft)')
             print(f'             {mapped}')
         return
 
