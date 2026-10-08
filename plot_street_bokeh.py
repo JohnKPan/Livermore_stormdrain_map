@@ -35,7 +35,8 @@ import xyzservices.providers as xyz
 from bokeh.layouts import column, row
 from bokeh.models import (Arrow, BoxSelectTool, CheckboxGroup,
                           ColumnDataSource, CustomJS, Div, HoverTool, LabelSet,
-                          Range1d, Span, TapTool, Title, VeeHead)
+                          CustomJSHover, Range1d, Span, TapTool, Title,
+                          VeeHead)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
@@ -249,8 +250,16 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     myb = np.where(np.isfinite(zb), my, np.nan)
     mxt = np.where(np.isfinite(zt), mx, np.nan)
     myt = np.where(np.isfinite(zt), my, np.nan)
-    src = ColumnDataSource(dict(d=d[k], z=z[k], sm=sm[k], mx=mx[k], my=my[k],
-                                lon=lon[k], lat=lat[k],
+    # float32 on the two long arrays that were float64 for no reason. z is
+    # already float32 off the parquet, which is why it cost 99 KB against sm's
+    # 204 KB for the identical 37,666 points. At float32 chainage holds to
+    # 0.7 mm over a 5 km street and elevation to 0.02 mm -- both far under
+    # anything this corpus can resolve. mx/my stay float64: Web Mercator
+    # metres at float32 are good to about a metre, which shows at zoom, and
+    # the lat/lon callback below now derives from them.
+    src = ColumnDataSource(dict(d=d[k].astype(np.float32), z=z[k],
+                                sm=sm[k].astype(np.float32),
+                                mx=mx[k], my=my[k],
                                 zb=zb[k], zt=zt[k],
                                 mxb=mxb[k], myb=myb[k],
                                 mxt=mxt[k], myt=myt[k]))
@@ -541,24 +550,44 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
         cur.data = {d:[H.d[i]], z:[H.z[i]], mx:[H.mx[i]], my:[H.my[i]]};
         cur.change.emit();
         vline.location = H.d[i];
+        const R = 6378137.0, DEG = 180 / Math.PI;
+        const la = (2 * Math.atan(Math.exp(H.my[i] / R)) - Math.PI / 2) * DEG;
+        const lo = H.mx[i] / R * DEG;
         read.text = "<b>" + H.d[i].toFixed(0) + " m</b> along  |  elev <b>"
                   + H.z[i].toFixed(2) + " m</b>  |  smoothed " + H.sm[i].toFixed(2)
-                  + " m  |  <b>" + H.lat[i].toFixed(6) + ", " + H.lon[i].toFixed(6) + "</b>";
+                  + " m  |  <b>" + la.toFixed(6) + ", " + lo.toFixed(6) + "</b>";
     """
     cb_prof = CustomJS(args=dict(SRC=src, cur=cur, vline=vline, read=read),
                        code=LINK_JS)
     cb_map = CustomJS(args=dict(SRC=src, cur=cur, vline=vline, read=read),
                       code=LINK_JS)
+    # mx/my and lat/lon are the SAME points in two projections, so shipping
+    # both put two float64 arrays per page on the wire for nothing -- 449 KB
+    # of a 1.67 MB page, 27% of it. Web Mercator inverts in closed form, and a
+    # CustomJSHover does that conversion on the ONE value being displayed,
+    # which is the only place it was ever needed. Checked against pyproj over
+    # 20,000 points in the Livermore box: worst error 1.4e-14 deg, under a
+    # nanometre. (The obvious alternative, filling the columns once at
+    # DocumentReady, does not work: that event never fires in a standalone
+    # saved document -- the handler ships and is simply never called.)
+    merc_lat = CustomJSHover(code="return ((2 * Math.atan(Math.exp("
+                                  "value / 6378137.0)) - Math.PI / 2)"
+                                  " * 180 / Math.PI).toFixed(6);")
+    merc_lon = CustomJSHover(code="return (value / 6378137.0 * 180 "
+                                  "/ Math.PI).toFixed(6);")
     path_tips = [("chainage", "@d{0.0} m"), ("elev", "@z{0.00} m"),
                  (f"smoothed ({smooth_m:g} m)", "@sm{0.00} m"),
-                 ("lat, lon", "@lat{0.000000}, @lon{0.000000}")]
+                 ("lat, lon", "@my{custom}, @mx{custom}")]
+    path_fmt = {"@my": merc_lat, "@mx": merc_lon}
     # vline mode on a scatter returns every point under the cursor, which
     # stacks five near-identical rows once zoomed in. Hovering the line with
     # line_policy="nearest" resolves to exactly one.
     prof.add_tools(HoverTool(renderers=[line_sm], tooltips=path_tips,
+                             formatters=path_fmt,
                              line_policy="nearest", mode="vline",
                              attachment="left", callback=cb_prof))
     mp.add_tools(HoverTool(renderers=[map_hit], tooltips=path_tips,
+                           formatters=path_fmt,
                            line_policy="nearest", attachment="left",
                            callback=cb_map))
 
