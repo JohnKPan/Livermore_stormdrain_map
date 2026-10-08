@@ -33,9 +33,9 @@ import numpy as np
 import pandas as pd
 import xyzservices.providers as xyz
 from bokeh.layouts import column, row
-from bokeh.models import (Arrow, BoxSelectTool, ColumnDataSource, CustomJS,
-                          Div, HoverTool, LabelSet, Range1d, Span, TapTool,
-                          VeeHead)
+from bokeh.models import (Arrow, BoxSelectTool, CheckboxGroup,
+                          ColumnDataSource, CustomJS, Div, HoverTool, LabelSet,
+                          Range1d, Span, TapTool, VeeHead)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
@@ -59,6 +59,9 @@ PROF_H, MAP_H, PANEL_W = 480, 560, 1180
 PROF_ARROW_FRAC = 0.16    # arrow length as a fraction of the visible y-range
 MAP_ARROW_FRAC = 0.10
 SV_W = 440                # embedded Street View panel, when a key is supplied
+# Shared, because the DEM-only toggle restores it: the pinned panel is a
+# snapshot of one tap and would otherwise keep showing the other mode's height.
+PICK_HINT = "<i>tap an inlet marker for its Street View link</i>"
 
 
 def bearing(lat1, lon1, lat2, lon2):
@@ -153,6 +156,26 @@ def _render_street(job):
     return out_rows, skipped, failed, msgs
 
 
+def inlet_paint(src, color):
+    """Fill, ring colour and ring width per inlet, from where its height came from.
+
+    Colour carries PROVENANCE, not type -- the marker glyph is already the type,
+    so fill is free to say something else, and what it says is whether the
+    height is measured or inferred. Surveyed keeps the type colour it has always
+    had; DEM-derived goes hollow, the same convention plot_street_drains.py
+    uses, so the two renderers cannot disagree about what a hollow marker means.
+    The ring stays the type colour, so a hollow marker is still typed.
+
+    One rule for both of the checkbox's modes, which is the point of factoring
+    it out: in DEM-only mode every marker comes back hollow, and the page says
+    at a glance that nothing on it is a survey.
+    """
+    surveyed = src == "survey"
+    return (np.where(surveyed, color, "#ffffff"),
+            np.where(surveyed, "#ffffff", color),
+            np.where(surveyed, 1.0, 2.0))
+
+
 def plan_names(by_name, names, branch_split=False, fold_split=False):
     """label and filename for every (street, part), assigned in one serial pass.
 
@@ -237,19 +260,23 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             if v.size:
                 ylo, yhi = min(ylo, v.min()), max(yhi, v.max())
     ypad = max(0.06*(yhi - ylo), 0.15)
+    # The smoothing window is in the title because two sets of these pages now
+    # exist side by side, and the sag markers below differ between them -- see
+    # prepare(). Two titles, not one, because the DEM-only checkbox changes
+    # which of them is true, and a title that still claimed the gate was in
+    # force would be the most authoritative wrong thing on the page.
+    title_head = (f"{street} — elevation profile ({len(near)} inlets within "
+                  f"{args.max_offset:g} m, {smooth_m:g} m smoothing, grate ")
+    title_gated = title_head + (
+        f"within {args.grate_tol_m:g} m of DEM else the DEM"
+        if args.grate_tol_m > 0 else "ungated") + ")"
+    title_dem = title_head + "from the DEM, published surveys ignored)"
     prof = figure(width=PANEL_W, height=PROF_H, tools="pan,wheel_zoom,box_zoom,reset",
                   x_axis_label=f"distance along street from {p['origin']} end (m)",
                   y_axis_label="elevation (m, NAVD88)",
                   x_range=Range1d(-0.02*float(d[-1]), 1.02*float(d[-1])),
                   y_range=Range1d(ylo - ypad, yhi + ypad),
-                  # The smoothing window is in the title because two sets of
-                  # these pages now exist side by side, and the sag markers
-                  # below differ between them -- see prepare().
-                  title=f"{street} — elevation profile "
-                        f"({len(near)} inlets within {args.max_offset:g} m, "
-                        f"{smooth_m:g} m smoothing, grate "
-                        + (f"within {args.grate_tol_m:g} m of DEM else the DEM"
-                           if args.grate_tol_m > 0 else "ungated") + ")")
+                  title=title_gated)
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     n_bridge = int(np.count_nonzero(np.isfinite(zb)))
     n_tunnel = int(np.count_nonzero(np.isfinite(zt)))
@@ -327,24 +354,27 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             # gate_to_dem() already substituted the DEM where the survey was
             # missing or rejected, so grate_m is populated; dem_m stays as the
             # last-resort fallback for an inlet that somehow snapped without one.
+            dem = g.dem_m.to_numpy(dtype=float)
             gy = np.where(np.isfinite(g.grate_m.to_numpy()),
-                          g.grate_m.to_numpy(), g.dem_m.to_numpy())
+                          g.grate_m.to_numpy(), dem)
             gsrc = (g.grate_src.to_numpy() if "grate_src" in g
                     else np.array(["survey"] * len(g)))
-            # Colour carries PROVENANCE, shape carries type -- the marker glyph
-            # is already the type, so fill is free to say something else, and
-            # what it says is whether the height is measured or inferred.
-            # Surveyed keeps the type colour it has always had; DEM-derived goes
-            # hollow, the same convention plot_street_drains.py uses, so the two
-            # renderers cannot disagree about what a hollow marker means. The
-            # ring stays the type colour, so a hollow marker is still typed.
-            surveyed = gsrc == "survey"
-            fcol = np.where(surveyed, sty["color"], "#ffffff")
-            lcol = np.where(surveyed, "#ffffff", sty["color"])
-            lw = np.where(surveyed, 1.0, 2.0)
+            # The DEM-only alternative, computed here so the checkbox is a
+            # column swap in the browser rather than arithmetic. An inlet the
+            # DEM has no reading for says "none" and leaves the profile, rather
+            # than quietly keeping the survey the mode just said to ignore.
+            gsrc_dem = np.where(np.isfinite(dem), "dem", "none")
+            fcol, lcol, lw = inlet_paint(gsrc, sty["color"])
+            fcol_d, lcol_d, lw_d = inlet_paint(gsrc_dem, sty["color"])
             isrc = ColumnDataSource(dict(
                 ch=g.chainage.to_numpy(), gy=gy,
                 gsrc=gsrc, fcol=fcol, lcol=lcol, lw=lw,
+                # The two modes the checkbox swaps between. The glyphs read the
+                # live columns above; these are the stock they are copied from,
+                # so toggling never recomputes a value or a colour, and toggling
+                # back is exact rather than a re-derivation.
+                gyG=gy, gsrcG=gsrc, fcolG=fcol, lcolG=lcol, lwG=lw,
+                gyD=dem, gsrcD=gsrc_dem, fcolD=fcol_d, lcolD=lcol_d, lwD=lw_d,
                 gsurv=(g.grate_survey_m.to_numpy() if "grate_survey_m" in g
                        else np.full(len(g), np.nan)),
                 mx=ix[m], my=iy[m], num=g.num.to_numpy(),
@@ -523,7 +553,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # Two points up on the hover readout above it: this line is read carefully
     # -- asset ID, elevations, and the Street View link -- while the hover line
     # is glanced at and replaced on every mouse move.
-    pick = Div(text="<i>tap an inlet marker for its Street View link</i>",
+    pick = Div(text=PICK_HINT,
                width=PANEL_W,
                styles={"font-family": "monospace", "font-size": "15px",
                        "padding": "4px 0", "min-height": "22px"})
@@ -607,13 +637,48 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
             # slot stays null and clicks never reach the tool. Bind it.
             f.toolbar.active_tap = tt
 
+    # ---------------- DEM elevations only ----------------
+    # The default view mixes two kinds of number: a published grate survey where
+    # one exists and passed the tolerance, the DEM everywhere else. That is the
+    # best estimate per inlet, but it is not one measurement of anything, so a
+    # profile read across several inlets is reading a blend. Ticking this puts
+    # every inlet on the lidar -- one instrument, one error model, comparable
+    # along the whole street -- which is what you want when the question is the
+    # SHAPE of the drainage rather than the height of any single grate.
+    #
+    # Both columns ship in the source, so this is a swap in the browser: no
+    # reload, no rebuild, and no arithmetic that could disagree with Python's.
+    dem_only = None
+    if inlet_srcs:
+        dem_only = CheckboxGroup(
+            labels=["DEM elevations only — ignore published grate surveys"],
+            active=[], width=PANEL_W)
+        dem_only.js_on_change("active", CustomJS(
+            args=dict(S=inlet_srcs, prof=prof, pick=pick, hint=PICK_HINT,
+                      tg=title_gated, td=title_dem),
+            code="""
+            const k = cb_obj.active.includes(0) ? "D" : "G";
+            for (const s of S) {
+              const d = s.data;
+              // slice(), not assignment: the stock columns must stay intact,
+              // or toggling back would read whatever the last mode left.
+              for (const c of ["gy", "gsrc", "fcol", "lcol", "lw"]) {
+                d[c] = d[c + k].slice();
+              }
+              s.change.emit();
+            }
+            prof.title.text = (k === "D") ? td : tg;
+            pick.text = hint;
+            """))
+
     # fname is pre-assigned when workers render in parallel: safe_name()
     # carries a collision counter, and two processes would break it.
     out = os.path.join(outdir,
                        (fname or safe_name(street, used)) + ".html")
     output_file(out, title=f"{street} — profile + map", mode="cdn")
     plan = row(mp, sv) if sv is not None else mp
-    save(column(*([read, pick] if inlet_srcs else [read]), prof, plan))
+    top = [read, pick, dem_only] if inlet_srcs else [read]
+    save(column(*top, prof, plan))
     return out, p
 
 
