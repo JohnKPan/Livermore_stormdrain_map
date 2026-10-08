@@ -75,6 +75,15 @@ backup */
 bay_area_*.csv
 survey_bay_area_sources.py
 
+# Marker/colour legend for the 12 canonical inlet types. Ignored like every
+# other artifact here, but with one difference worth stating: nothing in the
+# repo generates it, so a fresh clone cannot rebuild it the way it can rebuild
+# the rest. Its counts are also a snapshot of the FIVE-city corpus (71,092
+# rows) and are stale against the twelve-city one (93,826) -- Unknown alone
+# went 2,610 -> 10,449. If the key is wanted again, generate it from STYLE and
+# the live corpus rather than keeping this one.
+style_key.png
+
 # Editor / OS
 .vscode/
 .idea/
