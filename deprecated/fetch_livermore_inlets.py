@@ -29,7 +29,9 @@ FIELDS = [
     "Location", "MaintenanceArea", "MapGrid",
 ]
 
-OUT_DIR = Path(__file__).resolve().parent / "derived"
+# .parent.parent, not .parent: this script lives in deprecated/ but still
+# writes into the project root's derived/, where every consumer looks.
+OUT_DIR = Path(__file__).resolve().parent.parent / "derived"
 
 
 def fetch(offset, count=2000):

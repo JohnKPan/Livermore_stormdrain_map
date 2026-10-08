@@ -49,7 +49,10 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
+# The project root is one level up: this script lives in deprecated/, but every
+# step below still expects to run from the root, where derived/ and the conda
+# env are.
+cd "$(dirname "$0")/.."
 
 # Three page corpora. All read the SAME 0.15 m point corpus and differ only in
 # the rolling-mean window, so they are named for that window -- the spacing is a
@@ -135,7 +138,7 @@ environment:
 
 Writes Stormdrain_map/<city>/ -- the whole deliverable for one city.
 Region-wide is a loop:  for c in $(cut -d, -f1 city_geojson/_index.csv | tail -n +2);
-do bash run_pipeline.sh --city "$c"; done   -- but see the 8 GB/city DEM note above.
+do bash deprecated/run_pipeline.sh --city "$c"; done   -- but see the 8 GB/city DEM note above.
 EOF
 }
 

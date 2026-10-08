@@ -23,8 +23,9 @@ The service speaks GeoJSON natively (f=geojson), so no coordinate wrangling is
 needed here beyond asking for outSR=4326; its own storage is EPSG:6420.
 
 Usage:
-    python fetch_livermore_street_centerlines.py
-    python fetch_livermore_street_centerlines.py --out somewhere/else.geojson
+    python deprecated/fetch_livermore_street_centerlines.py
+    python deprecated/fetch_livermore_street_centerlines.py \
+        --out somewhere/else.geojson
 """
 import argparse
 import json
@@ -122,7 +123,9 @@ def main():
         "crs": {"type": "name", "properties": {"name": "EPSG:4326"}},
         "features": features,
     }
-    out = Path(__file__).resolve().parent / args.out
+    # .parent.parent: this script sits in deprecated/, so the paths it
+    # writes stay relative to the project root one level up.
+    out = Path(__file__).resolve().parent.parent / args.out
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
         json.dump(gj, f)

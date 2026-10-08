@@ -30,14 +30,14 @@ Everything runs from the project root. One command runs the lot:
     python run_pipeline.py --city livermore                 full rebuild
     python run_pipeline.py --city livermore --render-only   rebuild pages only
 
-Use the PYTHON one. run_pipeline.sh is the original and still works, but only
-from Git Bash, and picking the wrong shell fails in ways that look like anything
-but a shell problem. On this machine PowerShell resolves `bash` to WSL, not Git
-Bash; WSL then runs the script under Linux, correctly selects
+Use the PYTHON one. deprecated/run_pipeline.sh is the original and still works,
+but only from Git Bash, and picking the wrong shell fails in ways that look
+like anything but a shell problem. On this machine PowerShell resolves `bash`
+to WSL, not Git Bash; WSL then runs the script under Linux, correctly selects
 .conda/env/python.exe (drvfs marks every .exe executable), and launches that
-Windows interpreter through interop -- but WSL has no cygpath, so GDAL_DATA gets
-exported as /mnt/d/... and the Windows process cannot read it. The error that
-surfaces is "GDAL_DATA is not defined", which sends you looking at GDAL.
+Windows interpreter through interop -- but WSL has no cygpath, so GDAL_DATA
+gets exported as /mnt/d/... and the Windows process cannot read it. The error
+that surfaces is "GDAL_DATA is not defined", which sends you looking at GDAL.
 
 run_pipeline.py has no shell in the loop and is stdlib-only, so it starts under
 ANY interpreter -- including the wrong one on PATH -- and then runs every step
@@ -234,15 +234,15 @@ Livermore's own portal layer (Street_Centerline_-_Public, 4,867 features) was
 the baseline the Overture corpus was checked against -- same OBJECTID set, zero
 differing property values, coordinates identical to the last decimal. It is no
 longer a pipeline step: one fetch that works everywhere beat two that disagree
-about which city they serve. fetch_livermore_street_centerlines.py is
-DEPRECATED: kept for that comparison, called by nothing, and imported by
+about which city they serve. deprecated/fetch_livermore_street_centerlines.py
+is DEPRECATED: kept for that comparison, called by nothing, and imported by
 nothing since extract_centerline_latlon.py took over the SRC path it exported.
 It is also the only schema with no road_flags, so a corpus built from it cannot
 mark bridges (section 5).
 
-fetch_livermore_inlets.py is DEPRECATED the same way -- `fetch_inlets.py
-livermore` fetches the same layer with domain decoding, retry backoff and a
-`source` column.
+deprecated/fetch_livermore_inlets.py is DEPRECATED the same way --
+`fetch_inlets.py livermore` fetches the same layer with domain decoding, retry
+backoff and a `source` column.
 
 
 1. Storm drain inlets
