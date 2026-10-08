@@ -35,12 +35,12 @@ import xyzservices.providers as xyz
 from bokeh.layouts import column, row
 from bokeh.models import (Arrow, BoxSelectTool, CheckboxGroup,
                           ColumnDataSource, CustomJS, Div, HoverTool, LabelSet,
-                          Range1d, Span, TapTool, VeeHead)
+                          Range1d, Span, TapTool, Title, VeeHead)
 from bokeh.plotting import figure, output_file, save
 from pyproj import Transformer
 
 from plot_street_drains import (AOI_DIR, DATUM_SHIFT_M, DEFAULT_STYLE,
-                                GRATE_TOL_M,
+                                GRATE_TOL_M, GROUND_NOTE,
                                 INLETS as INLETS_ALL, INLETS_LEGACY, STYLE,
                                 street_parts, load_aoi, load_inlets, prepare,
                                 prepare_geom, prepare_smooth,
@@ -53,12 +53,19 @@ POINTS = points_path()
 OUTDIR = "Stormdrain_map/streets"
 # The profile is the panel the page is read for, and at 320 px a Livermore
 # street -- tens of metres of relief over kilometres -- was drawn nearly flat.
-# Height only: PANEL_W is pinned by the overview's iframe, which embeds these
-# pages at FRAME_W and would gain a horizontal scrollbar if this grew.
-PROF_H, MAP_H, PANEL_W = 480, 560, 1180
+# PANEL_W is no longer a width, it is a FLOOR. Every panel is stretch_width, so
+# a page fills whatever it is given -- the browser window, or the overview's
+# iframe -- and PANEL_W only sets the point below which it stops shrinking and
+# the container scrolls instead. Keep plot_city_overview.FRAME_W at or above it,
+# or the iframe is the thing that scrolls.
+PROF_H, MAP_H, PANEL_W = 480, 560, 1416
 PROF_ARROW_FRAC = 0.16    # arrow length as a fraction of the visible y-range
 MAP_ARROW_FRAC = 0.10
-SV_W = 440                # embedded Street View panel, when a key is supplied
+SV_W = 528                # embedded Street View panel, when a key is supplied
+# The one fixed width on the page: the Street View iframe is a raster pane with
+# no layout of its own, so it keeps its size and the map beside it takes the
+# slack. STRETCH is the sizing every other element uses.
+STRETCH = "stretch_width"
 # Shared, because the DEM-only toggle restores it: the pinned panel is a
 # snapshot of one tap and would otherwise keep showing the other mode's height.
 PICK_HINT = "<i>tap an inlet marker for its Street View link</i>"
@@ -271,12 +278,21 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
         f"within {args.grate_tol_m:g} m of DEM else the DEM"
         if args.grate_tol_m > 0 else "ungated") + ")"
     title_dem = title_head + "from the DEM, published surveys ignored)"
-    prof = figure(width=PANEL_W, height=PROF_H, tools="pan,wheel_zoom,box_zoom,reset",
+    prof = figure(sizing_mode=STRETCH, min_width=PANEL_W, height=PROF_H,
+                  tools="pan,wheel_zoom,box_zoom,reset",
                   x_axis_label=f"distance along street from {p['origin']} end (m)",
                   y_axis_label="elevation (m, NAVD88)",
                   x_range=Range1d(-0.02*float(d[-1]), 1.02*float(d[-1])),
                   y_range=Range1d(ylo - ypad, yhi + ypad),
                   title=title_gated)
+    # In the figure, not beside it: this is how to read the line, so it has to
+    # be on the chart that carries the line. The "below" slot sits under the
+    # x-axis label, where it cannot collide with the data at any y-range.
+    prof.add_layout(Title(
+        text=GROUND_NOTE + ". Bridge spans are drawn in purple, tunnels "
+                           "in green.",
+        text_font_size="11px", text_font_style="normal",
+        text_color="#52514e"), "below")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     n_bridge = int(np.count_nonzero(np.isfinite(zb)))
     n_tunnel = int(np.count_nonzero(np.isfinite(zt)))
@@ -304,7 +320,8 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # ---------------- map ----------------
     pad = float(np.clip(args.pad_frac*max(mx.max()-mx.min(), my.max()-my.min()),
                         args.pad_min_m, args.pad_m))
-    mp = figure(width=map_w, height=MAP_H, match_aspect=True,
+    mp = figure(sizing_mode=STRETCH, min_width=map_w, height=MAP_H,
+                match_aspect=True,
                 tools="pan,wheel_zoom,box_zoom,reset",
                 x_range=Range1d(mx.min()-pad, mx.max()+pad),
                 y_range=Range1d(my.min()-pad, my.max()+pad),
@@ -508,7 +525,8 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
         f.legend.background_fill_alpha = 0.85
 
     # ---------------- the link ----------------
-    read = Div(text="<i>hover either panel</i>", width=PANEL_W,
+    read = Div(text="<i>hover either panel</i>", sizing_mode=STRETCH,
+               min_width=PANEL_W,
                styles={"font-family": "monospace", "font-size": "13px",
                        "padding": "4px 0"})
     LINK_JS = """
@@ -553,8 +571,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # Two points up on the hover readout above it: this line is read carefully
     # -- asset ID, elevations, and the Street View link -- while the hover line
     # is glanced at and replaced on every mouse move.
-    pick = Div(text=PICK_HINT,
-               width=PANEL_W,
+    pick = Div(text=PICK_HINT, sizing_mode=STRETCH, min_width=PANEL_W,
                styles={"font-family": "monospace", "font-size": "15px",
                        "padding": "4px 0", "min-height": "22px"})
 
@@ -652,7 +669,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     if inlet_srcs:
         dem_only = CheckboxGroup(
             labels=["DEM elevations only — ignore published grate surveys"],
-            active=[], width=PANEL_W)
+            active=[], sizing_mode=STRETCH, min_width=PANEL_W)
         dem_only.js_on_change("active", CustomJS(
             args=dict(S=inlet_srcs, prof=prof, pick=pick, hint=PICK_HINT,
                       tg=title_gated, td=title_dem),
@@ -676,9 +693,9 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     out = os.path.join(outdir,
                        (fname or safe_name(street, used)) + ".html")
     output_file(out, title=f"{street} — profile + map", mode="cdn")
-    plan = row(mp, sv) if sv is not None else mp
+    plan = (row(mp, sv, sizing_mode=STRETCH) if sv is not None else mp)
     top = [read, pick, dem_only] if inlet_srcs else [read]
-    save(column(*top, prof, plan))
+    save(column(*top, prof, plan, sizing_mode=STRETCH))
     return out, p
 
 

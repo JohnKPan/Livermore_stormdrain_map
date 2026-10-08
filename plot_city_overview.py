@@ -58,12 +58,16 @@ PAGES_ALT = "Stormdrain_map/streets_10m"
 OUT = "Stormdrain_map/index.html"
 INDEX = "_index.csv"
 UNCLASSIFIED = "(unknown)"
-MAP_W, MAP_H = 1240, 700
+MAP_W, MAP_H = 1488, 700          # MAP_W is a floor: the map is stretch_width
+STRETCH = "stretch_width"
 # FRAME_H is the embedded street page's own height, measured: read + pick Divs,
-# then plot_street_bokeh.py's PROF_H and MAP_H panels with their titles and
-# axes. Short of it and the iframe grows an inner scrollbar, which is what a
-# 1,020 px frame was doing around a 1,305 px page. Raise this with PROF_H.
-FRAME_W, FRAME_H = 1240, 1320
+# the DEM-only checkbox, then plot_street_bokeh.py's PROF_H and MAP_H panels
+# with their titles and axes. Short of it and the iframe grows an inner
+# scrollbar, which is what a 1,020 px frame was doing around a 1,305 px page.
+# Raise this with PROF_H, or when a row is added above the profile. FRAME_W is
+# only a floor now: the iframe is width:100%, so the page inside it stretches
+# with this one.
+FRAME_W, FRAME_H = 1488, 1400
 HIT_W = 12                # invisible fat line under each class, for hit testing
 
 # Set from --city in main(). They were hardcoded to Livermore, so every
@@ -282,7 +286,8 @@ def main():
     ys_all = np.concatenate([a for r in rows.values() for a in r["ys"]])
     padx = 0.02*(xs_all.max() - xs_all.min())
     pady = 0.02*(ys_all.max() - ys_all.min())
-    mp = figure(width=MAP_W, height=MAP_H, match_aspect=True,
+    mp = figure(sizing_mode=STRETCH, min_width=MAP_W, height=MAP_H,
+                match_aspect=True,
                 tools="pan,wheel_zoom,box_zoom,reset",
                 x_range=Range1d(xs_all.min()-padx, xs_all.max()+padx),
                 y_range=Range1d(ys_all.min()-pady, ys_all.max()+pady),
@@ -461,14 +466,23 @@ def main():
              f" &middot; pages open at {labels[dvi]} smoothing; "
              f"switch to {', '.join(others)} above the map")
     pick = Div(text="<i>tap a street on the map, or search above</i>" + opens,
-               width=MAP_W,
+               sizing_mode=STRETCH, min_width=MAP_W,
                styles={"font-family": "monospace", "font-size": "13px",
                        "padding": "4px 0", "min-height": "20px"})
-    frame = Div(text=f"<div style='width:{FRAME_W}px;height:{FRAME_H}px;"
+    # Bokeh wraps a Div's html in a .bk-clearfix that is display:inline-block,
+    # i.e. shrink-to-fit, so a percentage width on a replaced child resolves
+    # against THAT -- and an iframe's shrink-to-fit size is its 300 px
+    # intrinsic default, which rendered a 303 px frame inside a 3,383 px Div.
+    # Absolute positioning skips it: the containing block is then the nearest
+    # POSITIONED ancestor, which is .bk-Div itself at the full stretched width.
+    # Keyed to Bokeh's own position:relative on that host, not to a class name.
+    FILL = "position:absolute;inset:0;"
+    frame = Div(text=f"<div style='{FILL}"
                      "display:flex;align-items:center;justify-content:center;"
                      "background:#eef1f4;color:#667;font:13px monospace;"
                      "border:1px solid #d5dade'>no street selected</div>",
-                width=FRAME_W, height=FRAME_H, disable_math=True)
+                sizing_mode=STRETCH, min_width=FRAME_W, height=FRAME_H,
+                disable_math=True)
 
     # name -> everything the page needs about a street. href/sags/unserved are
     # one entry per variant, indexed by the checkbox; inlets and length do not
@@ -517,12 +531,12 @@ def main():
                   + M.length.toFixed(0) + " m &middot; " + LAB[vi]
                   + " smoothing &middot; <span style='color:#777'>"
                   + M.href[vi] + "</span>";
-        frame.text = "<iframe src='" + M.href[vi] + "' width='%d' height='%d'"
-                   + " style='border:1px solid #d5dade' loading='lazy'></iframe>";
+        frame.text = "<iframe src='" + M.href[vi] + "'"
+                   + " style='%s' loading='lazy'></iframe>";
         if (decodeURIComponent((window.location.hash || "").slice(1)) !== nm) {
             history.replaceState(null, "", "#" + encodeURIComponent(nm));
         }
-    """ % (FRAME_W, FRAME_H)
+    """ % (FILL + "width:100%;height:100%;border:1px solid #d5dade",)
 
     ZOOM_JS = """
         // Pad the street's own bbox, then grow the short side to the map's
@@ -594,7 +608,7 @@ def main():
     if smooth is not None:
         body.append(smooth)
     body.append(frame)
-    doc.add_root(column(*body))
+    doc.add_root(column(*body, sizing_mode=STRETCH))
     doc.js_on_event(DocumentReady, ready)
     output_file(out, title=f"{NAME} stormdrain — street index", mode="cdn")
     save(doc)

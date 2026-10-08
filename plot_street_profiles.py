@@ -668,7 +668,7 @@ def main():
     outdir = os.path.join(here, args.outdir)
     os.makedirs(outdir, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(11, 4.6), dpi=args.dpi)
+    fig, ax = plt.subplots(figsize=(13.2, 4.6), dpi=args.dpi)
     used, rows, skipped = {}, [], 0
 
     # groupby drops a NaN key, which is what should happen: a nameless

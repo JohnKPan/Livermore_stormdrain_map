@@ -93,16 +93,25 @@ TILE_UA = ("PengWeather-Stormdrain-Study/1.0 "
 # mis-joined attribute blocks. See --grate-tol-m; 0 disables the check.
 GRATE_TOL_M = 6.096            # 20 ft
 
+# Said on every rendered page, because the DEM's one real limitation is the one
+# thing not visible in it. A bare-earth surface has no bridge deck, so a
+# crossing dips to whatever it spans -- and find_sags() looks for exactly that
+# shape, with no access to is_bridge, so it cannot tell the two apart. A reader
+# who does not know this reads a creek crossing as a ponding point.
+GROUND_NOTE = ("Elevation is bare-earth ground, not the road surface -- a bridge "
+               "deck is not in the DEM, so a crossing reads as a dip, and a sag "
+               "found on one is the surface rather than a place water collects")
+
 # Standardised chart scales. Vertical is fixed so 0.20 m (the sag threshold)
 # always renders ~10 px while the 2 cm DEM noise stays sub-pixel. Horizontal is
 # quantised to a 1-2-5 ladder so charts fall into a few comparable classes
 # instead of 1,728 unique scales.
 V_MPP_DEFAULT = 0.02
 H_LADDER = (0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0)
-PROF_W_MIN_PX, PROF_W_MAX_PX = 420.0, 1400.0
+PROF_W_MIN_PX, PROF_W_MAX_PX = 504.0, 1680.0
 PROF_H_MIN_PX, PROF_H_MAX_PX = 200.0, 900.0
 MAP_LADDER = (0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0)
-MAP_W_MIN_PX, MAP_W_MAX_PX = 420.0, 1200.0
+MAP_W_MIN_PX, MAP_W_MAX_PX = 504.0, 1440.0
 MAP_H_MIN_PX, MAP_H_MAX_PX = 320.0, 1000.0
 
 # The six original keys are Livermore's TypeDescription values verbatim, which
@@ -724,6 +733,15 @@ def render(street, st, prep, args, outdir, used):
                  f"({len(near)} inlets within {args.max_offset:g} m)\n"
                  f"{shift_note}\n{scale_note}",
                  fontsize=10.5)
+    # On the chart, under the x-axis label: a caveat about how to READ the
+    # line, not a parameter it was built with. Offset in POINTS from the axes
+    # corner rather than in axes fractions, which would drift with prof_h
+    # over its 200..900 px range and land on the label at one end of it.
+    ax.annotate(GROUND_NOTE + ". Bridge spans are drawn in purple, tunnels "
+                "in green.",
+                xy=(0.0, 0.0), xycoords="axes fraction",
+                xytext=(0, -44), textcoords="offset points",
+                fontsize=8.5, color="#666666", va="top", ha="left")
     ax.grid(alpha=0.3)
     # Legends go outside the axes; savefig(bbox_inches="tight") grows the canvas
     # to fit them, so nothing is clipped and nothing covers the data.

@@ -163,7 +163,9 @@ def axis_ticks(lo_ft, hi_ft, symlog):
 def panel(city, e, args):
     """One city's histogram, or a placeholder when it publishes no elevations."""
     ylog = args.scale == "symlog" and not args.no_ylog
-    p = figure(width=980, height=270,
+    # min_width, not width: the panels are stretch_width so the stack
+    # follows the window, and 1176 is the point it stops shrinking.
+    p = figure(sizing_mode="stretch_width", min_width=1176, height=270,
                tools="pan,box_zoom,wheel_zoom,reset,save",
                y_axis_type="log" if ylog else "linear",
                y_axis_label="inlets (log)" if ylog else "inlets")
@@ -251,7 +253,7 @@ def render(df, cities, args):
         + ("; signed-log spacing, labels are real feet)" if args.scale == "symlog"
            else ")"))
     output_file(args.out, title="Grate elevation error vs 3DEP lidar")
-    save(column(*panels))
+    save(column(*panels, sizing_mode="stretch_width"))
     print(f"wrote {args.out}")
 
 
