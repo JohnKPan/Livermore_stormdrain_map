@@ -40,13 +40,13 @@ import numpy as np
 import pandas as pd
 import xyzservices.providers as xyz
 from bokeh.document import Document
-from bokeh.events import DocumentReady
 from bokeh.layouts import column, row
 from bokeh.models import (AutocompleteInput, CDSView,
                           ColumnDataSource, CustomJS, Div, HoverTool,
                           IndexFilter, Legend, LegendItem,
                           RadioButtonGroup, Range1d, TapTool, WheelZoomTool)
 from bokeh.plotting import figure, output_file, save
+from jinja2 import Template
 from pyproj import Transformer
 
 from extract_centerline_latlon import DEFAULT_CITY, vertices_path
@@ -55,6 +55,39 @@ from plot_points_map import CLASS_COLORS, DRAW_ORDER
 VERTS = vertices_path()
 PAGES = "Stormdrain_map/streets_25m"
 PAGES_ALT = "Stormdrain_map/streets_10m"
+# DocumentReady does not fire in a standalone saved document. The handler is
+# serialised into the file and simply never called, which is why opening
+# index.html#Some%20Street gave a blank overview: the hash was written on every
+# selection and read by nothing. Bokeh exposes no other after-render hook for a
+# saved file, so the trigger is a plain script in the page template -- it waits
+# for BokehJS to publish the document, finds the callback by name and runs it.
+# The hashchange listener is a bonus DocumentReady could never have given:
+# Back and Forward now move between streets instead of only rewriting the URL.
+# A jinja2.Template, NOT the plain string Bokeh also accepts: given a string it
+# renders the template twice and the second pass raises "extended multiple
+# times" on the {% extends %} above.
+RESTORE_TEMPLATE = Template("""\n{% extends base %}
+{% block postamble %}
+<script>
+(function () {
+  var NAME = "restore_from_hash", tries = 0;
+  function run(cb) { try { cb.execute(cb, {}); } catch (e) { console.error(e); } }
+  function go() {
+    var docs = (window.Bokeh && window.Bokeh.documents) || [];
+    var doc = docs.length ? docs[0] : null;
+    var cb = (doc && doc.get_model_by_name) ? doc.get_model_by_name(NAME) : null;
+    // Give up rather than poll forever: 400 x 50 ms is 20 s, far past any
+    // render, and a page with no callback is a page with nothing to restore.
+    if (!cb) { if (++tries < 400) { window.setTimeout(go, 50); } return; }
+    run(cb);
+    window.addEventListener("hashchange", function () { run(cb); });
+  }
+  go();
+})();
+</script>
+{% endblock %}
+""")
+
 OUT = "Stormdrain_map/index.html"
 INDEX = "_index.csv"
 UNCLASSIFIED = "(unknown)"
@@ -575,7 +608,7 @@ def main():
         const nm = cb_obj.value;
     """ + LOAD_JS + ZOOM_JS))
 
-    ready = CustomJS(args=cb_args, code="""
+    ready = CustomJS(name="restore_from_hash", args=cb_args, code="""
         // Restore a bookmarked street. The hash holds the name, not the file,
         // so a page renamed by a rebuild still resolves.
         const nm = decodeURIComponent((window.location.hash || "").slice(1));
@@ -609,9 +642,15 @@ def main():
         body.append(smooth)
     body.append(frame)
     doc.add_root(column(*body, sizing_mode=STRETCH))
-    doc.js_on_event(DocumentReady, ready)
+    # `ready` is reached by NAME from RESTORE_TEMPLATE, not by an event, but a
+    # CustomJS that nothing in the document references is never serialised --
+    # the template would then look for a model that is not in the file. So it
+    # hangs off `name`, a property this page sets once at construction and
+    # never writes again: enough to carry the callback into the document,
+    # and it cannot fire on its own. Not a root -- roots get an embed div.
+    frame.js_on_change("name", ready)
     output_file(out, title=f"{NAME} stormdrain — street index", mode="cdn")
-    save(doc)
+    save(doc, template=RESTORE_TEMPLATE)
     n_seg = sum(len(s.data["xs"]) for s in srcs)
     print(f"{n_seg:,} segments over {len(names):,} pages -> {out}  "
           f"({os.path.getsize(out)/1e6:.1f} MB)")
