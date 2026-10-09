@@ -1,7 +1,7 @@
 """City-wide index map over the per-street pages from plot_street_bokeh.py.
 
 Draws every centerline of one city on an Esri Gray Canvas map, coloured by functional
-class or by the street's sag count -- a radio button on the page switches
+class or by the street's sags per mile -- a radio button on the page switches
 between the two, and --color-by picks which one it opens on. Tapping a street
 -- or picking one from the search box -- loads that street's existing
 profile+map page into an iframe directly below, so the whole corpus written by
@@ -16,7 +16,7 @@ and the iframe srcs are relative paths worked out from those two locations.
 windows. With more than one corpus the page grows a selector that switches
 between them. Historically this took a SECOND corpus only, and a
 checkbox that switches the whole page between the two: which page the iframe
-loads, the sag counts in the tooltips, and the sag colouring itself. Sags come
+loads, the sag rates in the tooltips, and the sag colouring itself. Sags come
 from the smoothed profile, so a shorter window finds more of them -- the two
 sets genuinely disagree, and the checkbox is how they are compared.
 
@@ -140,33 +140,55 @@ CLASS_WIDTH = {
     UNCLASSIFIED: 1.0,
 }
 
-# The alternate colouring: sags per street, binned rather than ramped. 1,391 of
-# the 1,728 streets have no sag at all and the tail runs to 29, so a linear
-# scale would spend its whole range on a handful of streets. Zero gets a grey
-# that reads as background; the ramp starts at one.
+M_PER_MILE = 1609.344
+
+# The alternate colouring: sags per MILE, binned rather than ramped. A rate and
+# not a count, so a 13-mile freeway with 16 sags no longer outranks every
+# residential street in town -- 16 over 13 miles is 1.2/mi, the quietest step
+# of the ramp, which is the honest reading of how often it sags.
 #
-# (lower bound, label, colour, minimum line width) -- the upper bound of each
-# bin is the next entry's lower bound. Width is a floor, not a value: a street
-# keeps its class width if that is already fatter, so the arterial skeleton
-# survives while a Local street with sags stops being a 1 px line.
+# The other end of that trade is worth knowing before reading the map. The
+# denominator is short for most pages: 69% of the streets that have a sag have
+# exactly one, and a quarter of those are under 200 m, so a single sag on a
+# 32 m cul-de-sac stub rates 51/mi and tops the scale. That is arithmetic
+# rather than a defect -- there IS a sag there -- but the top bin says "short
+# street with a sag" at least as often as "street with a drainage problem".
+# Nothing is floored or clipped to hide it; the count and the length sit in the
+# tooltip next to the rate, which is where the distinction can be made.
+#
+# The edges double because the rate is long-tailed (median 4.8/mi among the
+# streets that have one, tail to 51), and a doubling ladder is what keeps all
+# five ramp steps populated in every smoothing window. Zero gets a grey that
+# reads as background.
+#
+# (lower bound /mi, label, colour, minimum line width) -- the upper bound of
+# each bin is the next entry's lower bound. Width is a floor, not a value: a
+# street keeps its class width if that is already fatter, so the arterial
+# skeleton survives while a Local street with sags stops being a 1 px line.
 SAG_BINS = [
-    (0,  "no sag", "#aeb8c2", 0.0),
-    (1,  "1",      "#fcc44e", 1.8),
-    (2,  "2",      "#f99331", 2.2),
-    (3,  "3–4",    "#ef6420", 2.6),
-    (5,  "5–9",    "#cf2d16", 3.0),
-    (10, "10+",    "#8c0308", 3.4),
+    (None, "no sag",  "#aeb8c2", 0.0),   # bound unused: the rate is exactly 0
+    (0.0,  "under 2", "#fcc44e", 1.8),
+    (2.0,  "2–4",     "#f99331", 2.2),
+    (4.0,  "4–8",     "#ef6420", 2.6),
+    (8.0,  "8–16",    "#cf2d16", 3.0),
+    (16.0, "16+",     "#8c0308", 3.4),
 ]
 
 
+def sag_bin(rate):
+    """Index of the SAG_BINS entry a sags-per-mile rate falls in.
 
-
-def sag_bin(n):
-    """Index of the SAG_BINS entry a sag count falls in."""
-    for i in range(len(SAG_BINS) - 1, -1, -1):
-        if n >= SAG_BINS[i][0]:
+    Bin 0 is reserved for a rate of exactly zero, which is why its bound is
+    None rather than 0.0: having no sag is a state, not the bottom of a ramp,
+    and one sag in 13 miles belongs on the ramp rather than among the streets
+    that have none.
+    """
+    if rate <= 0:
+        return 0
+    for i in range(len(SAG_BINS) - 1, 1, -1):
+        if rate >= SAG_BINS[i][0]:
             return i
-    return 0
+    return 1
 
 
 def load(here, args, variants):
@@ -258,7 +280,7 @@ def main():
     NAME = city_name(os.path.dirname(os.path.abspath(__file__)), args.city)
     TITLE = (f"{NAME} street centerline — tap a street to load its profile "
              f"and drainage map below")
-    TITLE_SAG = (f"{NAME} streets by sag count — tap a street to load its "
+    TITLE_SAG = (f"{NAME} streets by sags per mile — tap a street to load its "
                  f"profile and drainage map below")
 
     # Primary first: it is the one the page opens on, and the one whose inlet
@@ -338,8 +360,12 @@ def main():
     # trip. The per-street pages leave this off, where panning matters more.
     mp.toolbar.active_scroll = mp.select_one(WheelZoomTool)
 
+    # Rate AND count AND length, all three: the rate is what the colour
+    # encodes, and the two numbers it came from are what tell a genuinely sag
+    # dense street from a 30 m stub that happens to have one.
     tips = [("street", "@name"), ("class", "@cls"),
             ("inlets", "@n_inlets"), ("sags", "@n_sags (@n_unserved unserved)"),
+            ("sags per mile", "@sag_mi{0.0}"),
             ("street length", "@length_m{0,0} m")]
     srcs, hits, cls_lines, cls_items, cls_w = [], [], [], [], []
     # Which segments of which class source land in which sag bin, per variant.
@@ -356,16 +382,26 @@ def main():
         # Inlets and length are upstream of the smoothing -- an inlet snaps to
         # the centerline and a street is as long as it is -- so they come from
         # the primary and stay put. Only the sag columns move with the checkbox.
+        length_m = stats[0].length_m.to_numpy()
+        # The length that divides is the PRIMARY's for every variant: a street
+        # is the same length however its profile was smoothed, so a rate that
+        # moved with the window would be moving for the wrong reason. Only the
+        # numerator is allowed to disagree between corpora.
+        miles = length_m / M_PER_MILE
+        rates = [sv.n_sags.to_numpy() / miles for sv in stats]
         data = dict(xs=r["xs"], ys=r["ys"], name=r["name"], cls=r["cls"],
                     n_inlets=stats[0].n_inlets.to_numpy(),
-                    length_m=stats[0].length_m.to_numpy(),
+                    length_m=length_m,
                     n_sags=stats[dvi].n_sags.to_numpy(),
-                    n_unserved=stats[dvi].n_unserved.to_numpy())
+                    n_unserved=stats[dvi].n_unserved.to_numpy(),
+                    sag_mi=rates[dvi])
         # Tooltips name fixed columns, so the toggle copies the variant it wants
-        # into n_sags/n_unserved. Both sets have to be on the source to do that.
-        for vi, s in enumerate(stats):
-            data[f"n_sags_v{vi}"] = s.n_sags.to_numpy()
-            data[f"n_unserved_v{vi}"] = s.n_unserved.to_numpy()
+        # into n_sags/n_unserved/sag_mi. Every set has to be on the source for
+        # that, which is three short columns per corpus against the geometry.
+        for vi, sv in enumerate(stats):
+            data[f"n_sags_v{vi}"] = sv.n_sags.to_numpy()
+            data[f"n_unserved_v{vi}"] = sv.n_unserved.to_numpy()
+            data[f"sag_mi_v{vi}"] = rates[vi]
         src = ColumnDataSource(data)
         # Two renderers on ONE source: the visible line, and a fat transparent
         # one to catch the cursor -- a 1 px Local street is otherwise unclickable.
@@ -384,9 +420,9 @@ def main():
         cls_w.append(w0)
 
         si = len(srcs) - 1
-        for vi, s in enumerate(stats):
-            for k, n in enumerate(s.n_sags.to_numpy()):
-                b = sag_bin(int(n))
+        for vi, rate in enumerate(rates):
+            for k, x in enumerate(rate):
+                b = sag_bin(float(x))
                 by_bin[vi][b].setdefault(si, []).append(k)
                 bin_names[vi][b].add(r["name"][k])
     mp.add_tools(HoverTool(renderers=hits, tooltips=tips, line_policy="nearest"))
@@ -420,8 +456,8 @@ def main():
             sag_lines.extend(rs)
             sag_var.extend([vi]*len(rs))
         leg = Legend(items=sag_items, visible=shown,
-                     title="sags on street" if len(variants) == 1
-                     else f"sags on street — {var['label']}")
+                     title="sags per mile" if len(variants) == 1
+                     else f"sags per mile — {var['label']}")
         mp.add_layout(leg)
         sag_legs.append(leg)
 
@@ -452,7 +488,7 @@ def main():
     search = AutocompleteInput(
         completions=names, search_strategy="includes", case_sensitive=False,
         min_characters=2, width=380, placeholder=f"search {len(names):,} pages")
-    colour = RadioButtonGroup(labels=["road class", "sags per street"],
+    colour = RadioButtonGroup(labels=["road class", "sags per mile"],
                               active=int(sag_first), width=260)
     # A radio group, not a checkbox: there can be any number of corpora now, and
     # a radio's `active` IS the variant index, which is what both JS callbacks
@@ -559,8 +595,13 @@ def main():
         hi.data = {xs: hx, ys: hy};
         hi.change.emit();
         state.data.nm = [nm];
+        // Divided here rather than carried in META: the rate is two numbers
+        // already in it, and 2,074 streets x one float per corpus is page
+        // weight for an arithmetic the browser can do on the spot.
+        const rate = M.sags[vi] / (M.length / %r);
         pick.text = "<b>" + nm + "</b> &middot; " + M.inlets + " inlets &middot; "
                   + M.sags[vi] + " sags (" + M.unserved[vi] + " unserved) &middot; "
+                  + rate.toFixed(1) + "/mi &middot; "
                   + M.length.toFixed(0) + " m &middot; " + LAB[vi]
                   + " smoothing &middot; <span style='color:#777'>"
                   + M.href[vi] + "</span>";
@@ -569,7 +610,7 @@ def main():
         if (decodeURIComponent((window.location.hash || "").slice(1)) !== nm) {
             history.replaceState(null, "", "#" + encodeURIComponent(nm));
         }
-    """ % (FILL + "width:100%;height:100%;border:1px solid #d5dade",)
+    """ % (M_PER_MILE, FILL + "width:100%;height:100%;border:1px solid #d5dade")
 
     ZOOM_JS = """
         // Pad the street's own bbox, then grow the short side to the map's
@@ -626,6 +667,7 @@ def main():
             for (const s of S) {
                 s.data.n_sags = s.data["n_sags_v" + v];
                 s.data.n_unserved = s.data["n_unserved_v" + v];
+                s.data.sag_mi = s.data["sag_mi_v" + v];
                 s.change.emit();
             }
             const nm = state.data.nm[0];
@@ -654,10 +696,13 @@ def main():
     n_seg = sum(len(s.data["xs"]) for s in srcs)
     print(f"{n_seg:,} segments over {len(names):,} pages -> {out}  "
           f"({os.path.getsize(out)/1e6:.1f} MB)")
+    miles = variants[0]["idx"].reindex(names).length_m.sum() / M_PER_MILE
     for var in variants:
-        sub = var["idx"].reindex(names)
-        print(f"  {var['label']:>6} smoothing: {int(sub.n_sags.sum()):,} sags, "
-              f"{int(sub.n_unserved.sum()):,} unserved   ({var['pages']})")
+        got = var["idx"].reindex(names)
+        print(f"  {var['label']:>6} smoothing: {int(got.n_sags.sum()):,} sags, "
+              f"{int(got.n_unserved.sum()):,} unserved, "
+              f"{got.n_sags.sum()/miles:.2f}/mi over {miles:,.0f} mi"
+              f"   ({var['pages']})")
     return 0
 
 
