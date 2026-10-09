@@ -732,16 +732,19 @@ def render(street, st, prep, args, outdir, used):
     ax.set_title(f"{street} — DEM profile with storm drain inlets   "
                  f"({len(near)} inlets within {args.max_offset:g} m)\n"
                  f"{shift_note}\n{scale_note}",
-                 fontsize=10.5)
-    # On the chart, under the x-axis label: a caveat about how to READ the
-    # line, not a parameter it was built with. Offset in POINTS from the axes
-    # corner rather than in axes fractions, which would drift with prof_h
-    # over its 200..900 px range and land on the label at one end of it.
+                 fontsize=10.5, pad=24)
+    # On the chart, immediately above the frame: a caveat about how to READ
+    # the line, not a parameter it was built with, so it is met before the
+    # line rather than after it. Offset in POINTS from the axes corner
+    # rather than in axes fractions, which would drift with prof_h over its
+    # 200..900 px range and close on the title at one end of it. set_title's
+    # pad above is what reserves the strip this sits in.
     ax.annotate(GROUND_NOTE + ". Bridge spans are drawn in purple, tunnels "
                 "in green.",
-                xy=(0.0, 0.0), xycoords="axes fraction",
-                xytext=(0, -44), textcoords="offset points",
-                fontsize=8.5, color="#666666", va="top", ha="left")
+                xy=(0.0, 1.0), xycoords="axes fraction",
+                xytext=(0, 6), textcoords="offset points",
+                fontsize=10.5, color="#666666",
+                va="bottom", ha="left")
     ax.grid(alpha=0.3)
     # Legends go outside the axes; savefig(bbox_inches="tight") grows the canvas
     # to fit them, so nothing is clipped and nothing covers the data.

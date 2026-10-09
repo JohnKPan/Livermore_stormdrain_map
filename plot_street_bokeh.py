@@ -34,10 +34,12 @@ import pandas as pd
 import xyzservices.providers as xyz
 from bokeh.layouts import column, row
 from bokeh.models import (Arrow, BoxSelectTool, CheckboxGroup,
-                          ColumnDataSource, CustomJS, Div, HoverTool, LabelSet,
+                          ColumnDataSource, CustomJS, Div, HoverTool,
+                          InlineStyleSheet, LabelSet,
                           CustomJSHover, Range1d, Span, TapTool, Title,
                           VeeHead)
 from bokeh.plotting import figure, output_file, save
+from jinja2 import Template
 from pyproj import Transformer
 
 from plot_street_drains import (AOI_DIR, DATUM_SHIFT_M, DEFAULT_STYLE,
@@ -59,7 +61,10 @@ OUTDIR = "Stormdrain_map/streets"
 # iframe -- and PANEL_W only sets the point below which it stops shrinking and
 # the container scrolls instead. Keep plot_city_overview.FRAME_W at or above it,
 # or the iframe is the thing that scrolls.
-PROF_H, MAP_H, PANEL_W = 480, 560, 1416
+PROF_H, MAP_H, PANEL_W = 528, 616, 1416
+# Floors for the drag grip below, at half the opening height: a panel can be
+# pulled down out of the way, but not to a sliver that cannot be grabbed again.
+PROF_H_MIN, MAP_H_MIN = 264, 308
 PROF_ARROW_FRAC = 0.16    # arrow length as a fraction of the visible y-range
 MAP_ARROW_FRAC = 0.10
 SV_W = 528                # embedded Street View panel, when a key is supplied
@@ -67,6 +72,124 @@ SV_W = 528                # embedded Street View panel, when a key is supplied
 # no layout of its own, so it keeps its size and the map beside it takes the
 # slack. STRETCH is the sizing every other element uses.
 STRETCH = "stretch_width"
+
+# Drag-to-resize. Bokeh's own resizable= property is NOT the way in: all it
+# does is set CSS `resize` on the figure host, and the grip it draws never
+# receives the pointer -- the canvas that spans the whole figure grid takes the
+# press, a real drag leaves no inline height behind, and the panel does not
+# move. (Setting the height from the console DOES relayout, which is what made
+# that version look like it worked.) So the handle is ours: a full-width bar
+# under each panel, which is also a target you can find without hunting a
+# 16 px corner.
+BAR_H = 14          # a splitter you can hit without aiming
+# The grip is painted as a BACKGROUND on the bar itself, not as a child div:
+# Bokeh wraps a Div's html in a .bk-clearfix that is display:inline-block, so
+# `margin: 0 auto` on a child centres it in a shrink-to-fit box and leaves it
+# flat against the left edge -- the same wrapper that once rendered a 303 px
+# iframe inside a 3,383 px Div. background-position does it in one line and
+# cannot be thrown off by the wrapper. The child that remains is absolutely
+# positioned over the whole bar and exists only to carry the tooltip.
+PILL = "<div title='drag to resize' style='position:absolute;inset:0'></div>"
+
+
+def drag_bar(target):
+    """The grab bar under one panel. `target` names the figure it resizes.
+
+    The name is the whole of the wiring: RESIZE_TEMPLATE finds every bar by the
+    "rsz-" prefix and looks its panel up by the rest of the name, so the pairing
+    survives any reordering of the column.
+    """
+    return Div(text=PILL, name="rsz-" + target, sizing_mode=STRETCH,
+               min_width=PANEL_W, height=BAR_H, disable_math=True,
+               styles={"cursor": "row-resize",
+                       "background-color": "#f2f4f6",
+                       "background-image": "linear-gradient(#b8c2cc, #b8c2cc)",
+                       "background-size": "56px 4px",
+                       "background-position": "center",
+                       "background-repeat": "no-repeat",
+                       "border-radius": "3px",
+                       # the drag must not also select text or pan the page
+                       "user-select": "none", "touch-action": "none"},
+               stylesheets=[InlineStyleSheet(
+                   css=":host(:hover) { background-color: #e5eaef; }")])
+
+
+# The drag itself. DocumentReady does not fire in a standalone saved document
+# -- see plot_city_overview.py, where the same discovery cost a dead bookmark
+# -- so the script rides in the page template and waits for BokehJS to publish
+# its views. Setting model.height is what makes Bokeh re-lay-out; nothing else
+# here touches the DOM. A jinja2.Template, NOT the plain string Bokeh also
+# accepts: a string gets rendered twice and the second pass raises "extended
+# multiple times" on the extends below.
+RESIZE_TEMPLATE = Template("""
+{% extends base %}
+{% block postamble %}
+<script>
+(function () {
+  var MIN = 140, MAX = 2000, tries = 0;
+  function walk(v, out) {
+    out.push(v);
+    for (const c of (v.child_views || [])) { walk(c, out); }
+    return out;
+  }
+  function wire(bar, panel) {
+    const el = bar.el;
+    let y0 = 0, h0 = 0, live = false;
+    el.addEventListener("pointerdown", function (ev) {
+      live = true; y0 = ev.clientY; h0 = panel.height;
+      el.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    });
+    // One relayout per frame, not one per pointermove: a move event can
+    // arrive per mouse poll, and each assignment re-lays-out a canvas holding
+    // thousands of points. Coalescing is the difference between a drag that
+    // tracks the pointer and one that stutters behind it.
+    let want = null, queued = false;
+    function flush() {
+      queued = false;
+      if (want !== null && want !== panel.height) { panel.height = want; }
+    }
+    el.addEventListener("pointermove", function (ev) {
+      if (!live) { return; }
+      const lo = panel.min_height || MIN;
+      want = Math.max(lo, Math.min(MAX, Math.round(h0 + ev.clientY - y0)));
+      if (!queued) { queued = true; window.requestAnimationFrame(flush); }
+    });
+    function stop(ev) {
+      if (!live) { return; }
+      live = false;
+      // Land the last position now rather than waiting for a frame that may
+      // never come: a drag can end inside the same frame it started in, and
+      // an inactive tab does not run requestAnimationFrame at all.
+      flush();
+      try { el.releasePointerCapture(ev.pointerId); } catch (e) {}
+    }
+    el.addEventListener("pointerup", stop);
+    el.addEventListener("pointercancel", stop);
+  }
+  function arm() {
+    const docs = (window.Bokeh && window.Bokeh.documents) || [];
+    if (!docs.length || !Bokeh.index || !Bokeh.index.roots.length) {
+      // 400 x 50 ms is 20 s, far past any render; a page with no roots is a
+      // page with nothing to wire.
+      if (++tries < 400) { window.setTimeout(arm, 50); }
+      return;
+    }
+    const doc = docs[0];
+    for (const root of Bokeh.index.roots) {
+      for (const v of walk(root, [])) {
+        const nm = v.model && v.model.name;
+        if (!nm || nm.indexOf("rsz-") !== 0 || !v.el) { continue; }
+        const panel = doc.get_model_by_name(nm.slice(4));
+        if (panel) { wire(v, panel); }
+      }
+    }
+  }
+  arm();
+})();
+</script>
+{% endblock %}
+""")
 # Shared, because the DEM-only toggle restores it: the pinned panel is a
 # snapshot of one tap and would otherwise keep showing the other mode's height.
 PICK_HINT = "<i>tap an inlet marker for its Street View link</i>"
@@ -287,7 +410,12 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
         f"within {args.grate_tol_m:g} m of DEM else the DEM"
         if args.grate_tol_m > 0 else "ungated") + ")"
     title_dem = title_head + "from the DEM, published surveys ignored)"
-    prof = figure(sizing_mode=STRETCH, min_width=PANEL_W, height=PROF_H,
+    # The name is how drag_bar()'s bar finds this panel; min_height is the
+    # floor the drag stops at. Height only -- the width is the container's to
+    # decide under stretch_width, and a dragged width would be overwritten the
+    # next time the window moved.
+    prof = figure(name="prof", sizing_mode=STRETCH, min_width=PANEL_W,
+                  height=PROF_H, min_height=PROF_H_MIN,
                   tools="pan,wheel_zoom,box_zoom,reset",
                   x_axis_label=f"distance along street from {p['origin']} end (m)",
                   y_axis_label="elevation (m, NAVD88)",
@@ -295,13 +423,15 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                   y_range=Range1d(ylo - ypad, yhi + ypad),
                   title=title_gated)
     # In the figure, not beside it: this is how to read the line, so it has to
-    # be on the chart that carries the line. The "below" slot sits under the
-    # x-axis label, where it cannot collide with the data at any y-range.
+    # be on the chart that carries the line. The "above" slot stacks between
+    # the figure title and the frame, so the caveat is read before the line
+    # instead of after it, and like "below" it is outside the frame and so
+    # cannot collide with the data at any y-range.
     prof.add_layout(Title(
         text=GROUND_NOTE + ". Bridge spans are drawn in purple, tunnels "
                            "in green.",
-        text_font_size="11px", text_font_style="normal",
-        text_color="#52514e"), "below")
+        text_font_size="13px", text_font_style="normal",
+        text_color="#52514e"), "above")
     prof.line("d", "z", source=src, line_color="#b6c4d2", line_width=1)
     n_bridge = int(np.count_nonzero(np.isfinite(zb)))
     n_tunnel = int(np.count_nonzero(np.isfinite(zt)))
@@ -329,7 +459,8 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     # ---------------- map ----------------
     pad = float(np.clip(args.pad_frac*max(mx.max()-mx.min(), my.max()-my.min()),
                         args.pad_min_m, args.pad_m))
-    mp = figure(sizing_mode=STRETCH, min_width=map_w, height=MAP_H,
+    mp = figure(name="plan", sizing_mode=STRETCH, min_width=map_w,
+                height=MAP_H, min_height=MAP_H_MIN,
                 match_aspect=True,
                 tools="pan,wheel_zoom,box_zoom,reset",
                 x_range=Range1d(mx.min()-pad, mx.max()+pad),
@@ -724,7 +855,13 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
     output_file(out, title=f"{street} — profile + map", mode="cdn")
     plan = (row(mp, sv, sizing_mode=STRETCH) if sv is not None else mp)
     top = [read, pick, dem_only] if inlet_srcs else [read]
-    save(column(*top, prof, plan, sizing_mode=STRETCH))
+    # A bar under each panel, so each is dragged by the edge it ends at. The
+    # map's bar drives the map and not the row it may sit in: with a Street
+    # View key the pane beside it keeps its own height, which is right -- the
+    # pano is a raster with no layout to follow along.
+    save(column(*top, prof, drag_bar("prof"), plan, drag_bar("plan"),
+                sizing_mode=STRETCH),
+         template=RESIZE_TEMPLATE)
     return out, p
 
 

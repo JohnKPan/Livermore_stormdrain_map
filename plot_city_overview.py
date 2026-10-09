@@ -97,10 +97,13 @@ STRETCH = "stretch_width"
 # the DEM-only checkbox, then plot_street_bokeh.py's PROF_H and MAP_H panels
 # with their titles and axes. Short of it and the iframe grows an inner
 # scrollbar, which is what a 1,020 px frame was doing around a 1,305 px page.
+# It tracks PROF_H + MAP_H + the two BAR_H drag bars under them. A reader
+# who pulls a panel taller scrolls inside the iframe: the frame is fixed
+# here and cannot grow to follow them.
 # Raise this with PROF_H, or when a row is added above the profile. FRAME_W is
 # only a floor now: the iframe is width:100%, so the page inside it stretches
 # with this one.
-FRAME_W, FRAME_H = 1488, 1400
+FRAME_W, FRAME_H = 1488, 1532
 HIT_W = 12                # invisible fat line under each class, for hit testing
 
 # Set from --city in main(). They were hardcoded to Livermore, so every
