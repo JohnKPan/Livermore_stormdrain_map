@@ -89,6 +89,14 @@ DEM_PROJECTS = {
     "hayward": ["CA_AlamedaCounty_2021_B21"],
     "fremont": ["CA_AlamedaCounty_2021_B21", "CA_SantaClaraCounty_2020_A20"],
     "san_jose": ["CA_SantaClaraCounty_2020_A20"],
+    # The only collect here that is NOT 1 ftUS on EPSG:6420: CA_SanFrancisco_B23
+    # is 0.25 m on EPSG:7131, San Francisco's own grid, and counts metres
+    # vertically too. add_elevation.py reads both units off the tiles rather
+    # than assuming feet -- see vertical_unit_m() there, and do not reintroduce
+    # a constant. 654 tiles, 6.9 GB, the finest DEM in the project by 4x, which
+    # matters most here because San Francisco publishes no grate elevations at
+    # all and the DEM is the only source of them.
+    "san_francisco": ["CA_SanFrancisco_B23"],
 }
 
 

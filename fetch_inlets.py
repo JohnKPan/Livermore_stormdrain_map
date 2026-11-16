@@ -1,10 +1,17 @@
-"""Fetch storm drain inlets from a Bay Area city's public ArcGIS service.
+"""Fetch storm drain inlets from a Bay Area city's public GIS service.
 
 Livermore was the first city; bay_area_stormdrain_sources.csv found 32 more that
 publish inlet points. The publishers agree on almost nothing -- field names, units
 and which layer of a storm network counts as "the inlets" all differ -- so this
 script keeps a small registry of vetted endpoints and maps each city's native
 fields onto one canonical schema.
+
+Two APIs, picked per city by the registry's `api` key. ArcGIS REST is the
+default and what twelve of the thirteen cities publish. San Francisco is on
+Socrata, the platform behind DataSF: the city DOES have an ArcGIS layer, but it
+is a lossy daily mirror of the Socrata dataset -- see the registry entry -- so
+the original is read instead. Both paths end at build_rows(), which is where
+every city becomes the same shape.
 
 The canonical names are Livermore's, because plot_street_drains.py and
 plot_street_bokeh.py already read them:
@@ -569,6 +576,69 @@ CITIES = {
                   "TopOfGrate": "Z_alt"},
         "out": "storm_inlets_belmont",
     },
+    "san_francisco": {
+        "label": "San Francisco",
+        # NOT the ArcGIS layer bay_area_stormdrain_sources.csv records for this
+        # city. SFGIS pushes a copy of this dataset to ArcGIS Online every
+        # morning, and the copy is lossy: measured 2026-11-15 it served 23,907
+        # rows holding only 20,603 distinct assets -- 3,304 duplicated exactly
+        # twice, byte-identical in every attribute and the geometry, and 3,304
+        # DIFFERENT upstream records missing, with the row count intact because
+        # a loader paging an unordered source stops when it has taken as many
+        # rows as the source claims. 13.8% of the city, invisible from the
+        # mirror. snapshot_sf_inlets.py keeps the evidence and watches whether
+        # the lost set rotates with each push.
+        #
+        # So this entry reads DataSF directly, which is the mirror's own stated
+        # source ("Data from: https://data.sfgov.org/d/jtgq-b7c5", and the
+        # schemas match field for field).
+        "api": "socrata",
+        "url": "https://data.sfgov.org/resource/jtgq-b7c5.json",
+        # point_x/point_y are the same position in CA State Plane III ftUS and
+        # are dropped: lon/lat already carry it, and the two agree to 0.0002 ft.
+        # (The ArcGIS mirror stores them as float32, which rounds them to whole
+        # feet -- another reason not to read that copy.) data_loaded_at is one
+        # constant per pull and says nothing about an inlet.
+        "fields": ["puc_maximo_asset_id", "drain_type", "system_use",
+                   "system_use_code", "dpw_node_id", "analysis_neighborhood",
+                   "supervisor_district", "data_as_of"],
+        # SoQL, not an Esri where clause. 23,835 of 23,907 survive it.
+        #
+        # What it drops: the 3 rows on the sanitary system, the 8 "Psuedo Drain
+        # for Model ONLY" (a hydraulic model's bookkeeping, no physical grate)
+        # and the 62 "LID / Other surface flow outlet point" -- outlets, which
+        # are the opposite of an inlet. One row is both sanitary and pseudo, so
+        # 72 rows go, not 73.
+        #
+        # What it deliberately KEEPS is the 623 system_use_code='COMB'. Most of
+        # San Francisco is on a combined sewer, and a combined catch basin still
+        # takes street runoff -- it is an inlet by every test this project
+        # applies. The code does not separate storm from combined cleanly in any
+        # case: the dominant value's own label is "Storm; even if DS flow is
+        # combined". The IS NULL arm keeps the 7 rows with no code at all, which
+        # a bare != would silently drop.
+        "where": ("(system_use_code IS NULL OR system_use_code != 'SANI') AND "
+                  "drain_type NOT IN ('Psuedo Drain for Model ONLY', "
+                  "'LID / Other surface flow outlet point')"),
+        # drain_type is the TypeDescription analogue: 100% populated, 27 values,
+        # free text like Pleasanton's SP_FUNC and needing the same normalising
+        # before it can drive a legend. 89.8% of it is "Catch Basin Drain".
+        #
+        # Nothing else maps. The dataset has NO elevation column of any kind --
+        # not zero-filled like Fremont's, absent -- so TopOfGrate,
+        # InvertElevation1 and Depth stay blank and every grate height in San
+        # Francisco comes from the DEM. There is no lifecycle or status field
+        # either. data_as_of is when the RECORD was last touched (2012..2026),
+        # not when the inlet was built, so it is not YearInstalled: Hayward's
+        # mislabelled Comments column could be mapped there because every value
+        # in it really was a year, and this one is not.
+        #
+        # No `datum` key, and check_registry() is right to want none: a datum
+        # declared with no elevation to apply it to is an error.
+        "canon": {"AssetID": "puc_maximo_asset_id",
+                  "TypeDescription": "drain_type"},
+        "out": "storm_inlets_san_francisco",
+    },
     "emeryville": {
         "label": "Emeryville",
         # ArcGIS Online hosted, public, no token. Smallest source in the
@@ -727,6 +797,80 @@ def fetch_all(url, meta, out_fields, where="1=1"):
 HUB_DATASET = "https://hub.arcgis.com/api/v3/datasets/{ds}"
 HUB_DOWNLOAD = ("https://hub.arcgis.com/api/v3/datasets/{ds}"
                 "/downloads/data?format=geojson&spatialRefId=4326")
+
+
+# Socrata's own ceiling for one $limit, and its row-identity column. Paging
+# MUST order by the latter; see fetch_socrata().
+SOCRATA_PAGE = 50000
+SOCRATA_OID = ":id"
+SOCRATA_GEOM = "location"
+# The platform bolts a dozen of these onto every spatial dataset -- the boundary
+# polygons each point falls inside, recomputed by Socrata rather than published
+# by the city. Not the publisher's data, not in the city's own extract, so they
+# are not carried into the corpus even under --all-fields.
+SOCRATA_COMPUTED = ":@computed_region_"
+
+
+def _socrata_cols(row):
+    return [c for c in row if not c.startswith(SOCRATA_COMPUTED)]
+
+
+def describe_socrata(url):
+    """Column names off one row, in the shape describe() returns.
+
+    A row rather than the metadata endpoint: it costs the same one request and
+    it reports what the export actually contains. There are no domains and no
+    field types to report -- the JSON export sends every column as a string,
+    the platform's typing being a property of the dataset, not of this view --
+    so a native column rides along as text. Only the canonical columns are
+    interpreted, and San Francisco maps two strings onto two strings.
+    """
+    d = get(url + "?$limit=1")
+    if not d:
+        raise SystemExit(f"no rows from {url}")
+    cols = _socrata_cols(d[0])
+    return {"name": url.rsplit("/", 1)[-1],
+            "oid": SOCRATA_OID,
+            "page": SOCRATA_PAGE,
+            "paging": True,
+            "fields": [c for c in cols if c != SOCRATA_GEOM],
+            "domains": {}}
+
+
+def fetch_socrata(url, out_fields, where=None):
+    """Page a Socrata resource into the feature shape build_rows() expects.
+
+    $order=:id is not a nicety. Offset paging over an unordered result set is
+    exactly what broke SFGIS's ArcGIS copy of this dataset: 3,304 of San
+    Francisco's inlets arrived twice and 3,304 others never arrived, in a file
+    whose row count was right to the row. :id is Socrata's own row identity and
+    is unique, so ordering by it makes the window stable between requests.
+
+    The geometry column is always requested, whatever the registry asked for --
+    a row without a point is not an inlet (see point()), and $select drops any
+    column it is not told about.
+    """
+    feats, offset = [], 0
+    while True:
+        params = {"$limit": SOCRATA_PAGE, "$offset": offset,
+                  "$order": SOCRATA_OID}
+        if where:
+            params["$where"] = where
+        if out_fields != "*":
+            params["$select"] = ",".join(list(out_fields) + [SOCRATA_GEOM])
+        batch = get(url + "?" + urllib.parse.urlencode(params))
+        if isinstance(batch, dict) and batch.get("error"):
+            raise SystemExit(f"socrata error: {batch.get('message', batch)}")
+        for r in batch:
+            geom = r.pop(SOCRATA_GEOM, None) or {}
+            c = geom.get("coordinates") or [None, None]
+            feats.append({"attributes": {k: r[k] for k in _socrata_cols(r)},
+                          "geometry": {"x": c[0], "y": c[1]}})
+        print(f"  {len(feats):,} features")
+        if len(batch) < SOCRATA_PAGE:
+            break
+        offset += SOCRATA_PAGE
+    return feats
 
 
 def fetch_hub(dataset):
@@ -961,6 +1105,12 @@ def fetch_city(key, cfg, args):
               + (f', elevations shifted {shift:+g} ft onto the corpus datum'
                  if shift else ' -- the corpus datum, no shift'))
 
+    if args.via_hub and cfg.get("api") == "socrata":
+        # The Hub cache is Esri's mirror of an Esri layer. This city is not on
+        # one, and the ArcGIS copy that does exist is the thing being avoided.
+        raise SystemExit(f'{key!r} is a Socrata resource; --via-hub reads an '
+                         f'Esri Hub cache and has nothing to offer it')
+
     if args.via_hub:
         if not cfg.get("hub"):
             raise SystemExit(f'no Hub dataset recorded for {key!r}')
@@ -981,6 +1131,20 @@ def fetch_city(key, cfg, args):
         missing = [f for f in cfg["fields"] if f not in available]
         if missing:
             print(f"  ! not in the cached extract, omitted: {', '.join(missing)}")
+    elif cfg.get("api") == "socrata":
+        meta = describe_socrata(cfg["url"])
+        print(f'socrata resource "{meta["name"]}"  '
+              f'{len(meta["fields"])} columns  page={meta["page"]}')
+
+        natives = meta["fields"] if args.all_fields else cfg["fields"]
+        unknown = [f for f in natives if f not in meta["fields"]]
+        if unknown:
+            raise SystemExit(f"columns not on this resource (schema changed?): "
+                             f"{unknown}")
+
+        domains = {}
+        feats = fetch_socrata(cfg["url"], "*" if args.all_fields else natives,
+                              cfg.get("where"))
     else:
         meta = describe(cfg["url"])
         print(f'layer "{meta["name"]}"  oid={meta["oid"]}  page={meta["page"]}  '
@@ -1122,7 +1286,8 @@ def main():
     if args.list:
         for key, c in CITIES.items():
             mapped = ", ".join(f"{k}<-{v}" for k, v in c["canon"].items())
-            print(f'{key:<12} {c["label"]:<12} {c["url"]}')
+            api = c.get("api", "arcgis")
+            print(f'{key:<15} {c["label"]:<15} [{api}] {c["url"]}')
             if c.get("where"):
                 print(f'             filter {c["where"]}')
             if c.get("datum"):

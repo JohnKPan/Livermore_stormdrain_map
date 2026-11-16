@@ -50,6 +50,10 @@ dem_*/
 # manifest each, as <slug>_tiles_<project>.csv (see DEM_PROJECTS).
 *_tiles*.csv
 *_download.log
+# The pipeline's own stdout, per city and per step. Reproducible by
+# re-running; kept on disk because a failed build is read from it.
+*_build.log
+*_streets.log
 
 # conda-forge environment. Only needed to mosaic collects that sit in DIFFERENT
 # projections -- gdal.Warp, which has no PyPI wheel on Windows. environment.yml
