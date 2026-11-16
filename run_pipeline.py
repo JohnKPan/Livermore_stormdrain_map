@@ -97,6 +97,30 @@ DEM_PROJECTS = {
     # matters most here because San Francisco publishes no grate elevations at
     # all and the DEM is the only source of them.
     "san_francisco": ["CA_SanFrancisco_B23"],
+    # South San Francisco is outside CA_SanFrancisco_B23 entirely -- that
+    # collect is the city and county and stops at 37.6959, and SSF ends at
+    # 37.6699, a 2.9 km gap. CaliforniaGaps is the only collect with full
+    # coverage here; West_Coast_2016 offers 5 tiles. 0.5 m on EPSG:6339
+    # (UTM 10N) in metres, so another collect that would have been divided by
+    # 3.28 before vertical_unit_m().
+    "south_san_francisco": ["CA_CaliforniaGaps_B23"],
+    # Brisbane straddles the edge of CA_SanFrancisco_B23, which is the finer
+    # collect (0.25 m against 0.5 m) but stops at 37.6959 -- it offers 19 tiles
+    # over Brisbane's real limits and the city runs to 37.7084, so the southern
+    # two thirds, which is most of the city, would have no tiles at all.
+    # CaliforniaGaps covers all 22. Taking it whole also keeps Brisbane on the
+    # same collect, CRS and resolution as South San Francisco next door, which
+    # is what lets the combined map hold both without a warped mosaic.
+    "brisbane": ["CA_CaliforniaGaps_B23"],
+    # Both further down the peninsula, and both on the same collect as South
+    # San Francisco and Brisbane -- CaliforniaGaps is the only one covering
+    # Burlingame at all, and for San Carlos the alternative
+    # (CA_SantaClaraCounty_2020_A20) offers 22 tiles against 163.
+    "san_carlos": ["CA_CaliforniaGaps_B23"],
+    "burlingame": ["CA_CaliforniaGaps_B23"],
+    # Same collect again. West_Coast_2016 is the only alternative and offers
+    # 14 tiles against 154.
+    "san_bruno": ["CA_CaliforniaGaps_B23"],
 }
 
 

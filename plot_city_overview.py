@@ -194,6 +194,32 @@ def sag_bin(rate):
     return 1
 
 
+# The gap's one colour. Lighter than SAG_BINS' "no sag" grey (#aeb8c2), which
+# a street with a corpus behind it can legitimately wear -- these two greys
+# have to be told apart at a glance or the map says the opposite of what it
+# means. Thin and translucent: a backdrop, not a layer competing for attention.
+GAP_COLOR, GAP_WIDTH, GAP_ALPHA = "#c9d1d9", 1.0, 0.85
+
+
+def load_gap(here, paths):
+    """Streets with no corpus behind them, in Web Mercator.
+
+    Returns None when none were given, which is every single-city build.
+    """
+    if not paths:
+        return None
+    frames = []
+    for p in paths:
+        g = pd.read_csv(os.path.join(here, p),
+                        usecols=["OBJECTID", "city", "vertex_index", "lat", "lon"])
+        frames.append(g)
+    g = pd.concat(frames, ignore_index=True)
+    g = g.sort_values(["OBJECTID", "vertex_index"], kind="stable")
+    to3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    g["mx"], g["my"] = to3857.transform(g.lon.to_numpy(), g.lat.to_numpy())
+    return g
+
+
 def load(here, args, variants):
     """Per-OBJECTID polylines in Web Mercator, joined to every page index.
 
@@ -274,13 +300,27 @@ def main():
                     choices=("class", "sags"), default="class",
                     help="colouring the page opens on; both are always built "
                          "and switchable on the page itself")
+    # A merged corpus spans cities, so the slug is no longer a city name.
+    ap.add_argument("--name", default=None,
+                    help="what the captions call this map (default: the "
+                         "--city slug's name from the boundary index)")
+    # Streets with no corpus behind them. Drawn under everything, in grey,
+    # with neither a tap target nor a search entry: Daly City's drains exist,
+    # we just cannot reach them, and blank ground would say the opposite.
+    ap.add_argument("--gap-verts", action="append", default=None,
+                    metavar="CSV",
+                    help="vertices CSV of streets that have no pages; drawn "
+                         "grey and inert. Repeatable")
+    ap.add_argument("--gap-note", default="no inlet data published by this city",
+                    help="what the grey streets say on hover")
     args = ap.parse_args()
     sag_first = args.color_by == "sags"
 
     # Captions name the city being drawn. Module globals rather than threaded
     # arguments because the figure builders below already read them by name.
     global TITLE, TITLE_SAG, NAME
-    NAME = city_name(os.path.dirname(os.path.abspath(__file__)), args.city)
+    NAME = args.name or city_name(
+        os.path.dirname(os.path.abspath(__file__)), args.city)
     TITLE = (f"{NAME} street centerline — tap a street to load its profile "
              f"and drainage map below")
     TITLE_SAG = (f"{NAME} streets by sags per mile — tap a street to load its "
@@ -362,6 +402,38 @@ def main():
     # City scale means a lot of zooming; make the wheel do it without a toolbar
     # trip. The per-street pages leave this off, where panning matters more.
     mp.toolbar.active_scroll = mp.select_one(WheelZoomTool)
+
+    # ---------------- the gap ----------------
+    # Drawn FIRST, so every real street sits on top of it. One flat grey at low
+    # alpha, no class ramp: these streets carry no data, and colouring them by
+    # class would put them in the same visual language as the streets that do.
+    # They get a hover of their own -- the only thing on the page that explains
+    # itself -- but no tap handler and no search entry, so the one thing a
+    # reader can do with them is find out why they are grey.
+    gap_verts = load_gap(here, args.gap_verts)
+    if gap_verts is not None:
+        # The caption is PER CITY, not per map. One of these cities secures its
+        # data, one withdrew it, one serves a catalogue with the coordinates
+        # stripped out, and three publish usable layers that simply are not
+        # built yet. Collapsing that into a single sentence would libel the
+        # last three.
+        has_reason = "reason" in gap_verts.columns
+        keys = ["OBJECTID", "city"] + (["reason"] if has_reason else [])
+        gxs, gys, gcity, gnote = [], [], [], []
+        for key, g in gap_verts.groupby(keys, sort=False):
+            gxs.append(g.mx.to_numpy())
+            gys.append(g.my.to_numpy())
+            gcity.append(city_name(here, key[1]))
+            gnote.append(key[2] if has_reason else args.gap_note)
+        gsrc = ColumnDataSource(dict(xs=gxs, ys=gys, city=gcity, note=gnote))
+        gline = mp.multi_line("xs", "ys", source=gsrc, line_color=GAP_COLOR,
+                              line_width=GAP_WIDTH, line_alpha=GAP_ALPHA)
+        ghit = mp.multi_line("xs", "ys", source=gsrc, line_width=HIT_W,
+                             line_alpha=0.0)
+        mp.add_tools(HoverTool(renderers=[ghit],
+                               tooltips=[("city", "@city"), ("", "@note")],
+                               line_policy="nearest"))
+        print(f"  gap: {len(gxs):,} street(s) drawn grey and inert")
 
     # Rate AND count AND length, all three: the rate is what the colour
     # encodes, and the two numbers it came from are what tell a genuinely sag

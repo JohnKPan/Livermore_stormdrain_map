@@ -163,9 +163,26 @@ def _negate(v):
     return None if f is None else -f
 
 
+def _title_case(v):
+    """One capitalisation for a label a human typed twice.
+
+    South San Francisco files 781 inlets as "Curb Inlet" and one as "CURB
+    INLET", 928 as "Active" and one as "ACTIVE". Those are not two kinds of
+    inlet and not two states; they are one value entered in two moods, and a
+    legend or a groupby would show them as separate categories. Hayward's
+    trailing-space variants are stripped for the same reason -- this is the
+    same defect with the shift key instead of the space bar.
+
+    Canonical columns only, like every converter here. A native column still
+    rides along exactly as served.
+    """
+    return v.title() if isinstance(v, str) else v
+
+
 CONVERTERS = {"float": _to_float, "lead_float": _lead_float,
               "first_line": _first_line, "year": _year,
-              "inches_to_feet": _inches_to_feet, "negate": _negate}
+              "inches_to_feet": _inches_to_feet, "negate": _negate,
+              "title_case": _title_case}
 
 # --------------------------------------------------------------------------
 # City registry.
@@ -638,6 +655,253 @@ CITIES = {
         "canon": {"AssetID": "puc_maximo_asset_id",
                   "TypeDescription": "drain_type"},
         "out": "storm_inlets_san_francisco",
+    },
+    "south_san_francisco": {
+        "label": "South San Francisco",
+        # Not in bay_area_stormdrain_sources.csv, because nothing finds it by
+        # searching: "South San Francisco" plus storm/drain on ArcGIS Online
+        # returns two unrelated items, the city runs no open data portal, and
+        # no GIS host answers under ssf.net. survey_bay_area_sources.py never
+        # probed it. The way in was searching ArcGIS Online for the phrase
+        # "City of South San Francisco" and following the publishing account
+        # back to its organisation, where the layer sits in the open.
+        "url": ("https://services5.arcgis.com/inY93B27l4TSbT7h/arcgis/rest"
+                "/services/catchbasins_ftb/FeatureServer/0"),
+        # 2,662 catch basins, OWNERNAME='SSF' on every one, so no filter: the
+        # layer is already just this city's inlets.
+        "fields": ["OBJECTID_1", "ID", "BASINID", "FACILITYID", "LEGACYID",
+                   "LOCATION", "OWNERNAME", "STATUS", "INLETTYPE", "RIMELEV",
+                   "INVELEV", "Grated", "Source", "Flows_To_B"],
+        # FACILITYID over BASINID and ID: 96.1% populated against 98.3% and
+        # 93.2%, but 2,557 distinct values and only 2 duplicated, and it is the
+        # column San Jose and Richmond already map here.
+        #
+        # INLETTYPE is thin -- 34.9% populated, Curb Inlet 781, Drain Inlet 85,
+        # Round 62 -- so two inlets in three come out with no type at all. It is
+        # still the only type column there is.
+        #
+        # STATUS is a lifecycle field (Active 928, Not Found 38, Not Searched
+        # 10, Buried 4), which is what OperationalStatus means, so unlike
+        # Hayward's condition grade it maps.
+        "convert": {"INLETTYPE": "title_case", "STATUS": "title_case"},
+        # MEASURED NGVD29, and the measurement is this city's whole story.
+        # RIMELEV minus USGS 3DEP bare earth over all 1,962 grates that carry
+        # one, sampled through the project's own mosaic at 0.5 m: median
+        # -2.980 ft, IQR 1.72, MAD 0.86. The median sits just outside the band
+        # the other NGVD29 cities occupy (-2.4 to -2.7; Pleasanton is nearest
+        # at -2.744), but the SPREAD is what marks it out -- only 54.4% of
+        # grates land within a foot of that median, against Livermore's 78.8%
+        # and San Jose's 69.3%. The loosest of the thirteen.
+        #
+        # It also carries a real defect the 20 ft gate will catch but not
+        # explain: 21 grates on the flat ground east of US-101 publish rims
+        # ~95 ft above it (E Grand Ave and neighbours, DEM 10-17 ft, published
+        # 109-269 ft), 15 of them marked Source=GPS and STATUS=Active. A
+        # matching negative tail runs to -158 ft. 48 grates in all fall outside
+        # the gate. See derived/ssf_grate_dem_error.csv.
+        "datum": "NGVD29",
+        "canon": {"AssetID": "FACILITYID", "TypeDescription": "INLETTYPE",
+                  "TopOfGrate": "RIMELEV", "InvertElevation1": "INVELEV",
+                  "OperationalStatus": "STATUS"},
+        "out": "storm_inlets_south_san_francisco",
+    },
+    "san_carlos": {
+        "label": "San Carlos",
+        # Hosted on San Mateo County's own ArcGIS Online org, which also carries
+        # Foster City, Pacifica and Menlo Park. The service name says Sewer AND
+        # Storm; layer 0 is the storm side.
+        "url": ("https://services.arcgis.com/yq3FgOI44hYHAFVZ/arcgis/rest"
+                "/services/San_Carlos_City_Sewer_Storm_Drainage_System"
+                "/FeatureServer/0"),
+        # 3,205 nodes, but this is a mixed structures layer: 566 Manhole, 198
+        # Outfall, 149 Junction, 116 Infall, 38 Manhole - Private, 3 Pump
+        # Station and 2 Cap are not inlets. BLOCK is the column that says which
+        # is which, and the filter keeps the 2,133 that are:
+        #   Catch Basin 1,537 | Catch Basin - Private 391
+        #   Drop Inlet 105 | Catch Basin Trash Capture 73 | Bubble Box 27
+        "where": ("BLOCK IN ('Catch Basin','Catch Basin - Private',"
+                  "'Catch Basin Trash Capture','Drop Inlet','Bubble Box')"),
+        "fields": ["OBJECTID", "ENTRYID", "ID_NO", "TYPE", "BLOCK", "THEME"],
+        # NO ELEVATION OF ANY KIND, and no depth either. The only numeric
+        # columns are MS_ANGLE, MS_ANG_OLD and ACAD_ANGLE, which are symbol
+        # rotations carried over from the CAD drawing this layer was digitised
+        # from. So no `datum` key here, and check_registry() is right not to
+        # want one: there is nothing for an offset to apply to. San Carlos is
+        # DEM-only, like San Francisco.
+        #
+        # TYPE is provenance, not a kind of inlet -- GPS 2,139, Foreign System
+        # 471, Private 446, JCT 149 -- so BLOCK is what maps to
+        # TypeDescription. THEME is BLOCK with the two "- Private" variants
+        # folded into a flat "Private", which loses the structure, so BLOCK
+        # wins.
+        "canon": {"AssetID": "ID_NO", "TypeDescription": "BLOCK"},
+        "out": "storm_inlets_san_carlos",
+    },
+    "san_bruno": {
+        "label": "San Bruno",
+        # SpryPoint-hosted, on the city's own ArcGIS Online org. Layer 1 is the
+        # inlets; the service also carries the pipe network.
+        "url": ("https://services2.arcgis.com/iLsFVn6d1pmqKEfA/arcgis/rest"
+                "/services/Storm_Drain_SpryPoint/FeatureServer/1"),
+        # 1,598 rows, of which 4 are Clean Outs and not inlets. Everything
+        # else is: Catch Basin 1,363, Drop Inlet 135, Field Inlet 60, Bubbler
+        # 10, Curb Inlet 8, Other 2, plus 16 with no type.
+        "where": "InletType IS NULL OR InletType <> 'Clean Out'",
+        # NOT FETCHED: CreateBy, RevBy and RevComments, which carry the names
+        # of the staff who edited each row.
+        #
+        # OwnedBy is worth reading before trusting: 1,473 City of San Bruno,
+        # 87 CalTrans, 18 City of South San Francisco, 12 HOA, 8 Private. The
+        # 18 are kept -- ownership is not location, and a drain SSF owns that
+        # sits in a San Bruno street still drains that street. The merge
+        # assigns pages by geometry, so nothing double-counts.
+        "fields": ["OBJECTID", "SDInletID", "SDInletCMMSID", "InletType",
+                   "GrateSize", "GrateShape", "GrateMaterial",
+                   "GrateCondition", "FrameCondition", "InletMaterial",
+                   "InletCondition", "CurbOpening", "TopOfGrate",
+                   "InvertElevationIn1", "InvertElevationOut1", "Depth",
+                   "NmbrOfPipesIn", "NmbrOfPipesOut", "InstallDate",
+                   "LandUseDesignation", "Location", "CrossStreet",
+                   "OwnedBy", "MaintainedBy", "Status", "GPSDate"],
+        # Status is "Active" on all 1,598, so it is not mapped to
+        # OperationalStatus -- a column with one value distinguishes nothing,
+        # the same call made for Brisbane's lifecyclestatus.
+        "canon": {"AssetID": "SDInletCMMSID", "TypeDescription": "InletType",
+                  "TopOfGrate": "TopOfGrate",
+                  "InvertElevation1": "InvertElevationOut1",
+                  "Depth": "Depth", "YearInstalled": "InstallDate"},
+        "convert": {"InstallDate": "year"},
+        # MEASURED NAVD88 -- only the second city in the registry on it, after
+        # Richmond, and the first on the peninsula.
+        #
+        # TopOfGrate minus 3DEP bare earth over all 186 grates that carry a
+        # non-zero one, through the project's own 0.5 m mosaic: median
+        # -0.340 ft. The NGVD29 cities sit at -2.4 to -2.7 and South San
+        # Francisco next door at -2.980; a grate on NAVD88 should read about
+        # zero against a NAVD88 DEM, and this reads -0.34. Richmond, the other
+        # NAVD88 city, measures +0.317.
+        #
+        # Declaring NAVD88 subtracts 2.605 ft to put San Bruno on the corpus
+        # datum. Leaving it out would have left every grate 2.6 ft high --
+        # exactly the failure check_registry() exists to prevent.
+        #
+        # TopOfGrate is thin: 204 populated, 186 of them non-zero, 11.6% of the
+        # layer. The INVERTS are the well-filled columns here
+        # (InvertElevationOut1 on 1,239, 77.5%), and they corroborate the
+        # datum from the other direction: grate minus invert is +6.16 ft
+        # median over the 159 rows carrying both, and negative on NONE of
+        # them. A column pair that never puts the pipe above the grate is a
+        # column pair measured on one datum.
+        #
+        # Spread is middling -- IQR 2.89, 45.7% within a foot of the median,
+        # between South San Francisco's 54.4% and Brisbane's 31.5% -- and one
+        # grate reads -74.7 ft. 1 of 186 falls outside the 20 ft gate.
+        "datum": "NAVD88",
+        "out": "storm_inlets_san_bruno",
+    },
+    "burlingame": {
+        "label": "Burlingame",
+        # The city's Adopt-a-Drain map, which is also its inlet inventory.
+        "url": ("https://services3.arcgis.com/GNfQzqBlylJyDTAC/arcgis/rest"
+                "/services/AdoptADrainMap_copy/FeatureServer/0"),
+        # 1,442 inlets, all of them inlets, so no filter.
+        #
+        # NOT FETCHED, deliberately: Adopter (98.8% populated), Nickname,
+        # created_user, last_edited_user and Image. This layer is an adoption
+        # programme as much as an asset inventory, and Adopter holds the names
+        # residents signed up under. The same reason Brisbane's Adopt_a_Drain
+        # service is left alone entirely.
+        "fields": ["OBJECTID", "FACILITYID", "INLETTYPE", "INVERTELEV",
+                   "Inlet_Length", "Inlet_Width", "Inlet_Depth",
+                   "Inlet_Status", "Status", "Structure_Shape", "Cover_Type",
+                   "Cover_Material", "Bike_Safe", "TCD", "TCD_Type", "Basin",
+                   "Watershed", "Street", "CarteID", "INSTALLDATE"],
+        # INLETTYPE is a coded domain that coded_domains() decodes:
+        # Catchbasin 1,360, CI 44, DI 14, Other 9, Unknown 6, AD 1.
+        #
+        # NO TOP OF GRATE. INVERTELEV exists but is populated on 51 of 1,442 --
+        # 3.5% -- and Inflow/Outflow_Invert_Elevation on 13 and 12. That is too
+        # thin to measure a datum against 3DEP with any confidence, and a datum
+        # declared on 51 points would be a guess wearing a measurement's
+        # clothes. So InvertElevation1 is NOT mapped and no datum is declared;
+        # Burlingame is DEM-only. The 51 values still ride along as the native
+        # INVERTELEV column for anyone who wants them.
+        #
+        # Inlet_Depth (68.9%) IS mapped, to Depth -- a depth is a length, not
+        # an elevation, so no datum touches it.
+        "canon": {"AssetID": "FACILITYID", "TypeDescription": "INLETTYPE",
+                  "Depth": "Inlet_Depth", "OperationalStatus": "Inlet_Status",
+                  "YearInstalled": "INSTALLDATE"},
+        "convert": {"INSTALLDATE": "year"},
+        "out": "storm_inlets_burlingame",
+    },
+    "brisbane": {
+        "label": "Brisbane",
+        # Also absent from bay_area_stormdrain_sources.csv, and found the same
+        # way South San Francisco was: searching ArcGIS Online for the phrase
+        # "City of Brisbane" and following the publishing account to its org.
+        # Searching for the city plus storm/drain returns one irrelevant item,
+        # and note that `brisbaneopendata` is Brisbane, AUSTRALIA.
+        #
+        # An Esri Utility Network "viewing" service, so the layer id is 400028
+        # rather than 0 and the OID field is lowercase `objectid`. The sibling
+        # Adopt_a_Drain_WFL1 service is NOT used and must not be: its rows are
+        # an adopter registry carrying residents' names, addresses, phone
+        # numbers and email addresses.
+        "url": ("https://services9.arcgis.com/UGpGSV1ugL0pHSgX/arcgis/rest"
+                "/services/StormwaterSystem_viewing_785433da605b41f59a81dc"
+                "844248e882/FeatureServer/400028"),
+        # 1,331 catch basins, 1,321 of them inside Brisbane's Census limits, so
+        # the layer is already this city and needs no filter. lifecyclestatus
+        # is "In Service" on every single row, which is why it is not mapped to
+        # OperationalStatus: a column with one value distinguishes nothing.
+        "fields": ["objectid", "assetid", "assettype", "designtype",
+                   "lifecyclestatus", "rimelevation", "invertelev", "depth",
+                   "material", "additionaldevice", "ownedby", "maintby",
+                   "spatialsource", "spatialconfidence", "installdate",
+                   "notes"],
+        # AssetID is mapped to `assetid` knowing it is 48/1331 -- 3.6%. It is
+        # the only asset identifier the layer publishes; globalid is 100% full
+        # but it is a GUID, which identifies a ROW and not a basin, and putting
+        # one in AssetID would dress up an absence as a value.
+        #
+        # designtype is the type column and it is nearly empty too: "Unknown"
+        # on 1,242 and "Grate" on 89. Both are coded-value domains, which
+        # coded_domains() already decodes, so these arrive as labels.
+        "canon": {"AssetID": "assetid", "TypeDescription": "designtype",
+                  "TopOfGrate": "rimelevation",
+                  "InvertElevation1": "invertelev"},
+        # MEASURED, and the measurement found something worse than a wrong
+        # datum: this city publishes TWO of them in one column.
+        #
+        # rimelevation minus 3DEP bare earth, all 375 grates that carry one,
+        # sampled through the project's own 0.5 m mosaic: median -1.393 ft,
+        # IQR 3.23, and only 31.5% within a foot of that median -- far looser
+        # than South San Francisco's 54.4%, which was the loosest until now.
+        # The median sits between the NGVD29 band (-2.4 to -2.7) and NAVD88
+        # (+0.3) and matches neither, which is the tell.
+        #
+        # Split by provenance and the two datums come apart cleanly:
+        #
+        #   ownedby=Private, spatialsource=As-Built   n= 46  median -3.05
+        #   ownedby=Private, designtype=Grate         n= 77  median -3.24
+        #   ownedby=Private, all                      n=259  median -1.91
+        #   ownedby=Our Agency, all                   n=116  median +0.31
+        #
+        # The privately owned basins -- and every one with real provenance,
+        # whether an As-Built source or an actual grate type -- land on NGVD29,
+        # within a tenth of a foot of South San Francisco next door. The
+        # city-owned records land on +0.31, which is Richmond's NAVD88 figure
+        # (+0.317) almost exactly. Records with an installdate read -2.08;
+        # those without, +0.06.
+        #
+        # NGVD29 is declared because it is right for 259 of the 375 and for all
+        # of the well-provenanced ones. The 116 city-owned grates will come out
+        # about 2.6 ft high. That is inside the 20 ft gate, so nothing will
+        # catch it downstream -- this comment is the only thing that will.
+        # See derived/brisbane_grate_dem_error.csv for the full set.
+        "datum": "NGVD29",
+        "out": "storm_inlets_brisbane",
     },
     "emeryville": {
         "label": "Emeryville",

@@ -53,6 +53,7 @@ dem_*/
 # The pipeline's own stdout, per city and per step. Reproducible by
 # re-running; kept on disk because a failed build is read from it.
 *_build.log
+*_build[0-9].log
 *_streets.log
 
 # conda-forge environment. Only needed to mosaic collects that sit in DIFFERENT
