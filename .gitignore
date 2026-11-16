@@ -94,3 +94,7 @@ style_key.png
 .idea/
 .DS_Store
 Thumbs.db
+
+# Staging tree for publish_merged.py: hardlinks to pages that already exist
+# under Stormdrain_map/<city>/, rebuilt from scratch on every publish.
+Stormdrain_map/_publish_*/

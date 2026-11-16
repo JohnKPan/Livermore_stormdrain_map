@@ -1,0 +1,27 @@
+gh: GitHub Pages is already enabled. (HTTP 409)
+clearing Stormdrain_map\_publish_SF_and_North_Peninsula
+staging 3689 page(s) from 5 corpora
+  brisbane                  95 page(s)
+  burlingame               233 page(s)
+  san_bruno                293 page(s)
+  san_francisco           2539 page(s)
+  south_san_francisco      529 page(s)
+  3689 hardlinked, 0 copied
+rendering the overview against the staged tree
+    $ D:\Claude\PengWeather Stormdrain map\.conda\env\python.exe D:\Claude\PengWeather Stormdrain map\plot_city_overview.py --city SF_and_North_Peninsula --name San Francisco and the North Peninsula ...
+  gap: 6,392 street(s) drawn grey and inert
+20,431 segments over 3,688 pages -> D:\Claude\PengWeather Stormdrain map\Stormdrain_map\_publish_SF_and_North_Peninsula\index.html  (14.4 MB)
+    10 m smoothing: 2,912 sags, 699 unserved, 1.78/mi over 1,632 mi   (Stormdrain_map\_publish_SF_and_North_Peninsula)
+staged: 629.5 MB over 3692 file(s) -> Stormdrain_map\_publish_SF_and_North_Peninsula
+broken hrefs in the staged tree: 0
+    $ gh api user -q .login
+creating JohnKPan/SF_and_North_Peninsula_stormdrain_map
+    $ gh repo create JohnKPan/SF_and_North_Peninsula_stormdrain_map --public --description ...
+    $ git init -q -b gh-pages
+    $ git add -A
+    $ git commit -q -m San Francisco and the North Peninsula -- 3689 pages over 5 cities
+    $ git remote add origin https://github.com/JohnKPan/SF_and_North_Peninsula_stormdrain_map.git
+pushing 629 MB, this takes a while
+    $ git push -q --force origin gh-pages
+    $ gh api -X POST repos/JohnKPan/SF_and_North_Peninsula_stormdrain_map/pages -f ...
+{"message":"GitHub Pages is already enabled.","documentation_url":"https://docs.github.com/rest/pages/pages#create-a-apiname-pages-site","status":"409"}command failed: gh api -X POST repos/JohnKPan/SF_and_North_Peninsula_stormdrain_map/pages -f source[branch]=gh-pages -f source[path]=/
