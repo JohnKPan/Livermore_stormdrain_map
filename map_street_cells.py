@@ -2,16 +2,19 @@
 
 Top panel  : the whole street over hillshaded terrain, discontinuities in red,
              with boxes showing where the detail panels zoom.
-Lower panels: native 1 ftUS cells drawn as actual squares, the cell containing
+Lower panels: native DEM cells drawn as actual squares, the cell containing
              each centerline point outlined, points on top, flagged points red.
 
-Individual 1 ft cells are sub-pixel at street scale, which is why the detail
-panels exist -- they are the only place the grid is actually visible.
+Individual cells are sub-pixel at street scale, which is why the detail panels
+exist -- they are the only place the grid is actually visible.
 
 This is the one plot in the project that works in the DEM's own frame rather
-than UTM 10N: its whole subject is the DEM grid, and the grid is only square,
-axis-aligned and whole-numbered in EPSG:6420. Axes are therefore ftUS, while
+than UTM 10N: its whole subject is the DEM grid, and the grid is only square
+and axis-aligned in the DEM's own CRS. Axes are therefore in that CRS's unit --
+US survey feet for the county collects, metres for CA_SanFrancisco_B23 -- while
 --window and every elevation stay in metres like the rest of the project.
+
+Units are read from the mosaic, never assumed. See add_elevation.vertical_unit_m.
 
 Usage:
     python map_street_cells.py                          # AIRWAY BL
@@ -34,29 +37,42 @@ from matplotlib.colors import LightSource, Normalize
 from matplotlib.patches import Rectangle
 from rasterio.windows import from_bounds
 
-from add_elevation import DEMDIR, FT_TO_M, VRT_NAME, build_vrt
+from add_elevation import (DEMDIR, VRT_NAME, build_vrt, horizontal_crs,
+                           res_metres, snap_unit, unit_abbr, vertical_unit_m)
 from extract_centerline_latlon import DEFAULT_CITY, SPACING, points_path
 from plot_street_profiles import DISC_CM
 
 
-def read_dem(vrt, bounds):
-    """Read a window of the DEM mosaic. Bounds are DEM CRS feet, values metres.
+def read_dem(vrt, bounds, v_unit):
+    """Read a window of the DEM mosaic. Bounds are DEM CRS units, values metres.
 
     Reading through the VRT rather than looping tiles means a window straddling
     a tile edge comes back whole -- the OPR tiles do not overlap.
+
+    `v_unit` is metres per vertical unit, from the mosaic. It was a foot
+    constant here
+    for as long as every collect counted feet; San Francisco's counts metres,
+    and the constant would have shrunk its hills to a third.
     """
     west, south, east, north = bounds
     with rasterio.open(vrt) as src:
+        nodata = src.nodata
         win = from_bounds(west, south, east, north, transform=src.transform)
         arr = src.read(1, window=win, boundless=True,
-                       fill_value=src.nodata).astype("float64")
-    arr[arr == -999999.0] = np.nan
-    return arr * FT_TO_M
+                       fill_value=nodata).astype("float64")
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+    return arr * v_unit
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--street", default="AIRWAY BL")
+    # Pre-existing break: main() has read args.city since the corpus moved under
+    # derived/<city>/, but the option was never declared, so every invocation
+    # died with AttributeError before reaching the plot.
+    ap.add_argument("--city", default=DEFAULT_CITY,
+                    help=f"city slug; reads derived/<city>/ (default {DEFAULT_CITY})")
     # 12 m, not the 40 m the 1 m DEM used: the panel's whole job is to make
     # individual cells visible, and 40 m of 1 ft cells is 131 across -- 17,000
     # squares whose white edges swamp the panel. 12 m gives 39 across, which is
@@ -77,7 +93,15 @@ def main():
     if not files:
         print(f"No .tif in {args.dem_dir}/ -- run fetch_usgs_lidar.py first")
         return 1
-    vrt = build_vrt(files, os.path.join(demdir, VRT_NAME)).path
+    mos = build_vrt(files, os.path.join(demdir, VRT_NAME))
+    vrt = mos.path
+    # The DEM's own units, read from the mosaic rather than assumed.
+    dem_crs = horizontal_crs(mos.crs)
+    h_unit = snap_unit(res_metres(dem_crs, 1.0) or 1.0)
+    v_unit = vertical_unit_m(mos.crs)
+    u = unit_abbr(h_unit)
+    epsg = dem_crs.to_epsg()
+    frame = f"EPSG:{epsg}" if epsg else "DEM CRS"
 
     df = pd.read_parquet(os.path.join(here, points_path(args.spacing, "parquet", args.city)))
     st = df[df.display_name == args.street].copy()
@@ -85,8 +109,8 @@ def main():
         print(f"No points for {args.street!r}")
         return 1
 
-    # Everything below is in DEM CRS feet; --window arrives in metres.
-    win_ft = args.window / FT_TO_M
+    # Everything below is in DEM CRS units; --window arrives in metres.
+    win_ft = args.window / h_unit
     flagged = st[st.elev_disc_cm > args.disc_threshold]
     # group flagged points into clusters to choose detail windows
     centers = []
@@ -110,11 +134,11 @@ def main():
             merged.append((cx, cy, cn))
     centers = merged[:3]
 
-    pad = 60.0 / FT_TO_M
+    pad = 60.0 / h_unit
     ob = (st.dem_x.min()-pad, st.dem_y.min()-pad,
           st.dem_x.max()+pad, st.dem_y.max()+pad)
     dem = read_dem(vrt, (np.floor(ob[0]), np.floor(ob[1]),
-                         np.ceil(ob[2]), np.ceil(ob[3])))
+                         np.ceil(ob[2]), np.ceil(ob[3])), v_unit)
     oext = [np.floor(ob[0]), np.ceil(ob[2]), np.floor(ob[1]), np.ceil(ob[3])]
 
     ndet = len(centers)
@@ -138,10 +162,11 @@ def main():
     ls = LightSource(azdeg=315, altdeg=45)
     fin = np.isfinite(dem)
     filled = np.where(fin, dem, np.nanmedian(dem[fin]))
-    # elevations are metres, pixels are feet -- give shade() the real cell size
-    # or the hillshade exaggerates by a factor of 3.28.
+    # elevations are metres and pixels are DEM units -- give shade() the real
+    # cell size in metres, or a foot grid exaggerates the relief by 3.28x.
+    px_m = mos.res_m
     rgb = ls.shade(filled, cmap=plt.get_cmap("gist_earth"), blend_mode="soft",
-                   vert_exag=4, dx=FT_TO_M, dy=FT_TO_M)
+                   vert_exag=4, dx=px_m, dy=px_m)
     ax.imshow(np.dstack([rgb[..., :3], fin.astype(float)]), extent=oext,
               origin="upper", interpolation="bilinear")
     ax.plot(st.dem_x, st.dem_y, ".", color="#1f4e79", ms=1.4,
@@ -158,10 +183,11 @@ def main():
                     fontsize=13, fontweight="bold",
                     xytext=(4, 2), textcoords="offset points", zorder=8)
     ax.set_title(f"A.  {args.street} — {len(st):,} points, "
-                 f"{st.OBJECTID.nunique()} segments\nover 1 ft DEM hillshade",
+                 f"{st.OBJECTID.nunique()} segments\nover {mos.res:g} {u} "
+                 f"DEM hillshade",
                  fontsize=10.5, loc="left")
-    ax.set_xlabel("CA zone 3 easting (ftUS)")
-    ax.set_ylabel("CA zone 3 northing (ftUS)")
+    ax.set_xlabel(f"{frame} easting ({u})")
+    ax.set_ylabel(f"{frame} northing ({u})")
     ax.ticklabel_format(style="plain")
     ax.tick_params(axis="x", labelrotation=45, labelsize=8)
     # legend below the axes: on a narrow street it would otherwise cover the road
@@ -177,11 +203,14 @@ def main():
         half = win_ft/2
         w, s = np.floor(cx-half), np.floor(cy-half)
         e, nn = w+win_ft, s+win_ft
-        sub = read_dem(vrt, (w, s, e, nn))
+        sub = read_dem(vrt, (w, s, e, nn), v_unit)
 
-        # every DEM cell drawn as a real square, edges visible
-        xs = np.arange(w, w + sub.shape[1] + 1)
-        ys = np.arange(s, s + sub.shape[0] + 1)
+        # every DEM cell drawn as a real square, edges visible. The step is the
+        # mosaic's pixel size in CRS units -- 1.0 on a 1 ftUS collect, 0.25 on
+        # San Francisco's metre grid. Using 1 there would draw every cell four
+        # times too wide and the panel would not line up with the points.
+        xs = w + np.arange(sub.shape[1] + 1) * mos.res
+        ys = s + np.arange(sub.shape[0] + 1) * mos.res
         norm = Normalize(np.nanpercentile(sub, 2), np.nanpercentile(sub, 98))
         mesh = axd.pcolormesh(xs, ys, sub[::-1], cmap="viridis", norm=norm,
                               edgecolors="#ffffff", linewidth=0.25)
@@ -206,14 +235,15 @@ def main():
                       f"{len(inw)} points, {len(fl)} flagged\n"
                       f"relief {np.nanmax(sub)-np.nanmin(sub):.2f} m across the window",
                       fontsize=9.5, loc="left")
-        axd.set_xlabel("easting (ftUS)")
+        axd.set_xlabel(f"easting ({u})")
         axd.tick_params(axis="x", labelrotation=45, labelsize=8)
         if i == 0 or tall:
-            axd.set_ylabel("northing (ftUS)")
+            axd.set_ylabel(f"northing ({u})")
         axd.ticklabel_format(style="plain")
         fig.colorbar(mesh, ax=axd, shrink=0.85, label="elevation (m)")
 
-    fig.suptitle(f"{args.street} — centerline points on the USGS 3DEP 1 ft grid\n"
+    fig.suptitle(f"{args.street} — centerline points on the USGS 3DEP "
+                 f"{mos.res:g} {u} grid\n"
                  "orange outlines: the DEM cell containing each point   ·   "
                  "red: elev_disc_cm above threshold",
                  fontsize=12.5, y=0.985)

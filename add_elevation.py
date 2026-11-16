@@ -4,10 +4,12 @@ Adds, in place, to derived/segments_points_<spacing>.{parquet,csv}:
 
     easting/northing     UTM 10N (EPSG:26910), metres -- the frame every plot
                          and map in this project works in
-    dem_x/dem_y          the same point in the DEM's own CRS (EPSG:6420,
-                         California zone 3, US survey feet)
-    cell_e/cell_n        integer 1 ftUS cell id; the DEM grid is aligned to
-                         whole feet in EPSG:6420, so floor(dem_x), floor(dem_y)
+    dem_x/dem_y          the same point in the DEM's own CRS, read from the
+                         mosaic: EPSG:6420 (California zone 3, US survey feet)
+                         for the county collects, EPSG:7131 (San Francisco
+                         CS13, metres) for CA_SanFrancisco_B23
+    cell_e/cell_n        integer 1-unit cell id in that CRS; the DEM grid is
+                         aligned to whole units, so floor(dem_x), floor(dem_y)
                          identifies a cell independently of which tile it is in
     cell_center_dist_m   how far the point sits from that cell's center, metres
     same_cell_as_prev    True when the previous point on the segment shares the
@@ -28,11 +30,13 @@ Adds, in place, to derived/segments_points_<spacing>.{parquet,csv}:
 
 The DEM
 -------
-Source is the USGS 3DEP Original Product Resolution tiles in dem_livermore/,
-fetched and merged by fetch_usgs_lidar.py: 1 US survey foot, EPSG:6420 with a
-NAVD88 (ftUS) vertical datum, AREA_OR_POINT=Point. Elevations are converted to
-metres on read, so every column this writes -- and everything downstream --
-stays in metres, on NAVD88, exactly as it was under the old 1 m product.
+Source is the USGS 3DEP Original Product Resolution tiles in dem_<city>/,
+fetched and merged by fetch_usgs_lidar.py. The county collects are 1 US survey
+foot on EPSG:6420 with a NAVD88 (ftUS) vertical datum; CA_SanFrancisco_B23 is
+0.25 m on EPSG:7131 with NAVD88 metres. Both are read in the unit the tile
+declares and converted to metres, so every column this writes -- and everything
+downstream -- stays in metres on NAVD88, exactly as it was under the old 1 m
+product. Nothing here may assume feet: see vertical_unit_m().
 
 Two details of that DEM differ from the 1 m product and are handled here:
 
@@ -59,6 +63,7 @@ import argparse
 import glob
 import json
 import os
+import re
 import xml.sax.saxutils as sx
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -74,7 +79,11 @@ from extract_centerline_latlon import (DEFAULT_CITY, SPACING, label,
                                        points_path)
 
 PROJ_CRS = "EPSG:26910"          # NAD83 / UTM zone 10N -- the project's frame
-DEM_CRS = "EPSG:6420"            # NAD83(2011) / California zone 3 (ftUS) -- the DEM's
+# The CRS the Bay Area COUNTY collects use. Nothing reads it any more: main()
+# takes the sampling frame from the mosaic itself, because CA_SanFrancisco_B23
+# is on EPSG:7131 in metres. Kept as the documented expectation, and as the
+# label on what every corpus written before San Francisco is in.
+DEM_CRS = "EPSG:6420"            # NAD83(2011) / California zone 3 (ftUS)
 VDATUM = "NAVD88"
 FT_TO_M = 1200.0 / 3937.0        # US survey foot -> metre, exact by definition
 # endpoints live beside the points, under derived/<city>/
@@ -210,6 +219,102 @@ def res_metres(crs, res):
     except Exception:                        # noqa: BLE001 -- geographic CRS, etc.
         factor = 1.0
     return res * factor
+
+
+def snap_unit(factor):
+    """A unit factor, collapsed onto the project's exact constant.
+
+    pyproj reports the US survey foot as 0.30480060960121924; FT_TO_M, defined
+    as 1200/3937, is 0.3048006096012192. They are the same number to one ulp of
+    a double, but multiplying by the reported one would move every elevation in
+    every existing corpus in the 14th decimal, and those files are supposed to
+    reproduce exactly. So a factor that IS the US survey foot becomes FT_TO_M,
+    and one that is a metre becomes exactly 1.0 -- which keeps the metre path a
+    true no-op rather than a multiply by 0.9999999999999999.
+    """
+    if abs(factor - FT_TO_M) < 1e-12:
+        return FT_TO_M
+    if abs(factor - 1.0) < 1e-12:
+        return 1.0
+    return factor
+
+
+def vertical_unit_m(crs):
+    """Metres per vertical unit of a DEM's CRS.
+
+    3DEP collects do not agree on units. Every Bay Area county collect so far
+    ships COMPD_CS["... California zone 3 (ftUS) + NAVD88 height (ftUS)"] and
+    counts US survey feet both ways. CA_SanFrancisco_B23 ships EPSG:7131, San
+    Francisco's own grid, and counts METRES both ways.
+
+    A constant foot-to-metre factor applied to the second one divides every
+    elevation by 3.28 -- Twin Peaks reads 85 m instead of 279 -- and nothing
+    downstream could tell, because the result is still a plausible elevation on
+    a plausible datum. Hence this, read from the tile rather than assumed.
+
+    Taken from the vertical sub-CRS where the tile declares one. A bare
+    EPSG:6420 (CA_SantaClaraCounty_2020_A20 ships one) declares no vertical
+    axis at all, and there the horizontal unit is the convention the publisher
+    means: a ftUS grid carrying ftUS heights.
+    """
+    try:
+        c = PyprojCRS.from_user_input(crs)
+        if c.is_compound and len(c.sub_crs_list) > 1:
+            axes = c.sub_crs_list[1].axis_info
+            if axes and axes[0].unit_conversion_factor:
+                return snap_unit(float(axes[0].unit_conversion_factor))
+    except Exception:                        # noqa: BLE001 -- unusual CRS
+        pass
+    return snap_unit(res_metres(crs, 1.0) or 1.0)
+
+
+def unit_name(factor):
+    """How to write a unit of `factor` metres in a metadata string."""
+    if abs(factor - 1.0) < 1e-12:
+        return "metres"
+    if abs(factor - FT_TO_M) < 1e-9:
+        return "US survey feet"
+    if abs(factor - 0.3048) < 1e-9:
+        return "international feet"
+    return "units of %.9g m" % factor
+
+
+def unit_abbr(factor):
+    """The same unit, abbreviated, for an axis label or a plot title."""
+    if abs(factor - 1.0) < 1e-12:
+        return "m"
+    if abs(factor - FT_TO_M) < 1e-9:
+        return "ftUS"
+    if abs(factor - 0.3048) < 1e-9:
+        return "ft"
+    return "%.9g m" % factor
+
+
+# The two filename layouts 3DEP uses. OPR puts the project before the tile code
+# (USGS_OPR_CA_SanFrancisco_B23_04200245, ..._B21_be_w6159n2043); the 1 m
+# product puts it after (USGS_1M_10_x60y417_CA_AlamedaCounty_2021_B21).
+_COLLECT_RE = (re.compile(r"^USGS_OPR_(.+?)_(?:be_)?[0-9wnxy]+\.tif$", re.I),
+               re.compile(r"^USGS_1M_\d+_[0-9xy]+_(.+?)\.tif$", re.I))
+
+
+def collects(files):
+    """Which 3DEP projects the tiles in a directory come from.
+
+    Read off the filenames because that is the only place a tile says. The
+    figure used to be hardcoded to CA_AlamedaCounty_2021_B21, which was true of
+    four cities and wrong about Fremont, whose corpus is half Santa Clara.
+    """
+    found = set()
+    for f in files:
+        b = os.path.basename(f)
+        for rx in _COLLECT_RE:
+            m = rx.match(b)
+            if m:
+                found.add(m.group(1))
+                break
+        else:
+            found.add("unrecognised: " + b)
+    return sorted(found)
 
 
 def _read_sources(files):
@@ -618,17 +723,53 @@ def main():
     df["easting"] = np.round(e, 3)
     df["northing"] = np.round(n, 3)
 
-    # The DEM frame, for sampling and for the cell ids.
-    trd = Transformer.from_crs("EPSG:4326", DEM_CRS, always_xy=True)
+    # The DEM frame, for sampling and for the cell ids: the MOSAIC's own CRS,
+    # not a constant. Every collect in the project was EPSG:6420 and the two
+    # agreed, so a hardcoded DEM_CRS went unnoticed until San Francisco, whose
+    # tiles are EPSG:7131 -- its own grid, in metres. Transforming into 6420 and
+    # then sampling a 7131 mosaic lands every point millions of units outside
+    # it, so that one at least fails loudly; the vertical unit below does not.
+    #
+    # Horizontal part only: the tiles' compound CRS carries a vertical axis, and
+    # a 2D transformer built from it would be asked for three coordinates.
+    dem_crs = horizontal_crs(mos.crs)
+    h_unit = snap_unit(res_metres(dem_crs, 1.0) or 1.0)   # m per horizontal unit
+    v_unit = vertical_unit_m(mos.crs)            # metres per vertical unit
+    dem_epsg = dem_crs.to_epsg()
+    dem_label = "EPSG:%d" % dem_epsg if dem_epsg else "the DEM's own CRS"
+    try:
+        dem_title = PyprojCRS.from_user_input(dem_crs).name
+    except Exception:                            # noqa: BLE001 -- unusual CRS
+        dem_title = "unnamed"
+    print(f"DEM frame: {dem_label} ({dem_title}), {unit_name(h_unit)} "
+          f"horizontally, elevations in {unit_name(v_unit)}")
+    trd = Transformer.from_crs("EPSG:4326", dem_crs, always_xy=True)
     dx, dy = trd.transform(df.lon.values, df.lat.values)
     df["dem_x"] = np.round(dx, 3)
     df["dem_y"] = np.round(dy, 3)
 
-    # Cell edges fall on whole feet in the DEM's CRS, so floor() is the cell id.
+    # Cell edges fall on whole units of the DEM's CRS, so floor() is the cell
+    # id -- while the grid really is aligned to whole units. It is on the 1 ftUS
+    # county collects, and on San Francisco's 0.25 m grid too (four pixels to
+    # the metre, tiles starting on a whole metre). Checked rather than assumed:
+    # on a grid that is not, floor() still names a reproducible box, it is just
+    # no longer one the DEM shares an edge with, and cell_center_dist_m is then
+    # measured to the box's centre rather than a pixel's.
+    # The tolerance is a millimetre on the ground, not an exact comparison:
+    # the published tiles carry float noise in their corners (Livermore's
+    # westmost is 6158999.99966666 ftUS, a tenth of a millimetre short of the
+    # whole foot it means) and an exact test calls every city misaligned.
+    ppu = 1.0 / mos.res
+    off = max(abs(mos.transform.c - round(mos.transform.c)),
+              abs(mos.transform.f - round(mos.transform.f))) * h_unit
+    if abs(round(ppu) - ppu) > 1e-9 or off > 1e-3:
+        print(f"  note: the {mos.res:g}-unit grid is not aligned to whole CRS "
+              f"units (origin is {off:.4g} m off); cell_e/cell_n name a box "
+              f"the DEM shares no edge with")
     df["cell_e"] = np.floor(dx).astype(np.int32)
     df["cell_n"] = np.floor(dy).astype(np.int32)
     df["cell_center_dist_m"] = np.round(
-        np.hypot(dx - (df.cell_e + 0.5), dy - (df.cell_n + 0.5)) * FT_TO_M, 4)
+        np.hypot(dx - (df.cell_e + 0.5), dy - (df.cell_n + 0.5)) * h_unit, 4)
 
     oid = df.OBJECTID.values
     same = np.r_[False, (df.cell_e.values[1:] == df.cell_e.values[:-1])
@@ -639,12 +780,14 @@ def main():
     df["bearing_deg"] = np.round(local_bearing(oid, e, n), 2).astype("float32")
 
     print("sampling DEM:")
-    elev_ft, cell_ft, pix_c, pix_r, inside = sample_mosaic(vrt, dx, dy)
+    elev_native, cell_native, pix_c, pix_r, inside = sample_mosaic(vrt, dx, dy)
 
-    # ftUS -> metres, here and only here: every column below is metres, so
-    # nothing downstream has to know the DEM changed units.
-    elev = elev_ft * FT_TO_M
-    cellz = cell_ft * FT_TO_M
+    # The DEM's own vertical unit -> metres, here and only here: every column
+    # below is metres, so nothing downstream has to know what the DEM counted
+    # in. v_unit is exactly 1.0 for a metre-based collect, which makes this the
+    # no-op it should be rather than a silent division by 3.28.
+    elev = elev_native * v_unit
+    cellz = cell_native * v_unit
     df["elev_m"] = np.round(elev, 3).astype("float32")
     df["elev_cell_m"] = np.round(cellz, 3).astype("float32")
     df["elev_disc_cm"] = np.round(np.abs(elev - cellz) * 100, 2).astype("float32")
@@ -677,14 +820,18 @@ def main():
         "point_spacing_m": float(args.spacing),
         "horizontal_crs": {"points_source": "EPSG:4326 (WGS84)",
                            "easting_northing": f"{PROJ_CRS} (NAD83 / UTM 10N), metres",
-                           "dem_x_dem_y": f"{DEM_CRS} (NAD83(2011) / CA zone 3), US survey feet"},
+                           "dem_x_dem_y": f"{dem_label} ({dem_title}), {unit_name(h_unit)}"},
         "vertical_datum": VDATUM,
-        "elevation_units": "metres (converted from the DEM's US survey feet)",
+        "elevation_units": ("metres (the DEM's own unit)" if v_unit == 1.0 else
+                            f"metres (converted from the DEM's {unit_name(v_unit)})"),
         "dem": {
             "product": "USGS 3DEP OPR (Original Product Resolution) DEM",
-            "project": "CA_AlamedaCounty_2021_B21",
-            "grid": "1 US survey foot (0.3048006 m), AREA_OR_POINT=Point",
-            "crs": f"{DEM_CRS} + NAVD88 height (ftUS), Geoid18",
+            "project": ", ".join(collects(files)),
+            "grid": (f"{mos.res:g} {unit_abbr(h_unit)}, AREA_OR_POINT=Point"
+                     if unit_abbr(h_unit) == "m" else
+                     f"{mos.res:g} {unit_abbr(h_unit)} ({mos.res_m:.4f} m), "
+                     f"AREA_OR_POINT=Point"),
+            "crs": f"{dem_label} + {VDATUM} height ({unit_name(v_unit)})",
             "tiles": len(files),
             "directory": args.dem_dir,
             "mosaic": f"{VRT_NAME} ({mos.width} x {mos.height} px), built per run",
@@ -695,11 +842,15 @@ def main():
             "mixed_projections": bool(mos.mixed_crs),
             "native_resolutions_m": sorted({s.res_m for s in mos.sources}),
             "overlap_rule": "finest-resolution source wins",
-            "nodata": -999999.0,
+            "nodata": mos.nodata,
             "note": ("tiles do not overlap; sampled through the VRT so points at "
                      "a tile edge still get all four bilinear neighbours"),
         },
         "accuracy_notes": {
+            # Measured once, on Livermore against CA_AlamedaCounty_2021_B21.
+            # They are properties of that collect and that corpus, not of
+            # whatever --dem-dir happens to be pointed at, so they say so.
+            "measured_on": "Livermore / CA_AlamedaCounty_2021_B21 (1 ftUS)",
             "absolute_vertical": "USGS 3DEP QL1/QL2 spec RMSEz <= 10 cm (not independently verified)",
             "cross_check_vs_1m_product": ("1.05 cm RMS, +0.19 cm mean, over 59,472 points "
                                           "against the 1 m product from the same collect"),
@@ -711,12 +862,14 @@ def main():
         },
         "columns": {
             "easting/northing": f"{PROJ_CRS}, metres -- the frame the plots use",
-            "dem_x/dem_y": f"{DEM_CRS}, US survey feet -- the frame the DEM uses",
-            "cell_e/cell_n": "SW corner of the containing 1 ftUS cell, DEM CRS",
+            "dem_x/dem_y": (f"{dem_label}, {unit_name(h_unit)} -- the frame "
+                            f"the DEM uses"),
+            "cell_e/cell_n": (f"SW corner of the containing 1 "
+                              f"{unit_abbr(h_unit)} cell, DEM CRS"),
             "elev_m": "bilinear interpolation of the 4 surrounding cell centers, metres",
             "elev_cell_m": "raw value of the containing cell, metres",
             "elev_disc_cm": ("|bilinear - cell|; >20 suggests a curb/wall/bridge edge. "
-                             "On this 1 ft grid the bulk is much tighter than on the "
+                             "On Livermore's 1 ftUS grid the bulk is much tighter than on the "
                              "1 m product (median 0.24 vs 1.5 cm), but above ~8 cm the "
                              "two agree closely -- that tail is real features, not grid "
                              "noise, so the threshold is unchanged."),
