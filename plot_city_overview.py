@@ -208,11 +208,18 @@ def load_gap(here, paths):
     """
     if not paths:
         return None
+    want = ["OBJECTID", "city", "vertex_index", "lat", "lon"]
     frames = []
     for p in paths:
-        g = pd.read_csv(os.path.join(here, p),
-                        usecols=["OBJECTID", "city", "vertex_index", "lat", "lon"])
-        frames.append(g)
+        full = os.path.join(here, p)
+        # "reason" is per-city -- merge_cities.py writes why each gap city has
+        # no corpus, and "no inlet data published" is FALSE for several of them
+        # (San Bruno and Belmont publish inlets; Millbrae publishes a catalogue
+        # without coordinates). Take it when the file carries it; older gap
+        # files predate the column and fall back to --gap-note.
+        head = pd.read_csv(full, nrows=0)
+        cols = want + (["reason"] if "reason" in head.columns else [])
+        frames.append(pd.read_csv(full, usecols=cols))
     g = pd.concat(frames, ignore_index=True)
     g = g.sort_values(["OBJECTID", "vertex_index"], kind="stable")
     to3857 = Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)

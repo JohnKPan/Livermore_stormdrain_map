@@ -29,6 +29,7 @@ Usage:
 import argparse
 import os
 import shutil
+import stat
 import subprocess
 import sys
 
@@ -48,6 +49,22 @@ def link_or_copy(src, dst):
     except OSError:
         shutil.copy2(src, dst)
         return "copy"
+
+
+def force_rmtree(path):
+    """rmtree, including a .git left behind by an earlier publish.
+
+    Git marks everything under .git/objects read-only, and on Windows a
+    read-only file refuses os.unlink outright -- so the second publish of a
+    site dies clearing the stage the first one built. Clear the bit and retry.
+    """
+    def onerror(fn, p, exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            fn(p)
+        except OSError:
+            raise
+    shutil.rmtree(path, onerror=onerror)
 
 
 def run(cmd, cwd=None):
@@ -87,11 +104,24 @@ def main():
             raise SystemExit("missing %s -- run merge_cities.py first"
                              % os.path.relpath(p, HERE))
 
+    # The overview is rendered by a CHILD process, sys.executable -- so an
+    # interpreter that can import pandas (enough to reach this line) but not
+    # bokeh gets all the way through staging 3,689 files before dying. Check
+    # the child's imports first, and name the interpreter that is missing them.
+    probe = subprocess.run([sys.executable, "-c", "import bokeh, rasterio"],
+                           capture_output=True, text=True)
+    if probe.returncode:
+        raise SystemExit(
+            "%s cannot import bokeh/rasterio -- run this script with "
+            "the project's own environment: %s"
+            % (sys.executable,
+               os.path.join(HERE, ".conda", "env", "python.exe")))
+
     stage = os.path.abspath(args.stage or os.path.join(
         HERE, "Stormdrain_map", "_publish_" + args.name))
     if os.path.exists(stage):
         print("clearing %s" % os.path.relpath(stage, HERE))
-        shutil.rmtree(stage)
+        force_rmtree(stage)
     os.makedirs(stage)
 
     idx = pd.read_csv(idx_path)

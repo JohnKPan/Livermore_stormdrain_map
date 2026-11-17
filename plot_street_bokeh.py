@@ -287,6 +287,42 @@ def _render_street(job):
     return out_rows, skipped, failed, msgs
 
 
+# matplotlib marker -> Bokeh marker.
+#
+# Must cover every marker STYLE uses: an unmapped one falls back to a circle
+# silently, which would make two types look identical here while looking
+# different in the matplotlib pages.
+#
+# And every value here must be a marker Bokeh FILLS. inlet_paint() below puts
+# the type colour in the fill and a white ring around it for a surveyed inlet,
+# so a stroke-only Bokeh marker -- x, cross, y, dash, asterisk -- draws nothing
+# but that white ring, on a white background. matplotlib's "X" and "+" are a
+# filled cross and a stroke cross respectively, and mapping them to Bokeh's
+# same-named x/cross made every surveyed Unknown inlet invisible: 16,588 of
+# them, 100% of Belmont and Emeryville, 97% of Fairfield, 96% of Burlingame,
+# 93% of Brisbane, 71% of South San Francisco. The markers still took a click
+# -- Bokeh hit-tests geometry, not paint -- but nothing showed where to aim.
+#
+# So the two cross markers take Bokeh's filled cross-in-a-shape forms. "X"
+# goes to square_x rather than circle_x because the shape it then resembles
+# is Grated Inlet's square (5,274 inlets) instead of Curb Inlet's circle
+# (23,497), and the colours differ in both cases.
+BOKEH_MARKER = {"o": "circle", "s": "square", "D": "diamond",
+                "P": "plus", "^": "triangle", "X": "square_x",
+                "v": "inverted_triangle", "*": "star",
+                "h": "hex", "+": "circle_cross"}
+
+# Bokeh markers that draw no fill. Nothing may map onto one of these while
+# inlet_paint() encodes provenance in the fill.
+BOKEH_UNFILLED = {"x", "cross", "y", "dash", "asterisk"}
+_bad = sorted(set(BOKEH_MARKER.values()) & BOKEH_UNFILLED)
+if _bad:
+    raise RuntimeError(
+        "BOKEH_MARKER maps a type onto fill-less Bokeh marker(s) %s; "
+        "inlet_paint() puts the type colour in the fill, so a surveyed inlet "
+        "would render as a white ring on white." % _bad)
+
+
 def inlet_paint(src, color):
     """Fill, ring colour and ring width per inlet, from where its height came from.
 
@@ -535,7 +571,14 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                 gsurv=(g.grate_survey_m.to_numpy() if "grate_survey_m" in g
                        else np.full(len(g), np.nan)),
                 mx=ix[m], my=iy[m], num=g.num.to_numpy(),
-                asset=g.AssetID.astype(str).to_numpy(),
+                # astype(str) turns a missing id into the STRING "nan",
+                # which the hover and the pick line then print at the reader:
+                # "inlet #3 . nan . Grated Inlet". Brisbane publishes no
+                # assetid for 1,283 of its 1,331 inlets and South San
+                # Francisco for 105 of 2,662, so this is not a rare corner.
+                # Empty string instead, and the two readouts drop the field.
+                asset=np.where(g.AssetID.notna(),
+                               g.AssetID.astype(str), "").astype(object),
                 iv=g.invert_m.to_numpy(),
                 off=g.offset_m.to_numpy(),
                 lat=g.lat.to_numpy(), lon=g.lon.to_numpy(),
@@ -546,13 +589,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                 # string is not, so it has to come from the rows.
                 typraw=(g.type_raw.fillna("").astype(str).to_numpy()
                         if "type_raw" in g else np.array([""] * len(g)))))
-            # Must cover every marker STYLE uses: an unmapped one falls back
-            # to a circle silently, which would make two types look identical
-            # here while looking different in the matplotlib pages.
-            mk = {"o": "circle", "s": "square", "D": "diamond",
-                  "P": "plus", "^": "triangle", "X": "x",
-                  "v": "inverted_triangle", "*": "star",
-                  "h": "hex", "+": "cross"}.get(sty["marker"], "circle")
+            mk = BOKEH_MARKER.get(sty["marker"], "circle")
             # nonselection_alpha=1: tapping an inlet selects it, and Bokeh's
             # default is to fade everything unselected. Here the tap is only a
             # way to pin details, so the other inlets must stay legible.
@@ -765,6 +802,13 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                       + "&map_action=pano&viewpoint=" + la.toFixed(6) + ","
                       + lo.toFixed(6) + "&heading=" + D.hd[i].toFixed(0);
             const iv = isFinite(D.iv[i]) ? D.iv[i].toFixed(2) + " m" : "n/a";
+            // An inlet whose publisher gave it no id has nothing to show
+            // here. Drop the field AND its separator, rather than leaving a
+            // dangling " . . " or printing "nan". The NaN test is aid !== aid
+            // because a page built before this fix carries a real NaN here.
+            const aid = D.asset[i];
+            const idtxt = (aid === null || aid === undefined || aid === ""
+                           || aid !== aid) ? "" : " &middot; " + aid;
             // The canonical class folds five cities' vocabularies together, so
             // show the publisher's own wording alongside it -- but only when it
             // actually differs, or every Livermore inlet would say the same
@@ -774,7 +818,7 @@ def build(street, st, inlets, args, outdir, used, segs=None, p=None,
                         ? D.typ[i] + " <span style='color:#777'>(" + raw + ")</span>"
                         : D.typ[i];
             pick.text =
-                "<b>inlet #" + D.num[i] + "</b> &middot; " + D.asset[i]
+                "<b>inlet #" + D.num[i] + "</b>" + idtxt
               + " &middot; " + typ + " &middot; " + D.ch[i].toFixed(1)
               + " m along &middot; grate " + D.gy[i].toFixed(2) + " m "
               + (D.gsrc[i] === "survey"
